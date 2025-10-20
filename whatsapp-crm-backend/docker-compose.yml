@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: whatsapp-crm-db
+    environment:
+      POSTGRES_USER: ajsal
+      POSTGRES_PASSWORD: "ajsalpv@4champz.in"
+      POSTGRES_DB: whatsapp_crm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - whatsapp-crm-network
+
+  # Node.js Backend
+  backend:
+    build: .
+    container_name: whatsapp-crm-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DB_USER: crm_user
+      DB_HOST: postgres
+      DB_NAME: whatsapp_crm
+      DB_PASSWORD: secure_password_123
+      DB_PORT: 5432
+      PORT: 3000
+      API_KEY: ${API_KEY:-your_secret_api_key_change_this}
+      GROQ_API_KEY: ${GROQ_API_KEY:-your_groq_api_key}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./server.js:/app/server.js
+      - ./package.json:/app/package.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - whatsapp-crm-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  whatsapp-crm-network:
+    driver: bridge
