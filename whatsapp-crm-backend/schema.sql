@@ -185,17 +185,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER IF NOT EXISTS update_leads_timestamp
+CREATE TRIGGER update_leads_timestamp
 BEFORE UPDATE ON leads
 FOR EACH ROW
 EXECUTE FUNCTION update_timestamp();
 
-CREATE TRIGGER IF NOT EXISTS update_conversations_timestamp
+CREATE TRIGGER update_conversations_timestamp
 BEFORE UPDATE ON conversations
 FOR EACH ROW
 EXECUTE FUNCTION update_timestamp();
 
-CREATE TRIGGER IF NOT EXISTS update_invoices_timestamp
+CREATE TRIGGER update_invoices_timestamp
 BEFORE UPDATE ON invoices
 FOR EACH ROW
 EXECUTE FUNCTION update_timestamp();
