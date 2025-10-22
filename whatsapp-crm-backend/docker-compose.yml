@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 
 services:
   # PostgreSQL Database
@@ -15,7 +15,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U crm_user"]
+      test: ["CMD-SHELL", "pg_isready -U ajsal"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -31,10 +31,10 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DB_USER: crm_user
+      DB_USER: ajsal
       DB_HOST: postgres
       DB_NAME: whatsapp_crm
-      DB_PASSWORD: secure_password_123
+      DB_PASSWORD: "ajsalpv@4champz.in"
       DB_PORT: 5432
       PORT: 3000
       API_KEY: ${API_KEY:-your_secret_api_key_change_this}

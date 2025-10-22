@@ -77,21 +77,52 @@ app.get('/health', (req, res) => {
 // Create or update a lead
 app.post('/api/leads', async (req, res) => {
   try {
-    const { phone_number, name, email, lead_source, interest_level, tags } = req.body;
+    const { 
+      phone_number, 
+      name, 
+      email, 
+      lead_source, 
+      interest_level, 
+      chess_rating,
+      location,
+      tournament_experience,
+      coaching_experience,
+      education_certs,
+      availability,
+      age_group_pref,
+      conversation_history,
+      last_contacted,
+      notes,
+      tags 
+    } = req.body;
 
     if (!phone_number) {
       return res.status(400).json({ error: 'phone_number is required' });
     }
 
     const query = `
-      INSERT INTO leads (phone_number, name, email, lead_source, interest_level, tags)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO leads (
+        phone_number, name, email, lead_source, interest_level,
+        chess_rating, location, tournament_experience, coaching_experience,
+        education_certs, availability, age_group_pref, last_contacted, notes, tags
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       ON CONFLICT (phone_number) DO UPDATE
-      SET name = COALESCE($2, name),
-          email = COALESCE($3, email),
-          interest_level = COALESCE($5, interest_level),
-          tags = COALESCE($6, tags),
-          updated_at = CURRENT_TIMESTAMP
+      SET 
+        name = COALESCE(EXCLUDED.name, leads.name),
+        email = COALESCE(EXCLUDED.email, leads.email),
+        interest_level = COALESCE(EXCLUDED.interest_level, leads.interest_level),
+        chess_rating = COALESCE(EXCLUDED.chess_rating, leads.chess_rating),
+        location = COALESCE(EXCLUDED.location, leads.location),
+        tournament_experience = COALESCE(EXCLUDED.tournament_experience, leads.tournament_experience),
+        coaching_experience = COALESCE(EXCLUDED.coaching_experience, leads.coaching_experience),
+        education_certs = COALESCE(EXCLUDED.education_certs, leads.education_certs),
+        availability = COALESCE(EXCLUDED.availability, leads.availability),
+        age_group_pref = COALESCE(EXCLUDED.age_group_pref, leads.age_group_pref),
+        last_contacted = COALESCE(EXCLUDED.last_contacted, leads.last_contacted),
+        notes = COALESCE(EXCLUDED.notes, leads.notes),
+        tags = COALESCE(EXCLUDED.tags, leads.tags),
+        updated_at = CURRENT_TIMESTAMP
       RETURNING *;
     `;
 
@@ -101,8 +132,45 @@ app.post('/api/leads', async (req, res) => {
       email || null,
       lead_source || 'whatsapp',
       interest_level || 1,
+      chess_rating || null,
+      location || null,
+      tournament_experience || null,
+      coaching_experience || null,
+      education_certs || null,
+      availability || null,
+      age_group_pref || null,
+      last_contacted || new Date().toISOString(),
+      notes || null,
       tags ? JSON.stringify(tags) : null,
     ]);
+
+    // If conversation_history provided, update conversations table
+    if (conversation_history && result.rows[0].id) {
+      const leadId = result.rows[0].id;
+      
+      // Check if conversation exists
+      const convCheck = await pool.query(
+        `SELECT id FROM conversations WHERE lead_id = $1`,
+        [leadId]
+      );
+
+      if (convCheck.rows.length > 0) {
+        // Update existing conversation
+        await pool.query(
+          `UPDATE conversations 
+           SET conversation_history = $1, updated_at = CURRENT_TIMESTAMP 
+           WHERE lead_id = $2`,
+          [conversation_history, leadId]
+        );
+      } else {
+        // Create new conversation
+        await pool.query(
+          `INSERT INTO conversations (lead_id, phone_number, conversation_history) 
+           VALUES ($1, $2, $3)`,
+          [leadId, phone_number, conversation_history]
+        );
+      }
+    }
 
     logRequest('POST', '/api/leads', 201);
     res.status(201).json({
@@ -116,29 +184,34 @@ app.post('/api/leads', async (req, res) => {
 });
 
 // Get lead by phone number
+// Get lead by phone number
 app.get('/api/leads/:phone', async (req, res) => {
-  try {
-    const { phone } = req.params;
+  const { phone } = req.params;
 
+  try {
     if (!phone) {
-      return res.status(400).json({ error: 'phone parameter is required' });
+      return res.status(400).json({ success: false, error: 'Phone parameter is required' });
     }
 
+    // Query DB
     const query = `SELECT * FROM leads WHERE phone_number = $1;`;
     const result = await pool.query(query, [phone]);
 
+    // Always return 200 OK
     if (result.rows.length === 0) {
-      logRequest('GET', `/api/leads/${phone}`, 404);
-      return res.status(404).json({ success: false, error: 'Lead not found' });
+      logRequest('GET', `/api/leads/${phone}`, 200);
+      return res.json({ success: false, data: null, message: 'Lead not found' });
     }
 
+    // Lead found
     logRequest('GET', `/api/leads/${phone}`, 200);
-    res.json({ success: true, data: result.rows[0] });
+    return res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     logRequest('GET', `/api/leads/${phone}`, 500);
-    handleError(res, error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 // Update lead interest level
 app.patch('/api/leads/:phone/interest', async (req, res) => {
@@ -191,7 +264,7 @@ app.post('/api/conversations', async (req, res) => {
     if (result.rows.length === 0) {
       const createQuery = `
         INSERT INTO conversations (lead_id, phone_number, conversation_history)
-        VALUES ($1, $2, '[]'::jsonb)
+        VALUES ($1, $2, '')
         RETURNING *;
       `;
       result = await pool.query(createQuery, [lead_id, phone_number]);
@@ -220,7 +293,9 @@ app.get('/api/conversations/:phone', async (req, res) => {
         c.*,
         l.name,
         l.email,
-        l.lead_status
+        l.lead_status,
+        l.chess_rating,
+        l.location
       FROM conversations c
       JOIN leads l ON c.lead_id = l.id
       WHERE c.phone_number = $1
@@ -231,8 +306,15 @@ app.get('/api/conversations/:phone', async (req, res) => {
     const result = await pool.query(query, [phone]);
 
     if (result.rows.length === 0) {
-      logRequest('GET', `/api/conversations/${phone}`, 404);
-      return res.status(404).json({ success: false, error: 'Conversation not found' });
+      logRequest('GET', `/api/conversations/${phone}`, 200);
+      return res.json({ 
+        success: false, 
+        data: {
+          conversation_history: '',
+          message_count: 0
+        },
+        message: 'Conversation not found' 
+      });
     }
 
     logRequest('GET', `/api/conversations/${phone}`, 200);
@@ -488,6 +570,7 @@ app.get('/api/invoices/lead/:lead_id', async (req, res) => {
 // ============================================
 
 // Webhook to receive data from n8n workflow
+// Webhook to receive data from n8n workflow with ALL custom fields
 app.post('/api/webhook/n8n', async (req, res) => {
   try {
     const { 
@@ -498,6 +581,13 @@ app.post('/api/webhook/n8n', async (req, res) => {
       message_id,
       conversation_history,
       interest_level,
+      chess_rating,
+      location,
+      tournament_experience,
+      coaching_experience,
+      education_certs,
+      availability,
+      age_group_pref,
       ai_summary,
       timestamp
     } = req.body;
@@ -506,18 +596,67 @@ app.post('/api/webhook/n8n', async (req, res) => {
       return res.status(400).json({ error: 'phone_number is required' });
     }
 
-    // 1. Create or update lead
+    // 1. Create or update lead with all custom fields
     let leadId;
     let leadQuery = `SELECT id FROM leads WHERE phone_number = $1;`;
     let leadResult = await pool.query(leadQuery, [phone_number]);
 
     if (leadResult.rows.length === 0) {
       const createLead = `
-        INSERT INTO leads (phone_number, name, lead_source, interest_level)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO leads (
+          phone_number, name, lead_source, interest_level,
+          chess_rating, location, tournament_experience, coaching_experience,
+          education_certs, availability, age_group_pref, last_contacted
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING id;
       `;
-      leadResult = await pool.query(createLead, [phone_number, name, lead_source || 'whatsapp', interest_level || 1]);
+      leadResult = await pool.query(createLead, [
+        phone_number, 
+        name, 
+        lead_source || 'whatsapp', 
+        interest_level || 1,
+        chess_rating || null,
+        location || null,
+        tournament_experience || null,
+        coaching_experience || null,
+        education_certs || null,
+        availability || null,
+        age_group_pref || null,
+        new Date().toISOString()
+      ]);
+    } else {
+      // Update existing lead
+      const updateLead = `
+        UPDATE leads
+        SET 
+          name = COALESCE($2, name),
+          interest_level = COALESCE($3, interest_level),
+          chess_rating = COALESCE($4, chess_rating),
+          location = COALESCE($5, location),
+          tournament_experience = COALESCE($6, tournament_experience),
+          coaching_experience = COALESCE($7, coaching_experience),
+          education_certs = COALESCE($8, education_certs),
+          availability = COALESCE($9, availability),
+          age_group_pref = COALESCE($10, age_group_pref),
+          last_contacted = $11,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE phone_number = $1
+        RETURNING id;
+      `;
+      leadResult = await pool.query(updateLead, [
+        phone_number,
+        name,
+        interest_level,
+        chess_rating,
+        location,
+        tournament_experience,
+        coaching_experience,
+        education_certs,
+        availability,
+        age_group_pref,
+        new Date().toISOString()
+      ]);
     }
     leadId = leadResult.rows[0].id;
 
@@ -529,13 +668,23 @@ app.post('/api/webhook/n8n', async (req, res) => {
     if (convResult.rows.length === 0) {
       const createConv = `
         INSERT INTO conversations (lead_id, phone_number, conversation_history)
-        VALUES ($1, $2, '[]'::jsonb)
+        VALUES ($1, $2, $3)
         RETURNING id;
       `;
-      convResult = await pool.query(createConv, [leadId, phone_number]);
+      convResult = await pool.query(createConv, [leadId, phone_number, conversation_history || '']);
       convId = convResult.rows[0].id;
     } else {
       convId = convResult.rows[0].id;
+      
+      // Update conversation history if provided
+      if (conversation_history) {
+        await pool.query(
+          `UPDATE conversations 
+           SET conversation_history = $1, updated_at = CURRENT_TIMESTAMP 
+           WHERE id = $2`,
+          [conversation_history, convId]
+        );
+      }
     }
 
     // 3. Store message
@@ -627,6 +776,52 @@ app.get('/api/notifications/pending/:phone', async (req, res) => {
   } catch (error) {
     logRequest('GET', `/api/notifications/pending/${phone}`, 500);
     handleError(res, error);
+  }
+});
+
+
+// Add to server.js
+app.get('/api/notifications/pending/all', async (req, res) => {
+  try {
+    const now = new Date();
+    
+    const query = `
+      SELECT n.*, l.name, l.phone_number 
+      FROM notifications n
+      JOIN leads l ON n.lead_id = l.id
+      WHERE n.status = 'pending'
+      AND n.scheduled_time <= $1
+      ORDER BY n.scheduled_time ASC;
+    `;
+
+    const result = await pool.query(query, [now]);
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// Add to server.js
+app.patch('/api/notifications/:id/sent', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, sent_at } = req.body;
+
+    const query = `
+      UPDATE notifications
+      SET status = $1, sent_at = $2, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [status, sent_at, id]);
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -728,6 +923,38 @@ app.get('/api/stats/messages', async (req, res) => {
   } catch (error) {
     logRequest('GET', '/api/stats/messages', 500);
     handleError(res, error);
+  }
+});
+
+
+
+
+
+
+
+
+// Add to server.js
+app.patch('/api/leads/:phone/last-contacted', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { last_contacted } = req.body;
+
+    const query = `
+      UPDATE leads
+      SET last_contacted = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE phone_number = $2
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [last_contacted, phone]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
