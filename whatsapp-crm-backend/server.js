@@ -1,6 +1,3 @@
-// ============================================
-// WhatsApp CRM Backend - Express Server
-// ============================================
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -1095,4 +1092,153 @@ app.listen(PORT, () => {
   console.log(`\n✓ WhatsApp CRM Backend running on http://localhost:${PORT}`);
   console.log(`✓ Database: ${process.env.DB_NAME}`);
   console.log(`✓ Environment: ${process.env.NODE_ENV}\n`);
+});
+
+
+
+
+
+
+
+
+
+
+
+// ============================================
+// AI CALLING ENDPOINTS
+// ============================================
+
+// 1. Create Company (for multi-tenant)
+app.post('/api/companies', async (req, res) => {
+  try {
+    const { name, phone_number } = req.body;
+    const query = `
+      INSERT INTO companies (name, phone_number)
+      VALUES ($1, $2)
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [name, phone_number]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 2. Create/Update Agent Config
+app.post('/api/agent-configs', async (req, res) => {
+  try {
+    const { company_id, prompt_key, prompt_preamble, initial_message, voice } = req.body;
+    const query = `
+      INSERT INTO agent_configs (company_id, prompt_key, prompt_preamble, initial_message, voice)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (company_id, prompt_key) DO UPDATE
+      SET prompt_preamble = EXCLUDED.prompt_preamble,
+          initial_message = EXCLUDED.initial_message,
+          voice = EXCLUDED.voice,
+          updated_at = CURRENT_TIMESTAMP
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [company_id, prompt_key, prompt_preamble, initial_message, voice]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 3. Get Agent Config by Company
+app.get('/api/agent-configs/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const query = `SELECT * FROM agent_configs WHERE company_id = $1 AND is_active = TRUE;`;
+    const result = await pool.query(query, [company_id]);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 4. Schedule Call (from n8n or manual)
+app.post('/api/schedule-call', async (req, res) => {
+  try {
+    const { company_id, lead_id, call_type, scheduled_time } = req.body;
+    const query = `
+      INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [company_id, lead_id, call_type, scheduled_time]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 5. Get Pending Scheduled Calls (for scheduler)
+app.get('/api/scheduled-calls/pending', async (req, res) => {
+  try {
+    const query = `
+      SELECT sc.*, l.phone_number, l.name, ac.prompt_key, ac.initial_message, ac.voice
+      FROM scheduled_calls sc
+      JOIN leads l ON sc.lead_id = l.id
+      JOIN agent_configs ac ON sc.company_id = ac.company_id
+      WHERE sc.status = 'pending' AND sc.scheduled_time <= NOW()
+      ORDER BY sc.scheduled_time ASC;
+    `;
+    const result = await pool.query(query);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 6. Create Call Log (from Python after call)
+app.post('/api/call-logs', async (req, res) => {
+  try {
+    const { company_id, lead_id, call_sid, to_phone, from_phone, call_type, call_status, transcript, sentiment, summary, conversation_history, recording_url } = req.body;
+    const query = `
+      INSERT INTO call_logs (company_id, lead_id, call_sid, to_phone, from_phone, call_type, call_status, transcript, sentiment, summary, conversation_history, recording_url)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [company_id, lead_id, call_sid, to_phone, from_phone, call_type, call_status, transcript, sentiment ? JSON.stringify(sentiment) : null, summary ? JSON.stringify(summary) : null, conversation_history ? JSON.stringify(conversation_history) : null, recording_url]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 7. Update Call Log (status, transcript, etc.)
+app.patch('/api/call-logs/:call_sid', async (req, res) => {
+  try {
+    const { call_sid } = req.params;
+    const { call_status, call_duration, transcript, sentiment, summary, recording_url } = req.body;
+    const query = `
+      UPDATE call_logs
+      SET call_status = COALESCE($1, call_status),
+          call_duration = COALESCE($2, call_duration),
+          transcript = COALESCE($3, transcript),
+          sentiment = COALESCE($4, sentiment),
+          summary = COALESCE($5, summary),
+          recording_url = COALESCE($6, recording_url),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE call_sid = $7
+      RETURNING *;
+    `;
+    const result = await pool.query(query, [call_status, call_duration, transcript, sentiment ? JSON.stringify(sentiment) : null, summary ? JSON.stringify(summary) : null, recording_url, call_sid]);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// 8. Get Call Logs by Lead
+app.get('/api/call-logs/lead/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    const query = `SELECT * FROM call_logs WHERE lead_id = $1 ORDER BY created_at DESC;`;
+    const result = await pool.query(query, [lead_id]);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    handleError(res, error);
+  }
 });
