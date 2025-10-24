@@ -67,9 +67,75 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
+
+app.get('/api/health', async (req, res) => {
+  try {
+    // Check database connection
+    const dbCheck = await pool.query('SELECT NOW()');
+    
+    // Check active connections
+    const activeConns = await pool.query(`
+      SELECT count(*) as active 
+      FROM pg_stat_activity 
+      WHERE datname = $1 AND state = 'active';
+    `, [process.env.DB_NAME]);
+    
+    logRequest('GET', '/api/health', 200);
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: true,
+        timestamp: dbCheck.rows[0].now,
+        active_connections: parseInt(activeConns.rows[0].active)
+      },
+      uptime: process.uptime(),
+      memory: process.memoryUsage()
+    });
+  } catch (error) {
+    logRequest('GET', '/api/health', 500);
+    res.status(500).json({
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      error: error.message
+    });
+  }
+});
+
 // ============================================
 // 1. LEAD MANAGEMENT ENDPOINTS
 // ============================================
+
+
+app.get('/api/leads', async (req, res) => {
+  try {
+    const { status, limit } = req.query;
+    
+    let query = 'SELECT * FROM leads WHERE 1=1';
+    const params = [];
+    
+    if (status) {
+      params.push(status);
+      query += ` AND lead_status = $${params.length}`;
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    if (limit) {
+      params.push(parseInt(limit));
+      query += ` LIMIT $${params.length}`;
+    }
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/leads', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/leads', 500);
+    handleError(res, error);
+  }
+});
+
 
 // Create or update a lead
 app.post('/api/leads', async (req, res) => {
@@ -180,6 +246,63 @@ app.post('/api/leads', async (req, res) => {
   }
 });
 
+
+app.patch('/api/leads/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    const { lead_status, interest_level, last_contacted, notes } = req.body;
+    
+    const updates = [];
+    const params = [];
+    
+    if (lead_status) {
+      params.push(lead_status);
+      updates.push(`lead_status = $${params.length}`);
+    }
+    
+    if (interest_level) {
+      params.push(interest_level);
+      updates.push(`interest_level = $${params.length}`);
+    }
+    
+    if (last_contacted) {
+      params.push(last_contacted);
+      updates.push(`last_contacted = $${params.length}`);
+    }
+    
+    if (notes) {
+      params.push(notes);
+      updates.push(`notes = $${params.length}`);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(lead_id);
+    
+    const query = `
+      UPDATE leads
+      SET ${updates.join(', ')}
+      WHERE id = $${params.length}
+      RETURNING *;
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Lead not found' });
+    }
+    
+    logRequest('PATCH', `/api/leads/${lead_id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('PATCH', `/api/leads/${lead_id}`, 500);
+    handleError(res, error);
+  }
+});
+
 // Get lead by phone number
 // Get lead by phone number
 app.get('/api/leads/:phone', async (req, res) => {
@@ -241,6 +364,108 @@ app.patch('/api/leads/:phone/interest', async (req, res) => {
     handleError(res, error);
   }
 });
+
+
+
+app.post('/api/leads/bulk', async (req, res) => {
+  try {
+    const { leads } = req.body;
+    
+    if (!Array.isArray(leads) || leads.length === 0) {
+      return res.status(400).json({ error: 'leads array is required' });
+    }
+    
+    const results = [];
+    const errors = [];
+    
+    for (const lead of leads) {
+      try {
+        const query = `
+          INSERT INTO leads (
+            phone_number, name, email, lead_source, company_id,
+            chess_rating, location, interest_level
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          ON CONFLICT (phone_number) DO UPDATE
+          SET 
+            name = COALESCE(EXCLUDED.name, leads.name),
+            email = COALESCE(EXCLUDED.email, leads.email),
+            updated_at = CURRENT_TIMESTAMP
+          RETURNING *;
+        `;
+        
+        const result = await pool.query(query, [
+          lead.phone_number,
+          lead.name || null,
+          lead.email || null,
+          lead.lead_source || 'import',
+          lead.company_id || null,
+          lead.chess_rating || null,
+          lead.location || null,
+          lead.interest_level || 1
+        ]);
+        
+        results.push(result.rows[0]);
+      } catch (error) {
+        errors.push({ phone: lead.phone_number, error: error.message });
+      }
+    }
+    
+    logRequest('POST', '/api/leads/bulk', 200);
+    res.json({ 
+      success: true, 
+      imported: results.length,
+      failed: errors.length,
+      data: results,
+      errors: errors
+    });
+  } catch (error) {
+    logRequest('POST', '/api/leads/bulk', 500);
+    handleError(res, error);
+  }
+});
+
+
+app.get('/api/search/leads', async (req, res) => {
+  try {
+    const { query: searchQuery, status, source } = req.query;
+
+    let query = `SELECT * FROM leads WHERE 1=1`;
+    const params = [];
+    let paramCount = 0;
+
+    if (searchQuery) {
+      paramCount++;
+      query += ` AND (name ILIKE $${paramCount} OR phone_number ILIKE $${paramCount})`;
+      params.push(`%${searchQuery}%`);
+    }
+
+    if (status) {
+      paramCount++;
+      query += ` AND lead_status = $${paramCount}`;
+      params.push(status);
+    }
+
+    if (source) {
+      paramCount++;
+      query += ` AND lead_source = $${paramCount}`;
+      params.push(source);
+    }
+
+    query += ` ORDER BY updated_at DESC LIMIT 50;`;
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', '/api/search/leads', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/search/leads', 500);
+    handleError(res, error);
+  }
+});
+
+
+
 
 // ============================================
 // 2. CONVERSATION ENDPOINTS
@@ -562,6 +787,46 @@ app.get('/api/invoices/lead/:lead_id', async (req, res) => {
   }
 });
 
+
+
+
+// ============================================
+// 3. GET ACTIVE CALLS (for duplicate prevention)
+// ============================================
+app.get('/api/active-calls', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        call_sid,
+        lead_id,
+        to_phone,
+        call_type,
+        call_status,
+        created_at
+      FROM call_logs
+      WHERE call_status IN ('initiated', 'in-progress', 'ringing')
+      AND created_at >= NOW() - INTERVAL '1 hour'
+      ORDER BY created_at DESC;
+    `;
+    
+    const result = await pool.query(query);
+    
+    logRequest('GET', '/api/active-calls', 200);
+    res.json({ 
+      success: true, 
+      count: result.rows.length,
+      calls: result.rows 
+    });
+  } catch (error) {
+    logRequest('GET', '/api/active-calls', 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+
 // ============================================
 // 7. WEBHOOK ENDPOINT (FROM n8n)
 // ============================================
@@ -716,6 +981,141 @@ app.post('/api/webhook/n8n', async (req, res) => {
     handleError(res, error);
   }
 });
+
+
+
+
+
+app.post('/api/webhook/call-completed', async (req, res) => {
+  try {
+    const { 
+      lead_id, 
+      call_sid,
+      transcript,
+      sentiment,
+      summary,
+      recording_url,
+      duration,
+      to_phone,
+      name,
+      call_type
+    } = req.body;
+    
+    if (!call_sid) {
+      return res.status(400).json({ error: 'call_sid is required' });
+    }
+    
+    // 1. Update call log in database
+    await pool.query(`
+      UPDATE call_logs
+      SET 
+        call_status = 'completed',
+        call_duration = $1,
+        transcript = $2,
+        sentiment = $3,
+        summary = $4,
+        recording_url = $5,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE call_sid = $6
+    `, [duration, transcript, JSON.stringify(sentiment), JSON.stringify(summary), recording_url, call_sid]);
+    
+    // 2. Update lead status
+    if (lead_id) {
+      const new_status = summary?.intent === 'interested' ? 'qualified' : 'contacted';
+      await pool.query(`
+        UPDATE leads
+        SET 
+          lead_status = $1,
+          interest_level = $2,
+          last_contacted = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+      `, [new_status, sentiment?.tone_score || 5, lead_id]);
+    }
+    
+    // 3. Save conversation
+    if (lead_id && to_phone) {
+      const convCheck = await pool.query('SELECT id FROM conversations WHERE lead_id = $1', [lead_id]);
+      
+      if (convCheck.rows.length > 0) {
+        await pool.query(`
+          UPDATE conversations
+          SET 
+            conversation_history = $1,
+            sentiment = $2,
+            ai_summary = $3,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE lead_id = $4
+        `, [transcript, sentiment?.sentiment, summary?.summary, lead_id]);
+      } else {
+        await pool.query(`
+          INSERT INTO conversations (lead_id, phone_number, conversation_history, sentiment, ai_summary)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [lead_id, to_phone, transcript, sentiment?.sentiment, summary?.summary]);
+      }
+    }
+    
+    logRequest('POST', '/api/webhook/call-completed', 200);
+    res.json({ 
+      success: true, 
+      message: 'Call completion processed',
+      lead_id,
+      call_sid 
+    });
+  } catch (error) {
+    logRequest('POST', '/api/webhook/call-completed', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// 5. WEBHOOK: CALL FAILED (from Python)
+// ============================================
+app.post('/api/webhook/call-failed', async (req, res) => {
+  try {
+    const { lead_id, call_sid, error, company_id, call_type } = req.body;
+    
+    if (!call_sid) {
+      return res.status(400).json({ error: 'call_sid is required' });
+    }
+    
+    // Update call log
+    await pool.query(`
+      UPDATE call_logs
+      SET 
+        call_status = 'failed',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE call_sid = $1
+    `, [call_sid]);
+    
+    // Update lead status
+    if (lead_id) {
+      await pool.query(`
+        UPDATE leads
+        SET 
+          lead_status = 'call_failed',
+          notes = COALESCE(notes || E'\n', '') || $1,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+      `, [`Call failed: ${error}`, lead_id]);
+    }
+    
+    logRequest('POST', '/api/webhook/call-failed', 200);
+    res.json({ 
+      success: true, 
+      message: 'Call failure processed',
+      lead_id,
+      call_sid 
+    });
+  } catch (error) {
+    logRequest('POST', '/api/webhook/call-failed', 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
 
 // ============================================
 // 8. NOTIFICATION ENDPOINTS
@@ -925,6 +1325,79 @@ app.get('/api/stats/messages', async (req, res) => {
 
 
 
+app.get('/api/metrics/dashboard', async (req, res) => {
+  try {
+    const metrics = {};
+    
+    // Total calls by type
+    const callsResult = await pool.query(`
+      SELECT 
+        call_type,
+        call_status,
+        COUNT(*) as count,
+        AVG(call_duration) as avg_duration
+      FROM call_logs
+      WHERE created_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY call_type, call_status;
+    `);
+    metrics.calls_24h = callsResult.rows;
+    
+    // Sentiment distribution
+    const sentimentResult = await pool.query(`
+      SELECT 
+        sentiment->>'sentiment' as sentiment_type,
+        COUNT(*) as count
+      FROM call_logs
+      WHERE sentiment IS NOT NULL
+      AND created_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY sentiment->>'sentiment';
+    `);
+    metrics.sentiment_distribution = sentimentResult.rows;
+    
+    // Lead conversion stats
+    const leadsResult = await pool.query(`
+      SELECT 
+        lead_status,
+        COUNT(*) as count
+      FROM leads
+      WHERE updated_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY lead_status;
+    `);
+    metrics.lead_status_24h = leadsResult.rows;
+    
+    // Active calls
+    const activeResult = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM call_logs
+      WHERE call_status IN ('initiated', 'in-progress', 'ringing')
+      AND created_at >= NOW() - INTERVAL '1 hour';
+    `);
+    metrics.active_calls = parseInt(activeResult.rows[0].count);
+    
+    // Success rate
+    const successResult = await pool.query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE call_status = 'completed') as completed,
+        COUNT(*) FILTER (WHERE call_status = 'failed') as failed,
+        COUNT(*) as total
+      FROM call_logs
+      WHERE created_at >= NOW() - INTERVAL '24 hours';
+    `);
+    const success = successResult.rows[0];
+    metrics.success_rate = success.total > 0 
+      ? ((success.completed / success.total) * 100).toFixed(2) 
+      : 0;
+    
+    logRequest('GET', '/api/metrics/dashboard', 200);
+    res.json({ success: true, data: metrics });
+  } catch (error) {
+    logRequest('GET', '/api/metrics/dashboard', 500);
+    handleError(res, error);
+  }
+});
+
+
+
 
 
 
@@ -1124,6 +1597,45 @@ app.post('/api/companies', async (req, res) => {
   }
 });
 
+
+
+app.get('/api/companies', async (req, res) => {
+  try {
+    const query = 'SELECT * FROM companies ORDER BY created_at DESC;';
+    const result = await pool.query(query);
+    
+    logRequest('GET', '/api/companies', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/companies', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// 7. GET COMPANY BY ID
+// ============================================
+app.get('/api/companies/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const query = 'SELECT * FROM companies WHERE id = $1;';
+    const result = await pool.query(query, [company_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Company not found' });
+    }
+    
+    logRequest('GET', `/api/companies/${company_id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/companies/${company_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
 // 2. Create/Update Agent Config
 app.post('/api/agent-configs', async (req, res) => {
   try {
@@ -1191,6 +1703,59 @@ app.get('/api/scheduled-calls/pending', async (req, res) => {
   }
 });
 
+
+
+app.patch('/api/scheduled-calls/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, call_sid } = req.body;  
+    
+    let query;
+    let params;
+    
+    if (status === 'called' && call_sid) {
+      query = `
+        UPDATE scheduled_calls
+        SET status = $1, call_sid = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+        RETURNING *;
+      `;
+      params = [status, call_sid, id];
+    } else if (status === 'failed') {
+      query = `
+        UPDATE scheduled_calls
+        SET status = $1, retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING *;
+      `;
+      params = [status, id];
+    } else {
+      query = `
+        UPDATE scheduled_calls
+        SET status = $1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING *;
+      `;
+      params = [status, id];
+    }
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Scheduled call not found' });
+    }
+    
+    logRequest('PATCH', `/api/scheduled-calls/${id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('PATCH', `/api/scheduled-calls/${id}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
 // 6. Create Call Log (from Python after call)
 app.post('/api/call-logs', async (req, res) => {
   try {
@@ -1239,6 +1804,723 @@ app.get('/api/call-logs/lead/:lead_id', async (req, res) => {
     const result = await pool.query(query, [lead_id]);
     res.json({ success: true, data: result.rows });
   } catch (error) {
+    handleError(res, error);
+  }
+});
+
+
+
+app.get('/api/call-logs', async (req, res) => {
+  try {
+    const { company_id, call_type, call_status, limit } = req.query;
+    
+    let query = 'SELECT * FROM call_logs WHERE 1=1';
+    const params = [];
+    
+    if (company_id) {
+      params.push(company_id);
+      query += ` AND company_id = ${params.length}`;
+    }
+    
+    if (call_type) {
+      params.push(call_type);
+      query += ` AND call_type = ${params.length}`;
+    }
+    
+    if (call_status) {
+      params.push(call_status);
+      query += ` AND call_status = ${params.length}`;
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    if (limit) {
+      params.push(parseInt(limit));
+      query += ` LIMIT ${params.length}`;
+    } else {
+      query += ' LIMIT 100';
+    }
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/call-logs', 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/call-logs', 500);
+    handleError(res, error);
+  }
+});
+
+
+app.get('/api/call-logs/:call_sid', async (req, res) => {
+  try {
+    const { call_sid } = req.params;
+    const query = 'SELECT * FROM call_logs WHERE call_sid = $1;';
+    const result = await pool.query(query, [call_sid]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Call log not found' });
+    }
+    
+    logRequest('GET', `/api/call-logs/${call_sid}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/call-logs/${call_sid}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+// ============================================
+// 10. GET CALL LOG BY CALL_SID
+// ============================================
+app.get('/api/call-logs/sid/:call_sid', async (req, res) => {
+  try {
+    const { call_sid } = req.params;
+    const query = 'SELECT * FROM call_logs WHERE call_sid = $1;';
+    const result = await pool.query(query, [call_sid]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Call log not found' });
+    }
+    
+    logRequest('GET', `/api/call-logs/sid/${call_sid}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/call-logs/sid/${call_sid}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+app.get('/api/call-logs/export/csv', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    let query = `
+      SELECT 
+        cl.call_sid,
+        cl.to_phone,
+        cl.from_phone,
+        cl.call_type,
+        cl.call_status,
+        cl.call_duration,
+        cl.created_at,
+        cl.sentiment->>'sentiment' as sentiment,
+        cl.sentiment->>'tone_score' as tone_score,
+        cl.summary->>'intent' as intent,
+        cl.summary->>'summary' as summary_text,
+        l.name as lead_name,
+        l.email as lead_email,
+        c.name as company_name
+      FROM call_logs cl
+      LEFT JOIN leads l ON cl.lead_id = l.id
+      LEFT JOIN companies c ON cl.company_id = c.id
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    
+    if (company_id) {
+      params.push(company_id);
+      query += ` AND cl.company_id = ${params.length}`;
+    }
+    
+    if (start_date) {
+      params.push(start_date);
+      query += ` AND cl.created_at >= ${params.length}`;
+    }
+    
+    if (end_date) {
+      params.push(end_date);
+      query += ` AND cl.created_at <= ${params.length}`;
+    }
+    
+    query += ' ORDER BY cl.created_at DESC;';
+    
+    const result = await pool.query(query, params);
+    
+    // Convert to CSV
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'No data to export' });
+    }
+    
+    const headers = Object.keys(result.rows[0]);
+    const csvRows = [headers.join(',')];
+    
+    for (const row of result.rows) {
+      const values = headers.map(header => {
+        const val = row[header];
+        return typeof val === 'string' ? `"${val.replace(/"/g, '""')}"` : val;
+      });
+      csvRows.push(values.join(','));
+    }
+    
+    const csv = csvRows.join('\n');
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="call_logs_${Date.now()}.csv"`);
+    res.send(csv);
+    
+    logRequest('GET', '/api/call-logs/export/csv', 200);
+  } catch (error) {
+    logRequest('GET', '/api/call-logs/export/csv', 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+
+// Create a simple notifications table endpoint
+app.post('/api/system-notifications', async (req, res) => {
+  try {
+    const { notification_type, title, message, priority, metadata } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ error: 'title and message are required' });
+    }
+
+    const query = `
+      INSERT INTO system_notifications (notification_type, title, message, priority, metadata)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      notification_type || 'info',
+      title,
+      message,
+      priority || 'normal',
+      metadata ? JSON.stringify(metadata) : null
+    ]);
+
+    logRequest('POST', '/api/system-notifications', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/system-notifications', 500);
+    handleError(res, error);
+  }
+});
+
+// Get recent notifications (replaces Slack checking)
+app.get('/api/system-notifications', async (req, res) => {
+  try {
+    const { type, priority, limit } = req.query;
+
+    let query = 'SELECT * FROM system_notifications WHERE 1=1';
+    const params = [];
+    let paramCount = 0;
+
+    if (type) {
+      paramCount++;
+      query += ` AND notification_type = $${paramCount}`;
+      params.push(type);
+    }
+
+    if (priority) {
+      paramCount++;
+      query += ` AND priority = $${paramCount}`;
+      params.push(priority);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    if (limit) {
+      paramCount++;
+      query += ` LIMIT $${paramCount}`;
+      params.push(parseInt(limit));
+    } else {
+      query += ' LIMIT 100';
+    }
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', '/api/system-notifications', 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/system-notifications', 500);
+    handleError(res, error);
+  }
+});
+
+// Mark notification as read
+app.patch('/api/system-notifications/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const query = `
+      UPDATE system_notifications
+      SET is_read = TRUE, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Notification not found' });
+    }
+
+    logRequest('PATCH', `/api/system-notifications/${id}/read`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('PATCH', `/api/system-notifications/${id}/read`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SIMPLE ANALYTICS SYSTEM (Replaces External Analytics)
+// ============================================
+
+// Track events internally
+app.post('/api/analytics/events', async (req, res) => {
+  try {
+    const { event_name, event_properties, lead_id, company_id } = req.body;
+
+    if (!event_name) {
+      return res.status(400).json({ error: 'event_name is required' });
+    }
+
+    const query = `
+      INSERT INTO analytics_events (event_name, event_properties, lead_id, company_id)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      event_name,
+      event_properties ? JSON.stringify(event_properties) : null,
+      lead_id || null,
+      company_id || null
+    ]);
+
+    logRequest('POST', '/api/analytics/events', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/analytics/events', 500);
+    handleError(res, error);
+  }
+});
+
+// Get analytics summary
+app.get('/api/analytics/summary', async (req, res) => {
+  try {
+    const { start_date, end_date, company_id } = req.query;
+
+    let query = `
+      SELECT 
+        event_name,
+        COUNT(*) as event_count,
+        COUNT(DISTINCT lead_id) as unique_leads,
+        DATE(created_at) as event_date
+      FROM analytics_events
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    let paramCount = 0;
+
+    if (start_date) {
+      paramCount++;
+      query += ` AND created_at >= $${paramCount}`;
+      params.push(start_date);
+    }
+
+    if (end_date) {
+      paramCount++;
+      query += ` AND created_at <= $${paramCount}`;
+      params.push(end_date);
+    }
+
+    if (company_id) {
+      paramCount++;
+      query += ` AND company_id = $${paramCount}`;
+      params.push(company_id);
+    }
+
+    query += ' GROUP BY event_name, DATE(created_at) ORDER BY event_date DESC;';
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', '/api/analytics/summary', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/analytics/summary', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SIMPLE ALERT/NOTIFICATION ENDPOINT
+// ============================================
+
+// Send alert (replaces Slack webhook in n8n)
+app.post('/api/alerts', async (req, res) => {
+  try {
+    const { alert_type, title, message, severity, lead_id, metadata } = req.body;
+
+    if (!title || !message) {
+      return res.status(400).json({ error: 'title and message are required' });
+    }
+
+    const query = `
+      INSERT INTO alerts (alert_type, title, message, severity, lead_id, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      alert_type || 'info',
+      title,
+      message,
+      severity || 'normal',
+      lead_id || null,
+      metadata ? JSON.stringify(metadata) : null
+    ]);
+
+    // Also create a system notification for UI
+    await pool.query(`
+      INSERT INTO system_notifications (notification_type, title, message, priority, metadata)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [alert_type, title, message, severity, metadata ? JSON.stringify(metadata) : null]);
+
+    logRequest('POST', '/api/alerts', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/alerts', 500);
+    handleError(res, error);
+  }
+});
+
+// Get recent alerts
+app.get('/api/alerts', async (req, res) => {
+  try {
+    const { severity, alert_type, limit } = req.query;
+
+    let query = 'SELECT * FROM alerts WHERE 1=1';
+    const params = [];
+    let paramCount = 0;
+
+    if (severity) {
+      paramCount++;
+      query += ` AND severity = $${paramCount}`;
+      params.push(severity);
+    }
+
+    if (alert_type) {
+      paramCount++;
+      query += ` AND alert_type = $${paramCount}`;
+      params.push(alert_type);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    if (limit) {
+      paramCount++;
+      query += ` LIMIT $${paramCount}`;
+      params.push(parseInt(limit));
+    } else {
+      query += ' LIMIT 50';
+    }
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', '/api/alerts', 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/alerts', 500);
+    handleError(res, error);
+  }
+});
+
+
+
+// ============================================
+// CALL RECORDINGS ENDPOINT
+// ============================================
+
+// Get recording by call_sid
+app.get('/api/recordings/:call_sid', async (req, res) => {
+  try {
+    const { call_sid } = req.params;
+
+    const query = `
+      SELECT recording_url, local_audio_path, call_duration, created_at
+      FROM call_logs
+      WHERE call_sid = $1;
+    `;
+
+    const result = await pool.query(query, [call_sid]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Recording not found' });
+    }
+
+    logRequest('GET', `/api/recordings/${call_sid}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/recordings/${call_sid}`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SUMMARY REPORTS ENDPOINT (Replaces metrics reports)
+// ============================================
+
+app.get('/api/reports/daily-summary', async (req, res) => {
+  try {
+    const { date, company_id } = req.query;
+    const targetDate = date || new Date().toISOString().split('T')[0];
+
+    const summary = {};
+
+    // Calls summary
+    let callsQuery = `
+      SELECT 
+        call_type,
+        call_status,
+        COUNT(*) as count,
+        AVG(call_duration) as avg_duration
+      FROM call_logs
+      WHERE DATE(created_at) = $1
+    `;
+    const params = [targetDate];
+    let paramCount = 1;
+
+    if (company_id) {
+      paramCount++;
+      callsQuery += ` AND company_id = $${paramCount}`;
+      params.push(company_id);
+    }
+
+    callsQuery += ' GROUP BY call_type, call_status;';
+    
+    const callsResult = await pool.query(callsQuery, params);
+    summary.calls = callsResult.rows;
+
+    // Sentiment summary
+    const sentimentQuery = `
+      SELECT 
+        sentiment->>'sentiment' as sentiment_type,
+        COUNT(*) as count
+      FROM call_logs
+      WHERE DATE(created_at) = $1
+      AND sentiment IS NOT NULL
+      ${company_id ? `AND company_id = $2` : ''}
+      GROUP BY sentiment->>'sentiment';
+    `;
+    
+    const sentimentResult = await pool.query(sentimentQuery, company_id ? [targetDate, company_id] : [targetDate]);
+    summary.sentiment = sentimentResult.rows;
+
+    // Leads updated
+    const leadsQuery = `
+      SELECT 
+        lead_status,
+        COUNT(*) as count
+      FROM leads
+      WHERE DATE(updated_at) = $1
+      ${company_id ? `AND company_id = $2` : ''}
+      GROUP BY lead_status;
+    `;
+    
+    const leadsResult = await pool.query(leadsQuery, company_id ? [targetDate, company_id] : [targetDate]);
+    summary.leads = leadsResult.rows;
+
+    logRequest('GET', '/api/reports/daily-summary', 200);
+    res.json({ 
+      success: true, 
+      date: targetDate,
+      data: summary 
+    });
+  } catch (error) {
+    logRequest('GET', '/api/reports/daily-summary', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SIMPLE EMAIL NOTIFICATION (No external SMTP)
+// ============================================
+
+// Store email notifications in database (to be sent by a cron job)
+app.post('/api/email-queue', async (req, res) => {
+  try {
+    const { to_email, subject, body, lead_id, priority } = req.body;
+
+    if (!to_email || !subject || !body) {
+      return res.status(400).json({ error: 'to_email, subject, and body are required' });
+    }
+
+    const query = `
+      INSERT INTO email_queue (to_email, subject, body, lead_id, priority, status)
+      VALUES ($1, $2, $3, $4, $5, 'pending')
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      to_email,
+      subject,
+      body,
+      lead_id || null,
+      priority || 'normal'
+    ]);
+
+    logRequest('POST', '/api/email-queue', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/email-queue', 500);
+    handleError(res, error);
+  }
+});
+
+// Get pending emails
+app.get('/api/email-queue/pending', async (req, res) => {
+  try {
+    const query = `
+      SELECT * FROM email_queue
+      WHERE status = 'pending'
+      ORDER BY priority DESC, created_at ASC
+      LIMIT 50;
+    `;
+
+    const result = await pool.query(query);
+
+    logRequest('GET', '/api/email-queue/pending', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/email-queue/pending', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// HOT LEADS ENDPOINT (Simple replacement for Slack alerts)
+// ============================================
+
+app.get('/api/hot-leads', async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        l.*,
+        cl.sentiment->>'tone_score' as tone_score,
+        cl.summary->>'intent' as intent,
+        cl.created_at as last_call_date
+      FROM leads l
+      JOIN call_logs cl ON l.id = cl.lead_id
+      WHERE l.lead_status = 'qualified'
+      OR (cl.sentiment->>'tone_score')::int >= 7
+      OR cl.summary->>'intent' = 'interested'
+      ORDER BY cl.created_at DESC
+      LIMIT 50;
+    `;
+
+    const result = await pool.query(query);
+
+    logRequest('GET', '/api/hot-leads', 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/hot-leads', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// FAILED CALLS ENDPOINT
+// ============================================
+
+app.get('/api/failed-calls', async (req, res) => {
+  try {
+    const { limit } = req.query;
+
+    const query = `
+      SELECT 
+        cl.*,
+        l.name,
+        l.email,
+        l.phone_number
+      FROM call_logs cl
+      LEFT JOIN leads l ON cl.lead_id = l.id
+      WHERE cl.call_status = 'failed'
+      ORDER BY cl.created_at DESC
+      LIMIT $1;
+    `;
+
+    const result = await pool.query(query, [parseInt(limit) || 50]);
+
+    logRequest('GET', '/api/failed-calls', 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/failed-calls', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SIMPLE DASHBOARD DATA ENDPOINT
+// ============================================
+
+app.get('/api/dashboard/overview', async (req, res) => {
+  try {
+    const overview = {};
+
+    // Today's stats
+    const today = new Date().toISOString().split('T')[0];
+
+    // Calls today
+    const callsToday = await pool.query(`
+      SELECT COUNT(*) as total, call_status
+      FROM call_logs
+      WHERE DATE(created_at) = $1
+      GROUP BY call_status;
+    `, [today]);
+    overview.calls_today = callsToday.rows;
+
+    // Hot leads (high interest)
+    const hotLeads = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM leads
+      WHERE lead_status = 'qualified'
+      AND updated_at >= NOW() - INTERVAL '24 hours';
+    `);
+    overview.hot_leads_24h = parseInt(hotLeads.rows[0].count);
+
+    // Failed calls today
+    const failedCalls = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM call_logs
+      WHERE call_status = 'failed'
+      AND DATE(created_at) = $1;
+    `, [today]);
+    overview.failed_calls_today = parseInt(failedCalls.rows[0].count);
+
+    // Active calls right now
+    const activeCalls = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM call_logs
+      WHERE call_status IN ('initiated', 'in-progress', 'ringing')
+      AND created_at >= NOW() - INTERVAL '1 hour';
+    `);
+    overview.active_calls = parseInt(activeCalls.rows[0].count);
+
+    // Pending scheduled calls
+    const pendingCalls = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM scheduled_calls
+      WHERE status = 'pending'
+      AND scheduled_time <= NOW() + INTERVAL '24 hours';
+    `);
+    overview.pending_calls_24h = parseInt(pendingCalls.rows[0].count);
+
+    logRequest('GET', '/api/dashboard/overview', 200);
+    res.json({ success: true, data: overview });
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/overview', 500);
     handleError(res, error);
   }
 });
