@@ -1,4 +1,4 @@
-# version: '3.8'
+version: '3.8'
 
 services:
   # PostgreSQL Database
@@ -13,15 +13,15 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
-      - ./migrations:/docker-entrypoint-initdb.d/migrations
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ajsal"]
+      test: ["CMD-SHELL", "pg_isready -U ajsal -d whatsapp_crm"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - whatsapp-crm-network
+    restart: unless-stopped
 
   # Node.js Backend
   backend:
@@ -43,8 +43,8 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./server.js:/app/server.js
-      - ./package.json:/app/package.json
+      - ./server.js:/app/server.js:ro
+      - ./package.json:/app/package.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]

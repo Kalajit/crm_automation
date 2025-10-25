@@ -380,6 +380,12 @@ app.post('/api/leads/bulk', async (req, res) => {
     
     for (const lead of leads) {
       try {
+        // FIX: Handle missing phone_number
+        if (!lead.phone_number) {
+          errors.push({ lead: lead, error: 'phone_number is required' });
+          continue;
+        }
+
         const query = `
           INSERT INTO leads (
             phone_number, name, email, lead_source, company_id,
@@ -407,6 +413,7 @@ app.post('/api/leads/bulk', async (req, res) => {
         
         results.push(result.rows[0]);
       } catch (error) {
+        console.error(`Error importing lead ${lead.phone_number}:`, error.message);
         errors.push({ phone: lead.phone_number, error: error.message });
       }
     }
@@ -420,6 +427,7 @@ app.post('/api/leads/bulk', async (req, res) => {
       errors: errors
     });
   } catch (error) {
+    console.error('Bulk import error:', error);
     logRequest('POST', '/api/leads/bulk', 500);
     handleError(res, error);
   }
@@ -649,6 +657,7 @@ app.post('/api/faqs', async (req, res) => {
       return res.status(400).json({ error: 'question and answer are required' });
     }
 
+    // FIX: Handle keywords as array directly (not JSON string)
     const query = `
       INSERT INTO faq_templates (question, answer, category, keywords, priority)
       VALUES ($1, $2, $3, $4, $5)
@@ -659,7 +668,7 @@ app.post('/api/faqs', async (req, res) => {
       question,
       answer,
       category || 'general',
-      keywords ? JSON.stringify(keywords) : null,
+      keywords || null,  // Pass array directly, not JSON.stringify
       priority || 1,
     ]);
 
@@ -670,6 +679,7 @@ app.post('/api/faqs', async (req, res) => {
     handleError(res, error);
   }
 });
+
 
 // ============================================
 // 5. BOOKING ENDPOINTS
@@ -949,14 +959,23 @@ app.post('/api/webhook/n8n', async (req, res) => {
       }
     }
 
-    // 3. Store message
+    // 3. Store message - FIX: Handle duplicate message_id
     if (message_body) {
-      await pool.query(
-        `INSERT INTO whatsapp_messages 
-         (conversation_id, lead_id, phone_number, message_type, message_body, sender, message_id, is_from_user)
-         VALUES ($1, $2, $3, 'text', $4, 'bot', $5, FALSE);`,
-        [convId, leadId, phone_number, message_body, message_id]
+      // Check if message already exists
+      const msgCheck = await pool.query(
+        'SELECT id FROM whatsapp_messages WHERE message_id = $1',
+        [message_id]
       );
+
+      if (msgCheck.rows.length === 0) {
+        // Only insert if message doesn't exist
+        await pool.query(
+          `INSERT INTO whatsapp_messages 
+           (conversation_id, lead_id, phone_number, message_type, message_body, sender, message_id, is_from_user)
+           VALUES ($1, $2, $3, 'text', $4, 'bot', $5, FALSE);`,
+          [convId, leadId, phone_number, message_body, message_id || `msg_${Date.now()}`]
+        );
+      }
     }
 
     // 4. Update conversation summary if AI summary provided
@@ -977,10 +996,12 @@ app.post('/api/webhook/n8n', async (req, res) => {
       conversation_id: convId
     });
   } catch (error) {
+    console.error('Webhook error:', error);
     logRequest('POST', '/api/webhook/n8n', 500);
     handleError(res, error);
   }
 });
+
 
 
 
@@ -1006,7 +1027,7 @@ app.post('/api/webhook/call-completed', async (req, res) => {
     }
     
     // 1. Update call log in database
-    await pool.query(`
+    const updateResult = await pool.query(`
       UPDATE call_logs
       SET 
         call_status = 'completed',
@@ -1017,7 +1038,14 @@ app.post('/api/webhook/call-completed', async (req, res) => {
         recording_url = $5,
         updated_at = CURRENT_TIMESTAMP
       WHERE call_sid = $6
+      RETURNING *
     `, [duration, transcript, JSON.stringify(sentiment), JSON.stringify(summary), recording_url, call_sid]);
+    
+    // Check if call log exists
+    if (updateResult.rows.length === 0) {
+      console.warn(`Call log not found for call_sid: ${call_sid}`);
+      // Don't fail, just log warning
+    }
     
     // 2. Update lead status
     if (lead_id) {
@@ -1063,6 +1091,7 @@ app.post('/api/webhook/call-completed', async (req, res) => {
       call_sid 
     });
   } catch (error) {
+    console.error('Call completed webhook error:', error);
     logRequest('POST', '/api/webhook/call-completed', 500);
     handleError(res, error);
   }
@@ -1207,9 +1236,10 @@ app.patch('/api/notifications/:id/sent', async (req, res) => {
     const { id } = req.params;
     const { status, sent_at } = req.body;
 
+    // FIX: Remove updated_at - notifications table doesn't have it
     const query = `
       UPDATE notifications
-      SET status = $1, sent_at = $2, updated_at = CURRENT_TIMESTAMP
+      SET status = $1, sent_at = $2
       WHERE id = $3
       RETURNING *;
     `;
@@ -1221,6 +1251,8 @@ app.patch('/api/notifications/:id/sent', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
 
 // ============================================
 // 9. DASHBOARD STATS ENDPOINTS
@@ -1539,33 +1571,7 @@ app.get('/api/search/leads', async (req, res) => {
   }
 });
 
-// ============================================
-// ERROR HANDLING
-// ============================================
 
-app.use((req, res) => {
-  logRequest(req.method, req.path, 404);
-  res.status(404).json({ error: 'Endpoint not found' });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ 
-    success: false,
-    error: 'Internal Server Error' 
-  });
-});
-
-// ============================================
-// START SERVER
-// ============================================
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n✓ WhatsApp CRM Backend running on http://localhost:${PORT}`);
-  console.log(`✓ Database: ${process.env.DB_NAME}`);
-  console.log(`✓ Environment: ${process.env.NODE_ENV}\n`);
-});
 
 
 
@@ -1818,25 +1824,25 @@ app.get('/api/call-logs', async (req, res) => {
     const params = [];
     
     if (company_id) {
-      params.push(company_id);
-      query += ` AND company_id = ${params.length}`;
+      params.push(parseInt(company_id));  // Convert to integer
+      query += ` AND company_id = $${params.length}`;  // FIX: Use $1 not 1
     }
     
     if (call_type) {
       params.push(call_type);
-      query += ` AND call_type = ${params.length}`;
+      query += ` AND call_type = $${params.length}`;  // FIX: Use $2 not 2
     }
     
     if (call_status) {
       params.push(call_status);
-      query += ` AND call_status = ${params.length}`;
+      query += ` AND call_status = $${params.length}`;  // FIX: Use $3 not 3
     }
     
     query += ' ORDER BY created_at DESC';
     
     if (limit) {
       params.push(parseInt(limit));
-      query += ` LIMIT ${params.length}`;
+      query += ` LIMIT $${params.length}`;  // FIX: Use $4 not 4
     } else {
       query += ' LIMIT 100';
     }
@@ -1850,6 +1856,7 @@ app.get('/api/call-logs', async (req, res) => {
     handleError(res, error);
   }
 });
+
 
 
 app.get('/api/call-logs/:call_sid', async (req, res) => {
@@ -1923,18 +1930,18 @@ app.get('/api/call-logs/export/csv', async (req, res) => {
     const params = [];
     
     if (company_id) {
-      params.push(company_id);
-      query += ` AND cl.company_id = ${params.length}`;
+      params.push(parseInt(company_id));  // Convert to integer
+      query += ` AND cl.company_id = $${params.length}`;  // FIX: Use $1 not 1
     }
     
     if (start_date) {
       params.push(start_date);
-      query += ` AND cl.created_at >= ${params.length}`;
+      query += ` AND cl.created_at >= $${params.length}::timestamp`;  // FIX: Cast to timestamp
     }
     
     if (end_date) {
       params.push(end_date);
-      query += ` AND cl.created_at <= ${params.length}`;
+      query += ` AND cl.created_at <= $${params.length}::timestamp`;  // FIX: Cast to timestamp
     }
     
     query += ' ORDER BY cl.created_at DESC;';
@@ -1969,6 +1976,7 @@ app.get('/api/call-logs/export/csv', async (req, res) => {
     handleError(res, error);
   }
 });
+
 
 
 
@@ -2523,4 +2531,36 @@ app.get('/api/dashboard/overview', async (req, res) => {
     logRequest('GET', '/api/dashboard/overview', 500);
     handleError(res, error);
   }
+});
+
+
+
+
+
+// ============================================
+// ERROR HANDLING
+// ============================================
+
+app.use((req, res) => {
+  logRequest(req.method, req.path, 404);
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ 
+    success: false,
+    error: 'Internal Server Error' 
+  });
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n✓ WhatsApp CRM Backend running on http://localhost:${PORT}`);
+  console.log(`✓ Database: ${process.env.DB_NAME}`);
+  console.log(`✓ Environment: ${process.env.NODE_ENV}\n`);
 });
