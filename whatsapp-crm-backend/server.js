@@ -1675,6 +1675,256 @@ app.get('/api/agent-configs/:company_id', async (req, res) => {
   }
 });
 
+
+
+// ============================================
+// AGENT INSTANCES ENDPOINTS (CLOSERX-LIKE)
+// ============================================
+
+// Create Agent Instance
+app.post('/api/agent-instances', async (req, res) => {
+  try {
+    const { 
+      company_id, 
+      agent_name, 
+      agent_type, 
+      phone_number, 
+      whatsapp_number,
+      agent_config_id,
+      custom_prompt,
+      custom_voice,
+      metadata
+    } = req.body;
+
+    if (!company_id || !agent_name || !agent_type) {
+      return res.status(400).json({ error: 'company_id, agent_name, and agent_type are required' });
+    }
+
+    const query = `
+      INSERT INTO agent_instances 
+      (company_id, agent_name, agent_type, phone_number, whatsapp_number, agent_config_id, custom_prompt, custom_voice, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      company_id,
+      agent_name,
+      agent_type,
+      phone_number || null,
+      whatsapp_number || null,
+      agent_config_id || null,
+      custom_prompt || null,
+      custom_voice || null,
+      metadata ? JSON.stringify(metadata) : null
+    ]);
+
+    logRequest('POST', '/api/agent-instances', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/agent-instances', 500);
+    handleError(res, error);
+  }
+});
+
+// Get All Agent Instances for a Company
+app.get('/api/agent-instances/company/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { agent_type } = req.query;
+
+    let query = `
+      SELECT ai.*, ac.prompt_key, ac.voice as default_voice, ac.model_name
+      FROM agent_instances ai
+      LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+      WHERE ai.company_id = $1
+    `;
+    
+    const params = [company_id];
+    
+    if (agent_type) {
+      query += ` AND ai.agent_type = $2`;
+      params.push(agent_type);
+    }
+    
+    query += ` ORDER BY ai.created_at DESC;`;
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', `/api/agent-instances/company/${company_id}`, 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', `/api/agent-instances/company/${company_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// Get Single Agent Instance
+app.get('/api/agent-instances/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const query = `
+      SELECT ai.*, ac.prompt_preamble, ac.initial_message, ac.voice as default_voice, ac.model_name
+      FROM agent_instances ai
+      LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+      WHERE ai.id = $1;
+    `;
+
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Agent instance not found' });
+    }
+
+    logRequest('GET', `/api/agent-instances/${id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/agent-instances/${id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// Update Agent Instance
+app.patch('/api/agent-instances/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { 
+      agent_name, 
+      phone_number, 
+      whatsapp_number,
+      custom_prompt,
+      custom_voice,
+      is_active,
+      metadata
+    } = req.body;
+
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+
+    if (agent_name) {
+      paramCount++;
+      updates.push(`agent_name = $${paramCount}`);
+      params.push(agent_name);
+    }
+
+    if (phone_number !== undefined) {
+      paramCount++;
+      updates.push(`phone_number = $${paramCount}`);
+      params.push(phone_number);
+    }
+
+    if (whatsapp_number !== undefined) {
+      paramCount++;
+      updates.push(`whatsapp_number = $${paramCount}`);
+      params.push(whatsapp_number);
+    }
+
+    if (custom_prompt !== undefined) {
+      paramCount++;
+      updates.push(`custom_prompt = $${paramCount}`);
+      params.push(custom_prompt);
+    }
+
+    if (custom_voice !== undefined) {
+      paramCount++;
+      updates.push(`custom_voice = $${paramCount}`);
+      params.push(custom_voice);
+    }
+
+    if (is_active !== undefined) {
+      paramCount++;
+      updates.push(`is_active = $${paramCount}`);
+      params.push(is_active);
+    }
+
+    if (metadata) {
+      paramCount++;
+      updates.push(`metadata = $${paramCount}`);
+      params.push(JSON.stringify(metadata));
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    paramCount++;
+    params.push(id);
+
+    const query = `
+      UPDATE agent_instances
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Agent instance not found' });
+    }
+
+    logRequest('PATCH', `/api/agent-instances/${id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('PATCH', `/api/agent-instances/${id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// Delete Agent Instance
+app.delete('/api/agent-instances/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const query = `DELETE FROM agent_instances WHERE id = $1 RETURNING *;`;
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Agent instance not found' });
+    }
+
+    logRequest('DELETE', `/api/agent-instances/${id}`, 200);
+    res.json({ success: true, message: 'Agent instance deleted', data: result.rows[0] });
+  } catch (error) {
+    logRequest('DELETE', `/api/agent-instances/${id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// Get Agent Instance by Phone Number (for routing incoming calls/messages)
+app.get('/api/agent-instances/phone/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+
+    const query = `
+      SELECT ai.*, ac.prompt_preamble, ac.initial_message, ac.voice as default_voice, ac.model_name, c.name as company_name
+      FROM agent_instances ai
+      LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+      LEFT JOIN companies c ON ai.company_id = c.id
+      WHERE (ai.phone_number = $1 OR ai.whatsapp_number = $1)
+      AND ai.is_active = TRUE
+      LIMIT 1;
+    `;
+
+    const result = await pool.query(query, [phone]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'No active agent found for this number' });
+    }
+
+    logRequest('GET', `/api/agent-instances/phone/${phone}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/agent-instances/phone/${phone}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
 // 4. Schedule Call (from n8n or manual)
 app.post('/api/schedule-call', async (req, res) => {
   try {

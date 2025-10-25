@@ -1464,6 +1464,31 @@ CREATE TABLE agent_configs (
   UNIQUE(company_id, prompt_key)
 );
 
+
+
+
+
+-- AGENT INSTANCES (Multiple AI agents per company)
+DROP TABLE IF EXISTS agent_instances CASCADE;
+CREATE TABLE agent_instances (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  agent_name VARCHAR(255) NOT NULL,
+  agent_type VARCHAR(50) DEFAULT 'voice', -- 'voice' or 'whatsapp'
+  phone_number VARCHAR(20), -- Dedicated number for this agent
+  whatsapp_number VARCHAR(20), -- WhatsApp number if applicable
+  agent_config_id INTEGER REFERENCES agent_configs(id) ON DELETE SET NULL,
+  custom_prompt TEXT, -- Override default prompt
+  custom_voice VARCHAR(50), -- Override default voice
+  is_active BOOLEAN DEFAULT TRUE,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, agent_name)
+);
+
+
+
 -- 13. CALL LOGS
 DROP TABLE IF EXISTS call_logs CASCADE;
 CREATE TABLE call_logs (
@@ -1609,6 +1634,12 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_calls_status ON scheduled_calls(status,
 -- Agent configs indexes
 CREATE INDEX IF NOT EXISTS idx_agent_configs_company ON agent_configs(company_id);
 
+
+CREATE INDEX IF NOT EXISTS idx_agent_instances_company ON agent_instances(company_id);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_phone ON agent_instances(phone_number);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_type ON agent_instances(agent_type);
+
+
 -- System notifications indexes
 CREATE INDEX IF NOT EXISTS idx_system_notifications_type ON system_notifications(notification_type);
 CREATE INDEX IF NOT EXISTS idx_system_notifications_priority ON system_notifications(priority, created_at DESC);
@@ -1673,6 +1704,11 @@ CREATE TRIGGER update_call_logs_timestamp BEFORE UPDATE ON call_logs FOR EACH RO
 
 DROP TRIGGER IF EXISTS update_agent_configs_timestamp ON agent_configs;
 CREATE TRIGGER update_agent_configs_timestamp BEFORE UPDATE ON agent_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+DROP TRIGGER IF EXISTS update_agent_instances_timestamp ON agent_instances;
+CREATE TRIGGER update_agent_instances_timestamp BEFORE UPDATE ON agent_instances FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
 
 DROP TRIGGER IF EXISTS update_system_notifications_timestamp ON system_notifications;
 CREATE TRIGGER update_system_notifications_timestamp BEFORE UPDATE ON system_notifications FOR EACH ROW EXECUTE FUNCTION update_timestamp();
