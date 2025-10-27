@@ -1288,6 +1288,8 @@ CREATE TABLE leads (
   education_certs TEXT,
   availability TEXT,
   age_group_pref TEXT,
+
+  preferred_language VARCHAR(10) DEFAULT 'en', -- ADDED FOR MULTILINGUAL SUPPORT
   
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1482,6 +1484,7 @@ CREATE TABLE agent_instances (
   custom_voice VARCHAR(50), -- Override default voice
   is_active BOOLEAN DEFAULT TRUE,
   metadata JSONB DEFAULT '{}'::jsonb,
+  supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'], -- NEW: Add supported languages
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, agent_name)
@@ -1598,6 +1601,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_source ON leads(lead_source);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(lead_status);
 CREATE INDEX IF NOT EXISTS idx_leads_location ON leads(location);
 CREATE INDEX IF NOT EXISTS idx_leads_chess_rating ON leads(chess_rating);
+CREATE INDEX IF NOT EXISTS idx_leads_language ON leads(preferred_language); -- NEW: Add index for language queries
 
 -- Conversations indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_lead_id ON conversations(lead_id);

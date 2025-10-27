@@ -4,9 +4,58 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
+
+
+
+// Translation function using Google Translate API
+async function translateText(text, targetLang, sourceLang = 'en') {
+  if (targetLang === 'en' || !text) return text;
+  
+  try {
+    // Using free Google Translate API (via googletrans library equivalent)
+    // Note: For production, consider using official Google Cloud Translation API
+    const response = await axios.get('https://translate.googleapis.com/translate_a/single', {
+      params: {
+        client: 'gtx',
+        sl: sourceLang,
+        tl: targetLang,
+        dt: 't',
+        q: text
+      }
+    });
+    
+    return response.data[0][0][0];
+  } catch (error) {
+    console.error('Translation error:', error.message);
+    return text; // Return original on error
+  }
+}
+
+// Detect language from text
+function detectLanguage(text) {
+  const lowerText = text.toLowerCase();
+  
+  // Hindi keywords
+  if (lowerText.includes('hindi') || lowerText.includes('हिंदी') || /[\u0900-\u097F]/.test(text)) {
+    return 'hi';
+  }
+  
+  // Kannada keywords
+  if (lowerText.includes('kannada') || lowerText.includes('ಕನ್ನಡ') || /[\u0C80-\u0CFF]/.test(text)) {
+    return 'kn';
+  }
+  
+  // Malayalam keywords
+  if (lowerText.includes('malayalam') || lowerText.includes('മലയാളം') || /[\u0D00-\u0D7F]/.test(text)) {
+    return 'ml';
+  }
+  
+  return 'en';
+}
 
 // ============================================
 // MIDDLEWARE
@@ -868,6 +917,12 @@ app.post('/api/webhook/n8n', async (req, res) => {
       return res.status(400).json({ error: 'phone_number is required' });
     }
 
+    // Detect language from message
+    const detectedLanguage = detectLanguage(message_body || '');
+    
+    // Check if language switch requested
+    const languageChanged = detectedLanguage !== 'en';
+
     // 1. Create or update lead with all custom fields
     let leadId;
     let leadQuery = `SELECT id FROM leads WHERE phone_number = $1;`;
@@ -878,9 +933,10 @@ app.post('/api/webhook/n8n', async (req, res) => {
         INSERT INTO leads (
           phone_number, name, lead_source, interest_level,
           chess_rating, location, tournament_experience, coaching_experience,
-          education_certs, availability, age_group_pref, last_contacted
+          education_certs, availability, age_group_pref, last_contacted,
+          preferred_language
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING id;
       `;
       leadResult = await pool.query(createLead, [
@@ -895,7 +951,8 @@ app.post('/api/webhook/n8n', async (req, res) => {
         education_certs || null,
         availability || null,
         age_group_pref || null,
-        new Date().toISOString()
+        new Date().toISOString(),
+        detectedLanguage
       ]);
     } else {
       // Update existing lead
@@ -912,6 +969,7 @@ app.post('/api/webhook/n8n', async (req, res) => {
           availability = COALESCE($9, availability),
           age_group_pref = COALESCE($10, age_group_pref),
           last_contacted = $11,
+          preferred_language = CASE WHEN $12 != 'en' THEN $12 ELSE preferred_language END,
           updated_at = CURRENT_TIMESTAMP
         WHERE phone_number = $1
         RETURNING id;
@@ -927,7 +985,8 @@ app.post('/api/webhook/n8n', async (req, res) => {
         education_certs,
         availability,
         age_group_pref,
-        new Date().toISOString()
+        new Date().toISOString(),
+        detectedLanguage
       ]);
     }
     leadId = leadResult.rows[0].id;
@@ -1001,7 +1060,6 @@ app.post('/api/webhook/n8n', async (req, res) => {
     handleError(res, error);
   }
 });
-
 
 
 
@@ -1459,6 +1517,72 @@ app.patch('/api/leads/:phone/last-contacted', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
+
+
+// ============================================
+// LANGUAGE PREFERENCE ENDPOINTS
+// ============================================
+
+// Get lead's language preference
+app.get('/api/leads/:phone/language', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    
+    const query = `
+      SELECT preferred_language 
+      FROM leads 
+      WHERE phone_number = $1;
+    `;
+    
+    const result = await pool.query(query, [phone]);
+    
+    if (result.rows.length === 0) {
+      return res.json({ success: true, language: 'en' }); // Default
+    }
+    
+    logRequest('GET', `/api/leads/${phone}/language`, 200);
+    res.json({ success: true, language: result.rows[0].preferred_language || 'en' });
+  } catch (error) {
+    logRequest('GET', `/api/leads/${phone}/language`, 500);
+    handleError(res, error);
+  }
+});
+
+// Update lead's language preference
+app.patch('/api/leads/:phone/language', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { language } = req.body;
+    
+    if (!['en', 'hi', 'kn', 'ml'].includes(language)) {
+      return res.status(400).json({ error: 'Invalid language code' });
+    }
+    
+    const query = `
+      UPDATE leads
+      SET preferred_language = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE phone_number = $2
+      RETURNING *;
+    `;
+    
+    const result = await pool.query(query, [language, phone]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Lead not found' });
+    }
+    
+    logRequest('PATCH', `/api/leads/${phone}/language`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('PATCH', `/api/leads/${phone}/language`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
 
 // ============================================
 // 10. AUDIT LOG ENDPOINTS
