@@ -13,49 +13,87 @@ const app = express();
 
 // Translation function using Google Translate API
 async function translateText(text, targetLang, sourceLang = 'en') {
-  if (targetLang === 'en' || !text) return text;
+  if (targetLang === sourceLang || !text) return text;
   
   try {
-    // Using free Google Translate API (via googletrans library equivalent)
-    // Note: For production, consider using official Google Cloud Translation API
-    const response = await axios.get('https://translate.googleapis.com/translate_a/single', {
-      params: {
-        client: 'gtx',
-        sl: sourceLang,
-        tl: targetLang,
-        dt: 't',
-        q: text
-      }
-    });
+    // Primary: LibreTranslate
+    const response = await axios.post(`${LIBRETRANSLATE_URL}/translate`, {
+      q: text,
+      source: sourceLang,
+      target: targetLang,
+      format: 'text'
+    }, { timeout: 10000 });
     
-    return response.data[0][0][0];
+    const translated = response.data.translatedText;
+    
+    if (translated && translated !== text) {
+      console.log(`LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
+      return translated;
+    }
+    
   } catch (error) {
-    console.error('Translation error:', error.message);
-    return text; // Return original on error
+    console.error('LibreTranslate error:', error.message);
+    
+    // Fallback: DeepL (if API key set)
+    if (DEEPL_API_KEY) {
+      try {
+        const deepl = require('deepl-node');
+        const translator = new deepl.Translator(DEEPL_API_KEY);
+        const result = await translator.translateText(text, sourceLang, targetLang);
+        console.log(`DeepL fallback used: ${text.substring(0, 50)}...`);
+        return result.text;
+      } catch (deeplError) {
+        console.error('DeepL fallback error:', deeplError.message);
+      }
+    }
   }
+  
+  // Ultimate fallback: return original
+  console.warn(`Translation failed, returning original: ${text.substring(0, 50)}...`);
+  return text;
 }
 
-// Detect language from text
+
+
+
+/**
+ * Detect language from text using Unicode ranges + keywords
+ * (No external API needed, instant detection)
+ */
 function detectLanguage(text) {
   const lowerText = text.toLowerCase();
   
-  // Hindi keywords
+  // Keyword-based detection
   if (lowerText.includes('hindi') || lowerText.includes('हिंदी') || /[\u0900-\u097F]/.test(text)) {
     return 'hi';
   }
   
-  // Kannada keywords
   if (lowerText.includes('kannada') || lowerText.includes('ಕನ್ನಡ') || /[\u0C80-\u0CFF]/.test(text)) {
     return 'kn';
   }
   
-  // Malayalam keywords
   if (lowerText.includes('malayalam') || lowerText.includes('മലയാളം') || /[\u0D00-\u0D7F]/.test(text)) {
     return 'ml';
   }
   
+  if (lowerText.includes('tamil') || lowerText.includes('தமிழ்') || /[\u0B80-\u0BFF]/.test(text)) {
+    return 'ta';
+  }
+  
+  if (lowerText.includes('telugu') || lowerText.includes('తెలుగు') || /[\u0C00-\u0C7F]/.test(text)) {
+    return 'te';
+  }
+  
   return 'en';
 }
+
+
+// LibreTranslate Configuration
+const LIBRETRANSLATE_URL = process.env.LIBRETRANSLATE_URL || 'http://libretranslate:5000';
+
+// Optional: DeepL Configuration
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY || null;
+
 
 // ============================================
 // MIDDLEWARE

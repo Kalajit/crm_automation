@@ -1,6 +1,43 @@
 version: '3.8'
 
 services:
+
+  # ========================================
+  # LibreTranslate - FREE Self-Hosted Translation
+  # ========================================
+  libretranslate:
+    image: libretranslate/libretranslate:v1.5.7
+    container_name: whatsapp-crm-translate
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      LT_DISABLE_WEB_UI: "true"      # Disable UI in production
+      LT_UPDATE_MODELS: "false"      # Prevent auto-updates
+      LT_THREADS: "4"
+      LT_FRONTEND_LANGUAGE_SOURCE: "en"
+      LT_FRONTEND_LANGUAGE_TARGET: "hi"
+    volumes:
+      - libretranslate_data:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/languages || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - whatsapp-crm-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 1G
+          cpus: '1'
+
+
+
+
   # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
@@ -25,10 +62,14 @@ services:
 
   # Node.js Backend
   backend:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
     container_name: whatsapp-crm-api
     depends_on:
       postgres:
+        condition: service_healthy
+      libretranslate:
         condition: service_healthy
     environment:
       NODE_ENV: production
@@ -40,6 +81,8 @@ services:
       PORT: 3000
       API_KEY: ${API_KEY:-your_secret_api_key_change_this}
       GROQ_API_KEY: ${GROQ_API_KEY:-your_groq_api_key}
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
     ports:
       - "3000:3000"
     volumes:
@@ -60,8 +103,44 @@ services:
         max-size: "10m"
         max-file: "3"
 
+
+
+  # ========================================
+  # Python AI Agent (Voice + WhatsApp AI)
+  # ========================================
+  python-agent:
+    build:
+      context: ../call automation
+      dockerfile: Dockerfile
+    container_name: whatsapp-crm-ai-agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+      libretranslate:
+        condition: service_healthy
+    environment:
+      PORT: 8000
+      DB_HOST: postgres
+      DB_USER: ajsal
+      DB_PASSWORD: "ajsalpv@4champz.in"
+      DB_NAME: whatsapp_crm
+      DB_PORT: 5432
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../call automation:/app:ro
+    restart: unless-stopped
+    networks:
+      - whatsapp-crm-network
+
+
+
 volumes:
   postgres_data:
+    driver: local
+  libretranslate_data:
     driver: local
 
 networks:
