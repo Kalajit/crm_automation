@@ -1590,6 +1590,149 @@ CREATE TABLE email_queue (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+
+
+-- ============================================
+-- HUMAN TAKEOVER TABLES
+-- ============================================
+
+-- 1. HUMAN AGENTS TABLE (Sales Reps)
+DROP TABLE IF EXISTS human_agents CASCADE;
+CREATE TABLE human_agents (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  phone VARCHAR(20),
+  role VARCHAR(100) DEFAULT 'sales_rep', -- sales_rep, senior_rep, specialist, manager
+  status VARCHAR(50) DEFAULT 'available', -- available, busy, offline
+  assigned_leads INTEGER DEFAULT 0,
+  max_concurrent_leads INTEGER DEFAULT 5,
+  expertise TEXT[], -- ['high_value', 'angry_customer', 'technical']
+  working_hours JSONB DEFAULT '{"start": "09:00", "end": "18:00", "timezone": "Asia/Kolkata"}',
+  notification_channels JSONB DEFAULT '{"email": true, "whatsapp": true, "sms": false}',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. TAKEOVER REQUESTS TABLE
+DROP TABLE IF EXISTS takeover_requests CASCADE;
+CREATE TABLE takeover_requests (
+  id SERIAL PRIMARY KEY,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+  call_sid VARCHAR(100), -- For voice calls
+  conversation_id INTEGER REFERENCES conversations(id), -- For WhatsApp
+  request_type VARCHAR(50) NOT NULL, -- 'call_transfer', 'whatsapp_takeover', 'escalation'
+  trigger_reason VARCHAR(100) NOT NULL, -- 'angry_customer', 'high_value', 'confused', 'manual_request'
+  ai_sentiment JSONB,
+  ai_summary TEXT,
+  conversation_context TEXT,
+  status VARCHAR(50) DEFAULT 'pending', -- pending, assigned, in_progress, completed, expired
+  assigned_agent_id INTEGER REFERENCES human_agents(id),
+  assigned_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  priority VARCHAR(20) DEFAULT 'medium', -- low, medium, high, urgent
+  metadata JSONB,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. HUMAN SESSIONS TABLE (Track human agent activity)
+DROP TABLE IF EXISTS human_sessions CASCADE;
+CREATE TABLE human_sessions (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  session_type VARCHAR(50) NOT NULL, -- 'call', 'whatsapp', 'email'
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ended_at TIMESTAMP,
+  duration_seconds INTEGER,
+  messages_sent INTEGER DEFAULT 0,
+  outcome VARCHAR(100), -- 'converted', 'follow_up_scheduled', 'not_interested', 'escalated'
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+
+
+-- CAMPAIGNS TABLE
+DROP TABLE IF EXISTS campaigns CASCADE;
+CREATE TABLE campaigns (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  campaign_name VARCHAR(255) NOT NULL,
+  campaign_type VARCHAR(50) DEFAULT 'outbound',
+  total_leads INTEGER NOT NULL,
+  scheduled_start TIMESTAMP,
+  call_rate_per_minute INTEGER DEFAULT 1,
+  status VARCHAR(50) DEFAULT 'scheduled',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Add campaign_id to scheduled_calls
+ALTER TABLE scheduled_calls ADD COLUMN IF NOT EXISTS campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL;
+
+
+
+
+-- ============================================
+-- DYNAMIC CUSTOM FIELDS SYSTEM
+-- ============================================
+
+-- 1. CUSTOM FIELD DEFINITIONS (Per Company/Agent Instance)
+DROP TABLE IF EXISTS custom_field_definitions CASCADE;
+CREATE TABLE custom_field_definitions (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  agent_instance_id INTEGER REFERENCES agent_instances(id) ON DELETE CASCADE,
+  field_key VARCHAR(100) NOT NULL, -- e.g., 'chess_rating', 'appointment_date', 'shoe_size'
+  field_label VARCHAR(255) NOT NULL, -- e.g., 'Chess Rating', 'Appointment Date', 'Shoe Size'
+  field_type VARCHAR(50) NOT NULL, -- 'text', 'number', 'date', 'email', 'phone', 'select', 'multiselect', 'boolean'
+  field_category VARCHAR(100), -- 'personal', 'qualification', 'preference', 'medical', etc.
+  is_required BOOLEAN DEFAULT FALSE,
+  validation_rules JSONB, -- {"min": 1000, "max": 3000, "pattern": "^[0-9]+$"}
+  extraction_config JSONB, -- {"keywords": ["rating", "elo"], "regex": "\\b(\\d{3,4})\\b"}
+  display_order INTEGER DEFAULT 0,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, field_key)
+);
+
+-- 2. CUSTOM FIELD VALUES (Actual Lead Data)
+DROP TABLE IF EXISTS lead_custom_data CASCADE;
+CREATE TABLE lead_custom_data (
+  id SERIAL PRIMARY KEY,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  field_definition_id INTEGER NOT NULL REFERENCES custom_field_definitions(id) ON DELETE CASCADE,
+  field_key VARCHAR(100) NOT NULL,
+  field_value TEXT,
+  field_value_normalized TEXT, -- Cleaned/normalized value for searching
+  source VARCHAR(50) DEFAULT 'ai_extraction', -- 'ai_extraction', 'manual', 'api', 'form'
+  confidence_score FLOAT, -- 0.0 to 1.0 (how confident AI is about extraction)
+  extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(lead_id, field_definition_id)
+);
+
+-- 3. EXTRACTION TEMPLATES (Pre-built for common industries)
+DROP TABLE IF EXISTS extraction_templates CASCADE;
+CREATE TABLE extraction_templates (
+  id SERIAL PRIMARY KEY,
+  template_name VARCHAR(255) NOT NULL UNIQUE,
+  industry VARCHAR(100) NOT NULL, -- 'chess_coaching', 'medical', 'real_estate', 'ecommerce', etc.
+  description TEXT,
+  field_definitions JSONB NOT NULL, -- Array of field configs
+  is_system_template BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
 -- ============================================
 -- INDEXES FOR PERFORMANCE
 -- ============================================
@@ -1665,6 +1808,29 @@ CREATE INDEX IF NOT EXISTS idx_analytics_events_created ON analytics_events(crea
 CREATE INDEX IF NOT EXISTS idx_email_queue_status ON email_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_email_queue_priority ON email_queue(priority, status);
 
+
+CREATE INDEX IF NOT EXISTS idx_takeover_requests_status ON takeover_requests(status, priority, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_takeover_requests_agent ON takeover_requests(assigned_agent_id);
+CREATE INDEX IF NOT EXISTS idx_human_agents_status ON human_agents(status, assigned_leads);
+CREATE INDEX IF NOT EXISTS idx_human_sessions_agent ON human_sessions(agent_id, started_at DESC);
+
+
+
+CREATE INDEX IF NOT EXISTS idx_custom_field_defs_company ON custom_field_definitions(company_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_custom_field_defs_agent ON custom_field_definitions(agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_lead_custom_data_lead ON lead_custom_data(lead_id);
+CREATE INDEX IF NOT EXISTS idx_lead_custom_data_field ON lead_custom_data(field_key);
+CREATE INDEX IF NOT EXISTS idx_lead_custom_data_normalized ON lead_custom_data(field_value_normalized);
+
+
+
+
+-- Add index for in-progress calls
+CREATE INDEX IF NOT EXISTS idx_call_logs_in_progress ON call_logs(call_sid, call_status) WHERE call_status = 'in-progress';
+
+-- Add index for conversation turns
+CREATE INDEX IF NOT EXISTS idx_conversation_history ON call_logs USING GIN (conversation_history);
+
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
 -- ============================================
@@ -1716,6 +1882,22 @@ CREATE TRIGGER update_agent_instances_timestamp BEFORE UPDATE ON agent_instances
 
 DROP TRIGGER IF EXISTS update_system_notifications_timestamp ON system_notifications;
 CREATE TRIGGER update_system_notifications_timestamp BEFORE UPDATE ON system_notifications FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+
+DROP TRIGGER IF EXISTS update_human_agents_timestamp ON human_agents;
+CREATE TRIGGER update_human_agents_timestamp BEFORE UPDATE ON human_agents FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_takeover_requests_timestamp ON takeover_requests;
+CREATE TRIGGER update_takeover_requests_timestamp BEFORE UPDATE ON takeover_requests FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+
+DROP TRIGGER IF EXISTS update_custom_field_definitions_timestamp ON custom_field_definitions;
+CREATE TRIGGER update_custom_field_definitions_timestamp BEFORE UPDATE ON custom_field_definitions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_lead_custom_data_timestamp ON lead_custom_data;
+CREATE TRIGGER update_lead_custom_data_timestamp BEFORE UPDATE ON lead_custom_data FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
 
@@ -2177,6 +2359,268 @@ INSERT INTO system_notifications (notification_type, title, message, priority) V
 -- Sample analytics event
 INSERT INTO analytics_events (event_name, event_properties) VALUES
 ('system_started', '{"version": "1.0.0", "environment": "production"}');
+
+
+
+INSERT INTO human_agents (name, email, phone, role, expertise) VALUES
+  ('Rahul Sharma', 'rahul@4champz.com', '+919876543210', 'senior_rep', ARRAY['high_value', 'angry_customer']),
+  ('Priya Singh', 'priya@4champz.com', '+919876543211', 'sales_rep', ARRAY['general_sales', 'follow_up']),
+  ('Amit Patel', 'amit@4champz.com', '+919876543212', 'specialist', ARRAY['technical', 'confused_customer'])
+ON CONFLICT (email) DO NOTHING;
+
+
+
+
+
+-- Template 1: Chess Coaching
+INSERT INTO extraction_templates (template_name, industry, description, field_definitions, is_system_template) VALUES
+('Chess Coaching', 'sports_coaching', 'Fields for chess coaching recruitment', 
+'{
+  "fields": [
+    {
+      "field_key": "chess_rating",
+      "field_label": "Chess Rating",
+      "field_type": "number",
+      "field_category": "qualification",
+      "is_required": false,
+      "validation_rules": {"min": 1000, "max": 3000},
+      "extraction_config": {
+        "keywords": ["rating", "elo", "fide", "score"],
+        "regex": "\\\\b(\\\\d{3,4})\\\\b",
+        "examples": ["My rating is 2400", "I have 1850 rating"]
+      }
+    },
+    {
+      "field_key": "location",
+      "field_label": "Location",
+      "field_type": "text",
+      "field_category": "personal",
+      "is_required": true,
+      "extraction_config": {
+        "keywords": ["location", "area", "place", "from", "staying in"],
+        "predefined_values": ["bangalore", "btm", "jayanagar", "koramangala", "whitefield"],
+        "examples": ["I am in BTM", "From Bangalore"]
+      }
+    },
+    {
+      "field_key": "coaching_experience",
+      "field_label": "Coaching Experience",
+      "field_type": "text",
+      "field_category": "qualification",
+      "extraction_config": {
+        "regex": "\\\\b(\\\\d+)\\\\s*years?\\\\b",
+        "keywords": ["experience", "taught", "coaching", "years"],
+        "examples": ["5 years experience", "I have taught for 3 years"]
+      }
+    },
+    {
+      "field_key": "availability",
+      "field_label": "Availability",
+      "field_type": "select",
+      "field_category": "preference",
+      "extraction_config": {
+        "keywords": ["available", "free", "timing", "schedule"],
+        "predefined_values": ["weekdays", "weekends", "mornings", "evenings", "flexible"],
+        "examples": ["Available on weekends", "Free in mornings"]
+      }
+    },
+    {
+      "field_key": "age_group_preference",
+      "field_label": "Age Group Preference",
+      "field_type": "text",
+      "field_category": "preference",
+      "extraction_config": {
+        "regex": "\\\\b(\\\\d+)\\\\s*(?:to|-)\\\\s*(\\\\d+)\\\\s*(?:years|classes)?",
+        "keywords": ["age group", "classes", "students"],
+        "examples": ["10 to 15 years", "Classes 5-8"]
+      }
+    }
+  ]
+}', TRUE)
+ON CONFLICT (template_name) DO NOTHING;
+
+-- Template 2: Medical Appointment Booking
+INSERT INTO extraction_templates (template_name, industry, description, field_definitions, is_system_template) VALUES
+('Medical Appointments', 'healthcare', 'Fields for medical appointment booking', 
+'{
+  "fields": [
+    {
+      "field_key": "patient_age",
+      "field_label": "Patient Age",
+      "field_type": "number",
+      "field_category": "personal",
+      "is_required": true,
+      "validation_rules": {"min": 0, "max": 120},
+      "extraction_config": {
+        "regex": "\\\\b(\\\\d{1,3})\\\\s*(?:years?|yr|y\\\\.o\\\\.)\\\\b",
+        "keywords": ["age", "years old", "year old"],
+        "examples": ["I am 45 years old", "Patient is 12"]
+      }
+    },
+    {
+      "field_key": "symptoms",
+      "field_label": "Symptoms",
+      "field_type": "text",
+      "field_category": "medical",
+      "is_required": true,
+      "extraction_config": {
+        "keywords": ["symptom", "feeling", "pain", "problem", "issue"],
+        "examples": ["Having fever and headache", "Stomach pain"]
+      }
+    },
+    {
+      "field_key": "preferred_date",
+      "field_label": "Preferred Appointment Date",
+      "field_type": "date",
+      "field_category": "preference",
+      "extraction_config": {
+        "keywords": ["tomorrow", "next week", "monday", "appointment"],
+        "date_formats": ["tomorrow", "next week", "DD/MM/YYYY"],
+        "examples": ["Tomorrow morning", "Next Monday"]
+      }
+    },
+    {
+      "field_key": "insurance_provider",
+      "field_label": "Insurance Provider",
+      "field_type": "text",
+      "field_category": "personal",
+      "extraction_config": {
+        "keywords": ["insurance", "policy", "coverage"],
+        "examples": ["I have Star Health insurance", "No insurance"]
+      }
+    },
+    {
+      "field_key": "doctor_preference",
+      "field_label": "Doctor Preference",
+      "field_type": "text",
+      "field_category": "preference",
+      "extraction_config": {
+        "keywords": ["doctor", "specialist", "prefer"],
+        "examples": ["I want to see Dr. Sharma", "Any cardiologist"]
+      }
+    }
+  ]
+}', TRUE)
+ON CONFLICT (template_name) DO NOTHING;
+
+-- Template 3: Real Estate
+INSERT INTO extraction_templates (template_name, industry, description, field_definitions, is_system_template) VALUES
+('Real Estate', 'real_estate', 'Fields for real estate lead qualification', 
+'{
+  "fields": [
+    {
+      "field_key": "property_type",
+      "field_label": "Property Type",
+      "field_type": "select",
+      "field_category": "preference",
+      "is_required": true,
+      "extraction_config": {
+        "predefined_values": ["apartment", "villa", "plot", "commercial"],
+        "keywords": ["property", "looking for", "want"],
+        "examples": ["Looking for 2BHK apartment", "Want a villa"]
+      }
+    },
+    {
+      "field_key": "budget",
+      "field_label": "Budget Range",
+      "field_type": "text",
+      "field_category": "qualification",
+      "is_required": true,
+      "extraction_config": {
+        "regex": "\\\\b(\\\\d+)\\\\s*(?:lakhs?|crores?|L|Cr)\\\\b",
+        "keywords": ["budget", "price", "afford"],
+        "examples": ["Budget is 50 lakhs", "Around 1 crore"]
+      }
+    },
+    {
+      "field_key": "preferred_location",
+      "field_label": "Preferred Location",
+      "field_type": "text",
+      "field_category": "preference",
+      "is_required": true,
+      "extraction_config": {
+        "keywords": ["location", "area", "near"],
+        "examples": ["Whitefield area", "Near Outer Ring Road"]
+      }
+    },
+    {
+      "field_key": "bedrooms",
+      "field_label": "Number of Bedrooms",
+      "field_type": "number",
+      "field_category": "preference",
+      "extraction_config": {
+        "regex": "\\\\b(\\\\d)\\\\s*(?:BHK|bedroom|bed)\\\\b",
+        "keywords": ["bhk", "bedroom"],
+        "examples": ["2BHK", "3 bedroom flat"]
+      }
+    },
+    {
+      "field_key": "timeline",
+      "field_label": "Purchase Timeline",
+      "field_type": "select",
+      "field_category": "qualification",
+      "extraction_config": {
+        "predefined_values": ["immediate", "1-3 months", "3-6 months", "6+ months"],
+        "keywords": ["when", "timeline", "urgently"],
+        "examples": ["Need immediately", "Planning in 2 months"]
+      }
+    }
+  ]
+}', TRUE)
+ON CONFLICT (template_name) DO NOTHING;
+
+-- Template 4: E-commerce/Retail
+INSERT INTO extraction_templates (template_name, industry, description, field_definitions, is_system_template) VALUES
+('E-commerce Retail', 'retail', 'Fields for online retail lead capture', 
+'{
+  "fields": [
+    {
+      "field_key": "product_interest",
+      "field_label": "Product Interest",
+      "field_type": "text",
+      "field_category": "preference",
+      "is_required": true,
+      "extraction_config": {
+        "keywords": ["looking for", "want", "need", "interested in"],
+        "examples": ["Looking for running shoes", "Need a laptop"]
+      }
+    },
+    {
+      "field_key": "size_preference",
+      "field_label": "Size",
+      "field_type": "text",
+      "field_category": "personal",
+      "extraction_config": {
+        "keywords": ["size", "fit"],
+        "examples": ["Size 10", "Medium size"]
+      }
+    },
+    {
+      "field_key": "budget_range",
+      "field_label": "Budget",
+      "field_type": "text",
+      "field_category": "qualification",
+      "extraction_config": {
+        "regex": "\\\\b(?:Rs\\\\.?|₹)?\\\\s*(\\\\d+(?:,\\\\d+)*)\\\\b",
+        "keywords": ["budget", "price", "spend"],
+        "examples": ["Budget around Rs. 5000", "Under ₹10,000"]
+      }
+    },
+    {
+      "field_key": "delivery_address",
+      "field_label": "Delivery Address",
+      "field_type": "text",
+      "field_category": "personal",
+      "is_required": true,
+      "extraction_config": {
+        "keywords": ["address", "delivery", "ship to"],
+        "examples": ["Deliver to BTM Layout", "Address: 123 Main St"]
+      }
+    }
+  ]
+}', TRUE)
+ON CONFLICT (template_name) DO NOTHING;
+
 -- ============================================
 -- UTILITY VIEWS
 -- ============================================

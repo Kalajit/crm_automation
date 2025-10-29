@@ -5,11 +5,20 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
+const WebSocket = require('ws');
+const http = require('http');
 require('dotenv').config();
 
 const app = express();
 
 
+
+// Create HTTP server for both Express and WebSocket
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// Track active WebSocket connections per call_sid
+const activeConnections = new Map(); // call_sid -> Set of WebSocket clients
 
 // Translation function using Google Translate API
 async function translateText(text, targetLang, sourceLang = 'en') {
@@ -144,6 +153,188 @@ const handleError = (res, error, statusCode = 500) => {
     error: error.message || 'Internal Server Error' 
   });
 };
+
+
+
+
+
+// ============================================
+// WEBSOCKET HANDLER FOR LIVE CALL UPDATES
+// ============================================
+
+wss.on('connection', (ws, req) => {
+  // Extract call_sid from URL: /ws/live-call/:call_sid
+  const urlParts = req.url.split('/');
+  const call_sid = urlParts[urlParts.length - 1];
+  
+  if (!call_sid || call_sid.length < 10) {
+    ws.send(JSON.stringify({ error: 'Invalid call_sid' }));
+    ws.close();
+    return;
+  }
+  
+  // Register connection
+  if (!activeConnections.has(call_sid)) {
+    activeConnections.set(call_sid, new Set());
+  }
+  activeConnections.get(call_sid).add(ws);
+  
+  console.log(`[WS] Client connected to call ${call_sid} (${activeConnections.get(call_sid).size} active)`);
+  
+  // Send initial connection confirmation
+  ws.send(JSON.stringify({
+    type: 'connected',
+    call_sid: call_sid,
+    timestamp: new Date().toISOString()
+  }));
+  
+  // Handle incoming messages from client (e.g., agent notes)
+  ws.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message);
+      
+      if (data.type === 'agent_note') {
+        // Store agent note in database
+        await pool.query(`
+          UPDATE call_logs
+          SET summary = jsonb_set(
+            COALESCE(summary, '{}'::jsonb),
+            '{agent_notes}',
+            to_jsonb($1::text)
+          )
+          WHERE call_sid = $2
+        `, [data.note, call_sid]);
+        
+        // Broadcast to all other clients on this call
+        broadcastToCall(call_sid, {
+          type: 'agent_note',
+          note: data.note,
+          timestamp: new Date().toISOString()
+        }, ws);
+      }
+      
+    } catch (error) {
+      console.error('[WS] Error handling message:', error);
+    }
+  });
+  
+  // Handle disconnection
+  ws.on('close', () => {
+    if (activeConnections.has(call_sid)) {
+      activeConnections.get(call_sid).delete(ws);
+      
+      if (activeConnections.get(call_sid).size === 0) {
+        activeConnections.delete(call_sid);
+        console.log(`[WS] All clients disconnected from call ${call_sid}, cleanup complete`);
+      } else {
+        console.log(`[WS] Client disconnected from call ${call_sid} (${activeConnections.get(call_sid).size} remaining)`);
+      }
+    }
+  });
+  
+  ws.on('error', (error) => {
+    console.error(`[WS] Error on call ${call_sid}:`, error);
+    ws.close();
+  });
+});
+
+// Helper function to broadcast to all clients watching a call
+function broadcastToCall(call_sid, data, excludeWs = null) {
+  if (!activeConnections.has(call_sid)) return;
+  
+  const message = JSON.stringify(data);
+  let sentCount = 0;
+  
+  activeConnections.get(call_sid).forEach((client) => {
+    if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
+      client.send(message);
+      sentCount++;
+    }
+  });
+  
+  console.log(`[WS] Broadcast to ${sentCount} clients on call ${call_sid}`);
+}
+
+// ============================================
+// REST API ENDPOINT FOR PYTHON TO PUSH UPDATES
+// ============================================
+
+app.post('/api/live-update', async (req, res) => {
+  try {
+    const {
+      call_sid,
+      lead_id,
+      sentiment,
+      summary,
+      transcript,
+      turn_count,
+      call_status,
+      call_duration,
+      recording_url,
+      timestamp
+    } = req.body;
+    
+    if (!call_sid) {
+      return res.status(400).json({ error: 'call_sid is required' });
+    }
+    
+    // Fetch lead info to enrich payload
+    let leadInfo = null;
+    if (lead_id) {
+      const leadResult = await pool.query('SELECT name, phone_number, email, chess_rating FROM leads WHERE id = $1', [lead_id]);
+      leadInfo = leadResult.rows[0] || null;
+    }
+    
+    // Broadcast to all WebSocket clients watching this call
+    const payload = {
+      type: 'live_update',
+      call_sid,
+      lead_id,
+      lead_info: leadInfo,
+      sentiment,
+      summary,
+      transcript,
+      turn_count,
+      call_status,
+      call_duration,
+      recording_url,
+      timestamp: timestamp || new Date().toISOString()
+    };
+    
+    broadcastToCall(call_sid, payload);
+    
+    logRequest('POST', '/api/live-update', 200);
+    res.json({ 
+      success: true, 
+      message: `Broadcast to ${activeConnections.get(call_sid)?.size || 0} clients`,
+      call_sid 
+    });
+    
+  } catch (error) {
+    console.error('[WS] Live update error:', error);
+    logRequest('POST', '/api/live-update', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// ENDPOINT TO GET ACTIVE WS CONNECTIONS (DEBUG)
+// ============================================
+
+app.get('/api/ws/stats', (req, res) => {
+  const stats = {};
+  activeConnections.forEach((clients, call_sid) => {
+    stats[call_sid] = clients.size;
+  });
+  
+  res.json({
+    success: true,
+    total_calls: activeConnections.size,
+    total_clients: Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0),
+    calls: stats
+  });
+});
+
 
 // ============================================
 // HEALTH CHECK
@@ -1699,39 +1890,39 @@ app.post('/api/leads/bulk-update-interest', async (req, res) => {
 // ============================================
 
 // Search leads
-app.get('/api/search/leads', async (req, res) => {
-  try {
-    const { query: searchQuery, status, source } = req.query;
+// app.get('/api/search/leads', async (req, res) => {
+//   try {
+//     const { query: searchQuery, status, source } = req.query;
 
-    let query = `SELECT * FROM leads WHERE 1=1`;
-    const params = [];
+//     let query = `SELECT * FROM leads WHERE 1=1`;
+//     const params = [];
 
-    if (searchQuery) {
-      query += ` AND (name ILIKE ${params.length + 1} OR phone_number ILIKE ${params.length + 1})`;
-      params.push(`%${searchQuery}%`);
-    }
+//     if (searchQuery) {
+//       query += ` AND (name ILIKE ${params.length + 1} OR phone_number ILIKE ${params.length + 1})`;
+//       params.push(`%${searchQuery}%`);
+//     }
 
-    if (status) {
-      query += ` AND lead_status = ${params.length + 1}`;
-      params.push(status);
-    }
+//     if (status) {
+//       query += ` AND lead_status = ${params.length + 1}`;
+//       params.push(status);
+//     }
 
-    if (source) {
-      query += ` AND lead_source = ${params.length + 1}`;
-      params.push(source);
-    }
+//     if (source) {
+//       query += ` AND lead_source = ${params.length + 1}`;
+//       params.push(source);
+//     }
 
-    query += ` ORDER BY updated_at DESC LIMIT 50;`;
+//     query += ` ORDER BY updated_at DESC LIMIT 50;`;
 
-    const result = await pool.query(query, params);
+//     const result = await pool.query(query, params);
 
-    logRequest('GET', '/api/search/leads', 200);
-    res.json({ success: true, data: result.rows });
-  } catch (error) {
-    logRequest('GET', '/api/search/leads', 500);
-    handleError(res, error);
-  }
-});
+//     logRequest('GET', '/api/search/leads', 200);
+//     res.json({ success: true, data: result.rows });
+//   } catch (error) {
+//     logRequest('GET', '/api/search/leads', 500);
+//     handleError(res, error);
+//   }
+// });
 
 
 
@@ -2948,6 +3139,807 @@ app.get('/api/dashboard/overview', async (req, res) => {
 
 
 
+// ============================================
+// HUMAN TAKEOVER ENDPOINTS
+// ============================================
+
+// 1. CREATE TAKEOVER REQUEST
+app.post('/api/takeover/request', async (req, res) => {
+  try {
+    const {
+      lead_id,
+      company_id,
+      call_sid,
+      conversation_id,
+      request_type,
+      trigger_reason,
+      ai_sentiment,
+      ai_summary,
+      conversation_context,
+      priority
+    } = req.body;
+
+    if (!lead_id || !request_type || !trigger_reason) {
+      return res.status(400).json({ error: 'lead_id, request_type, and trigger_reason are required' });
+    }
+
+    // Find best available agent
+    const agent = await pool.query(`
+      SELECT id, name, email, phone
+      FROM human_agents
+      WHERE status = 'available'
+      AND assigned_leads < max_concurrent_leads
+      AND (expertise @> ARRAY[$1] OR role = 'senior_rep')
+      ORDER BY assigned_leads ASC, RANDOM()
+      LIMIT 1
+    `, [trigger_reason]);
+
+    const assigned_agent_id = agent.rows.length > 0 ? agent.rows[0].id : null;
+
+    // Create takeover request
+    const query = `
+      INSERT INTO takeover_requests (
+        lead_id, company_id, call_sid, conversation_id,
+        request_type, trigger_reason, ai_sentiment, ai_summary,
+        conversation_context, priority, assigned_agent_id,
+        status, assigned_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      lead_id,
+      company_id || null,
+      call_sid || null,
+      conversation_id || null,
+      request_type,
+      trigger_reason,
+      ai_sentiment ? JSON.stringify(ai_sentiment) : null,
+      ai_summary || null,
+      conversation_context || null,
+      priority || 'medium',
+      assigned_agent_id,
+      assigned_agent_id ? 'assigned' : 'pending',
+      assigned_agent_id ? new Date().toISOString() : null
+    ]);
+
+    // Update agent's assigned count
+    if (assigned_agent_id) {
+      await pool.query(`
+        UPDATE human_agents
+        SET assigned_leads = assigned_leads + 1,
+            status = CASE WHEN assigned_leads + 1 >= max_concurrent_leads THEN 'busy' ELSE 'available' END
+        WHERE id = $1
+      `, [assigned_agent_id]);
+
+      // Send notification to agent
+      const agentData = agent.rows[0];
+      await pool.query(`
+        INSERT INTO notifications (
+          lead_id, phone_number, notification_type, title, message,
+          scheduled_time, delivery_channel
+        )
+        VALUES ($1, $2, 'takeover_alert', $3, $4, CURRENT_TIMESTAMP, 'whatsapp')
+      `, [
+        lead_id,
+        agentData.phone,
+        '🔥 New Lead Takeover',
+        `Urgent: ${trigger_reason} lead assigned to you. Lead ID: ${lead_id}. Check dashboard now!`
+      ]);
+    }
+
+    logRequest('POST', '/api/takeover/request', 201);
+    res.status(201).json({ success: true, data: result.rows[0], agent: agent.rows[0] || null });
+  } catch (error) {
+    logRequest('POST', '/api/takeover/request', 500);
+    handleError(res, error);
+  }
+});
+
+// 2. GET PENDING TAKEOVERS FOR AGENT
+app.get('/api/takeover/my-requests/:agent_id', async (req, res) => {
+  try {
+    const { agent_id } = req.params;
+    const { status } = req.query;
+
+    let query = `
+      SELECT 
+        tr.*,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        l.chess_rating,
+        l.location,
+        c.conversation_history,
+        ha.name as agent_name
+      FROM takeover_requests tr
+      JOIN leads l ON tr.lead_id = l.id
+      LEFT JOIN conversations c ON tr.conversation_id = c.id
+      LEFT JOIN human_agents ha ON tr.assigned_agent_id = ha.id
+      WHERE tr.assigned_agent_id = $1
+    `;
+
+    const params = [agent_id];
+
+    if (status) {
+      params.push(status);
+      query += ` AND tr.status = $${params.length}`;
+    } else {
+      query += ` AND tr.status IN ('pending', 'assigned', 'in_progress')`;
+    }
+
+    query += ' ORDER BY tr.priority DESC, tr.created_at ASC;';
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', `/api/takeover/my-requests/${agent_id}`, 200);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (error) {
+    logRequest('GET', `/api/takeover/my-requests/${agent_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// 3. ACCEPT TAKEOVER
+app.patch('/api/takeover/:id/accept', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { agent_id } = req.body;
+
+    // Start human session
+    const takeover = await pool.query('SELECT * FROM takeover_requests WHERE id = $1', [id]);
+
+    if (takeover.rows.length === 0) {
+      return res.status(404).json({ error: 'Takeover request not found' });
+    }
+
+    const tr = takeover.rows[0];
+
+    // Update takeover status
+    await pool.query(`
+      UPDATE takeover_requests
+      SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [id]);
+
+    // Create human session
+    await pool.query(`
+      INSERT INTO human_sessions (agent_id, lead_id, session_type, started_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+    `, [agent_id, tr.lead_id, tr.request_type === 'call_transfer' ? 'call' : 'whatsapp']);
+
+    // Pause AI agent
+    await pool.query(`
+      UPDATE conversations
+      SET ai_summary = COALESCE(ai_summary || E'\n', '') || '[HUMAN_TAKEOVER] Human agent ${agent_id} took over at ${new Date().toISOString()}'
+      WHERE id = $1
+    `, [tr.conversation_id]);
+
+    logRequest('PATCH', `/api/takeover/${id}/accept`, 200);
+    res.json({ success: true, message: 'Takeover accepted, AI paused' });
+  } catch (error) {
+    logRequest('PATCH', `/api/takeover/${id}/accept`, 500);
+    handleError(res, error);
+  }
+});
+
+// 4. COMPLETE TAKEOVER
+app.patch('/api/takeover/:id/complete', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { outcome, notes, resume_ai } = req.body;
+
+    const takeover = await pool.query('SELECT * FROM takeover_requests WHERE id = $1', [id]);
+
+    if (takeover.rows.length === 0) {
+      return res.status(404).json({ error: 'Takeover request not found' });
+    }
+
+    const tr = takeover.rows[0];
+
+    // Update takeover
+    await pool.query(`
+      UPDATE takeover_requests
+      SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [id]);
+
+    // End human session
+    await pool.query(`
+      UPDATE human_sessions
+      SET ended_at = CURRENT_TIMESTAMP,
+          duration_seconds = EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)),
+          outcome = $1,
+          notes = $2
+      WHERE agent_id = $3 AND lead_id = $4 AND ended_at IS NULL
+    `, [outcome, notes, tr.assigned_agent_id, tr.lead_id]);
+
+    // Decrement agent's assigned count
+    await pool.query(`
+      UPDATE human_agents
+      SET assigned_leads = GREATEST(assigned_leads - 1, 0),
+          status = 'available'
+      WHERE id = $1
+    `, [tr.assigned_agent_id]);
+
+    // Resume AI if requested
+    if (resume_ai && tr.conversation_id) {
+      await pool.query(`
+        UPDATE conversations
+        SET ai_summary = COALESCE(ai_summary || E'\n', '') || '[AI_RESUMED] AI agent resumed at ${new Date().toISOString()}'
+        WHERE id = $1
+      `, [tr.conversation_id]);
+    }
+
+    logRequest('PATCH', `/api/takeover/${id}/complete`, 200);
+    res.json({ success: true, message: 'Takeover completed' });
+  } catch (error) {
+    logRequest('PATCH', `/api/takeover/${id}/complete`, 500);
+    handleError(res, error);
+  }
+});
+
+// 5. GET ALL AGENTS
+app.get('/api/human-agents', async (req, res) => {
+  try {
+    const { status, role } = req.query;
+
+    let query = 'SELECT * FROM human_agents WHERE 1=1';
+    const params = [];
+
+    if (status) {
+      params.push(status);
+      query += ` AND status = $${params.length}`;
+    }
+
+    if (role) {
+      params.push(role);
+      query += ` AND role = $${params.length}`;
+    }
+
+    query += ' ORDER BY assigned_leads ASC;';
+
+    const result = await pool.query(query, params);
+
+    logRequest('GET', '/api/human-agents', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/human-agents', 500);
+    handleError(res, error);
+  }
+});
+
+// 6. UPDATE AGENT STATUS
+app.patch('/api/human-agents/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!['available', 'busy', 'offline'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    await pool.query(`
+      UPDATE human_agents
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+    `, [status, id]);
+
+    logRequest('PATCH', `/api/human-agents/${id}/status`, 200);
+    res.json({ success: true, message: 'Status updated' });
+  } catch (error) {
+    logRequest('PATCH', `/api/human-agents/${id}/status`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+// ============================================
+// CAMPAIGN MANAGEMENT
+// ============================================
+
+// Create campaign
+app.post('/api/campaigns', async (req, res) => {
+  try {
+    const { company_id, campaign_name, campaign_type, target_leads, scheduled_start, call_rate_per_minute } = req.body;
+
+    if (!company_id || !campaign_name || !target_leads) {
+      return res.status(400).json({ error: 'company_id, campaign_name, and target_leads are required' });
+    }
+
+    const query = `
+      INSERT INTO campaigns (
+        company_id, campaign_name, campaign_type, 
+        total_leads, scheduled_start, call_rate_per_minute, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'scheduled')
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      company_id,
+      campaign_name,
+      campaign_type || 'outbound',
+      target_leads.length,
+      scheduled_start || new Date().toISOString(),
+      call_rate_per_minute || 1
+    ]);
+
+    const campaign_id = result.rows[0].id;
+
+    // Bulk insert scheduled calls
+    const values = target_leads.map((lead, idx) => 
+      `(${company_id}, ${lead.lead_id}, '${campaign_type}', '${scheduled_start}', ${campaign_id})`
+    ).join(',');
+
+    await pool.query(`
+      INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time, campaign_id)
+      VALUES ${values}
+    `);
+
+    logRequest('POST', '/api/campaigns', 201);
+    res.status(201).json({ 
+      success: true, 
+      campaign_id: campaign_id,
+      scheduled_calls: target_leads.length,
+      message: `Campaign created with ${target_leads.length} calls scheduled`
+    });
+  } catch (error) {
+    logRequest('POST', '/api/campaigns', 500);
+    handleError(res, error);
+  }
+});
+
+// Get campaign stats
+app.get('/api/campaigns/:id/stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const stats = await pool.query(`
+      SELECT 
+        c.campaign_name,
+        c.total_leads,
+        c.status as campaign_status,
+        COUNT(sc.id) FILTER (WHERE sc.status = 'pending') as pending,
+        COUNT(sc.id) FILTER (WHERE sc.status = 'called') as called,
+        COUNT(cl.id) FILTER (WHERE cl.call_status = 'completed') as completed,
+        COUNT(cl.id) FILTER (WHERE cl.call_status = 'failed') as failed,
+        AVG(cl.call_duration) as avg_duration
+      FROM campaigns c
+      LEFT JOIN scheduled_calls sc ON c.id = sc.campaign_id
+      LEFT JOIN call_logs cl ON sc.call_sid = cl.call_sid
+      WHERE c.id = $1
+      GROUP BY c.id
+    `, [id]);
+
+    if (stats.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    logRequest('GET', `/api/campaigns/${id}/stats`, 200);
+    res.json({ success: true, data: stats.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/campaigns/${id}/stats`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+
+// ============================================
+// ADS INTEGRATION
+// ============================================
+
+// Website form capture with UTM
+app.post('/api/leads/website', async (req, res) => {
+  try {
+    const { 
+      name, 
+      phone, 
+      email, 
+      message,
+      utm_source,
+      utm_campaign,
+      utm_medium,
+      utm_content,
+      utm_term
+    } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    // Normalize phone
+    let normalizedPhone = phone.replace(/\D/g, '');
+    if (normalizedPhone.length === 10) {
+      normalizedPhone = `+91${normalizedPhone}`;
+    } else if (!normalizedPhone.startsWith('+')) {
+      normalizedPhone = `+${normalizedPhone}`;
+    }
+
+    // Create metadata with UTM params
+    const metadata = {};
+    if (utm_source) metadata.utm_source = utm_source;
+    if (utm_campaign) metadata.utm_campaign = utm_campaign;
+    if (utm_medium) metadata.utm_medium = utm_medium;
+    if (utm_content) metadata.utm_content = utm_content;
+    if (utm_term) metadata.utm_term = utm_term;
+
+    // Create tags
+    const tags = ['website'];
+    if (utm_source) tags.push(`source_${utm_source}`);
+    if (utm_campaign) tags.push(`campaign_${utm_campaign}`);
+
+    const query = `
+      INSERT INTO leads (
+        phone_number, name, email, lead_source, metadata, tags, notes
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (phone_number) DO UPDATE
+      SET 
+        name = COALESCE(EXCLUDED.name, leads.name),
+        email = COALESCE(EXCLUDED.email, leads.email),
+        metadata = leads.metadata || EXCLUDED.metadata,
+        tags = array_cat(leads.tags, EXCLUDED.tags),
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      normalizedPhone,
+      name,
+      email,
+      utm_source || 'website',
+      JSON.stringify(metadata),
+      tags,
+      message
+    ]);
+
+    // Send auto-response
+    const autoResponse = `Hi ${name || 'there'}! Thanks for your interest in 4champz. We'll contact you within 24 hours. In the meantime, check out our programs at https://4champz.com`;
+    
+    // Queue WhatsApp message
+    await pool.query(`
+      INSERT INTO notifications (
+        lead_id, phone_number, notification_type, title, message,
+        scheduled_time, delivery_channel
+      )
+      VALUES ($1, $2, 'welcome', 'Welcome to 4champz', $3, CURRENT_TIMESTAMP, 'whatsapp')
+    `, [result.rows[0].id, normalizedPhone, autoResponse]);
+
+    logRequest('POST', '/api/leads/website', 201);
+    res.status(201).json({ 
+      success: true, 
+      data: result.rows[0],
+      message: 'Lead captured, auto-response queued'
+    });
+  } catch (error) {
+    logRequest('POST', '/api/leads/website', 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+// ============================================
+// DYNAMIC CUSTOM FIELDS API
+// ============================================
+
+// 1. GET EXTRACTION TEMPLATES
+app.get('/api/extraction-templates', async (req, res) => {
+  try {
+    const { industry } = req.query;
+    
+    let query = 'SELECT * FROM extraction_templates WHERE 1=1';
+    const params = [];
+    
+    if (industry) {
+      params.push(industry);
+      query += ` AND industry = $${params.length}`;
+    }
+    
+    query += ' ORDER BY template_name;';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/extraction-templates', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/extraction-templates', 500);
+    handleError(res, error);
+  }
+});
+
+// 2. APPLY TEMPLATE TO COMPANY
+app.post('/api/companies/:company_id/apply-template', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { template_id, agent_instance_id } = req.body;
+    
+    // Get template
+    const template = await pool.query(
+      'SELECT * FROM extraction_templates WHERE id = $1',
+      [template_id]
+    );
+    
+    if (template.rows.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    const fieldDefs = template.rows[0].field_definitions.fields;
+    
+    // Insert field definitions
+    const inserted = [];
+    for (const field of fieldDefs) {
+      const result = await pool.query(`
+        INSERT INTO custom_field_definitions (
+          company_id, agent_instance_id, field_key, field_label, 
+          field_type, field_category, is_required, 
+          validation_rules, extraction_config
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (company_id, field_key) DO UPDATE
+        SET 
+          field_label = EXCLUDED.field_label,
+          field_type = EXCLUDED.field_type,
+          extraction_config = EXCLUDED.extraction_config,
+          updated_at = CURRENT_TIMESTAMP
+        RETURNING *;
+      `, [
+        company_id,
+        agent_instance_id || null,
+        field.field_key,
+        field.field_label,
+        field.field_type,
+        field.field_category,
+        field.is_required || false,
+        field.validation_rules ? JSON.stringify(field.validation_rules) : null,
+        JSON.stringify(field.extraction_config)
+      ]);
+      
+      inserted.push(result.rows[0]);
+    }
+    
+    logRequest('POST', `/api/companies/${company_id}/apply-template`, 201);
+    res.status(201).json({ 
+      success: true, 
+      message: `Applied ${fieldDefs.length} field definitions`,
+      data: inserted 
+    });
+  } catch (error) {
+    logRequest('POST', `/api/companies/${company_id}/apply-template`, 500);
+    handleError(res, error);
+  }
+});
+
+// 3. GET CUSTOM FIELDS FOR COMPANY/AGENT
+app.get('/api/custom-fields/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { agent_instance_id } = req.query;
+    
+    let query = `
+      SELECT * FROM custom_field_definitions 
+      WHERE company_id = $1 AND is_active = TRUE
+    `;
+    const params = [company_id];
+    
+    if (agent_instance_id) {
+      params.push(agent_instance_id);
+      query += ` AND (agent_instance_id = $${params.length} OR agent_instance_id IS NULL)`;
+    }
+    
+    query += ' ORDER BY display_order, field_label;';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', `/api/custom-fields/${company_id}`, 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', `/api/custom-fields/${company_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+// 4. ADD/UPDATE CUSTOM FIELD DEFINITION
+app.post('/api/custom-fields', async (req, res) => {
+  try {
+    const {
+      company_id,
+      agent_instance_id,
+      field_key,
+      field_label,
+      field_type,
+      field_category,
+      is_required,
+      validation_rules,
+      extraction_config
+    } = req.body;
+    
+    if (!company_id || !field_key || !field_label || !field_type) {
+      return res.status(400).json({ 
+        error: 'company_id, field_key, field_label, and field_type are required' 
+      });
+    }
+    
+    const query = `
+      INSERT INTO custom_field_definitions (
+        company_id, agent_instance_id, field_key, field_label, 
+        field_type, field_category, is_required, 
+        validation_rules, extraction_config
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (company_id, field_key) DO UPDATE
+      SET 
+        field_label = EXCLUDED.field_label,
+        field_type = EXCLUDED.field_type,
+        field_category = EXCLUDED.field_category,
+        is_required = EXCLUDED.is_required,
+        validation_rules = EXCLUDED.validation_rules,
+        extraction_config = EXCLUDED.extraction_config,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *;
+    `;
+    
+    const result = await pool.query(query, [
+      company_id,
+      agent_instance_id || null,
+      field_key,
+      field_label,
+      field_type,
+      field_category || 'general',
+      is_required || false,
+      validation_rules ? JSON.stringify(validation_rules) : null,
+      extraction_config ? JSON.stringify(extraction_config) : null
+    ]);
+    
+    logRequest('POST', '/api/custom-fields', 201);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('POST', '/api/custom-fields', 500);
+    handleError(res, error);
+  }
+});
+
+// 5. SAVE EXTRACTED CUSTOM DATA
+app.post('/api/leads/:lead_id/custom-data', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    const { custom_data, source, confidence_scores } = req.body;
+    
+    if (!custom_data || typeof custom_data !== 'object') {
+      return res.status(400).json({ error: 'custom_data object is required' });
+    }
+    
+    const saved = [];
+    
+    for (const [field_key, field_value] of Object.entries(custom_data)) {
+      if (!field_value) continue; // Skip empty values
+      
+      // Get field definition
+      const fieldDef = await pool.query(
+        'SELECT id FROM custom_field_definitions WHERE field_key = $1 AND is_active = TRUE LIMIT 1',
+        [field_key]
+      );
+      
+      if (fieldDef.rows.length === 0) continue; // Skip undefined fields
+      
+      const field_definition_id = fieldDef.rows[0].id;
+      const confidence = confidence_scores?.[field_key] || 0.8;
+      
+      // Normalize value
+      let normalized = String(field_value).toLowerCase().trim();
+      
+      const result = await pool.query(`
+        INSERT INTO lead_custom_data (
+          lead_id, field_definition_id, field_key, 
+          field_value, field_value_normalized, 
+          source, confidence_score
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (lead_id, field_definition_id) DO UPDATE
+        SET 
+          field_value = EXCLUDED.field_value,
+          field_value_normalized = EXCLUDED.field_value_normalized,
+          source = EXCLUDED.source,
+          confidence_score = EXCLUDED.confidence_score,
+          updated_at = CURRENT_TIMESTAMP
+        RETURNING *;
+      `, [
+        lead_id,
+        field_definition_id,
+        field_key,
+        field_value,
+        normalized,
+        source || 'ai_extraction',
+        confidence
+      ]);
+      
+      saved.push(result.rows[0]);
+    }
+    
+    logRequest('POST', `/api/leads/${lead_id}/custom-data`, 201);
+    res.status(201).json({ 
+      success: true, 
+      saved_fields: saved.length,
+      data: saved 
+    });
+  } catch (error) {
+    logRequest('POST', `/api/leads/${lead_id}/custom-data`, 500);
+    handleError(res, error);
+  }
+});
+
+// 6. GET LEAD CUSTOM DATA
+app.get('/api/leads/:lead_id/custom-data', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const query = `
+      SELECT 
+        lcd.*,
+        cfd.field_label,
+        cfd.field_type,
+        cfd.field_category
+      FROM lead_custom_data lcd
+      JOIN custom_field_definitions cfd ON lcd.field_definition_id = cfd.id
+      WHERE lcd.lead_id = $1
+      ORDER BY cfd.display_order, cfd.field_label;
+    `;
+    
+    const result = await pool.query(query, [lead_id]);
+    
+    logRequest('GET', `/api/leads/${lead_id}/custom-data`, 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', `/api/leads/${lead_id}/custom-data`, 500);
+    handleError(res, error);
+  }
+});
+
+// 7. SEARCH LEADS BY CUSTOM FIELD
+app.get('/api/leads/search-by-custom-field', async (req, res) => {
+  try {
+    const { field_key, field_value, company_id } = req.query;
+    
+    if (!field_key || !field_value) {
+      return res.status(400).json({ error: 'field_key and field_value are required' });
+    }
+    
+    let query = `
+      SELECT DISTINCT l.*
+      FROM leads l
+      JOIN lead_custom_data lcd ON l.id = lcd.lead_id
+      WHERE lcd.field_key = $1 
+      AND lcd.field_value_normalized ILIKE $2
+    `;
+    const params = [field_key, `%${field_value.toLowerCase()}%`];
+    
+    if (company_id) {
+      params.push(company_id);
+      query += ` AND l.company_id = $${params.length}`;
+    }
+    
+    query += ' ORDER BY l.updated_at DESC LIMIT 50;';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/leads/search-by-custom-field', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/leads/search-by-custom-field', 500);
+    handleError(res, error);
+  }
+});
+
+
+
 
 // ============================================
 // ERROR HANDLING
@@ -2973,6 +3965,7 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n✓ WhatsApp CRM Backend running on http://localhost:${PORT}`);
+  console.log(`✓ WebSocket server running on ws://localhost:${PORT}/ws/live-call/:call_sid`);
   console.log(`✓ Database: ${process.env.DB_NAME}`);
   console.log(`✓ Environment: ${process.env.NODE_ENV}\n`);
 });
