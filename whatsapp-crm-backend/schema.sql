@@ -1485,6 +1485,9 @@ CREATE TABLE agent_instances (
   is_active BOOLEAN DEFAULT TRUE,
   metadata JSONB DEFAULT '{}'::jsonb,
   supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'], -- NEW: Add supported languages
+  whatsapp_credentials JSONB DEFAULT '{}'::jsonb, -- NEW: WhatsApp API credentials
+  webhook_verify_token VARCHAR(255), -- NEW: For webhook verification
+  token_expires_at TIMESTAMP, -- NEW: WhatsApp token expiration
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, agent_name)
@@ -1745,6 +1748,9 @@ CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(lead_status);
 CREATE INDEX IF NOT EXISTS idx_leads_location ON leads(location);
 CREATE INDEX IF NOT EXISTS idx_leads_chess_rating ON leads(chess_rating);
 CREATE INDEX IF NOT EXISTS idx_leads_language ON leads(preferred_language); -- NEW: Add index for language queries
+-- Missing indexes for frequent searches
+CREATE INDEX idx_leads_last_contacted ON leads(last_contacted DESC);
+CREATE INDEX idx_conversations_phone ON conversations(phone_number);
 
 -- Conversations indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_lead_id ON conversations(lead_id);
@@ -1830,6 +1836,13 @@ CREATE INDEX IF NOT EXISTS idx_call_logs_in_progress ON call_logs(call_sid, call
 
 -- Add index for conversation turns
 CREATE INDEX IF NOT EXISTS idx_conversation_history ON call_logs USING GIN (conversation_history);
+
+
+
+
+-- Add index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_agent_instances_whatsapp_number ON agent_instances(whatsapp_number);
+
 
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
