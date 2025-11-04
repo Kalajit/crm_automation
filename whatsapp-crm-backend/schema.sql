@@ -1245,13 +1245,7 @@
 
 
 
-
-
--- ============================================
--- WhatsApp CRM Database Schema - COMPLETE
--- This file creates ALL tables in the correct order
--- ============================================
-
+  
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 

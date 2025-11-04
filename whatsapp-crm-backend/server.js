@@ -4463,6 +4463,315 @@ app.get('/callback', async (req, res) => {
 
 
 
+
+// app.post('/api/webhook/lead-capture', async (req, res) => {
+//   const apiKey = req.header('X-API-Key');
+//   if (apiKey !== process.env.LEAD_WEBHOOK_KEY) {
+//     logRequest('POST', '/api/webhook/lead-capture', 401);
+//     return res.status(401).json({ success: false, error: 'Invalid API key' });
+//   }
+
+//   const client = await pool.connect();
+//   try {
+//     await client.query('BEGIN');
+
+//     const input = req.body;
+
+//     // ---- Validate ----
+//     if (!input.phone && !input.phone_number) {
+//       throw new Error('Phone number is required');
+//     }
+
+//     // ---- Normalize phone ----
+//     let phone = (input.phone || input.phone_number).replace(/\D/g, '');
+//     if (phone.length === 10) phone = `+91${phone}`;
+//     else if (!phone.startsWith('+')) phone = `+${phone}`;
+
+//     // ---- Source & Tags ----
+//     const source = input.source || input.lead_source || 'unknown';
+//     const newTags = [source];
+//     if (input.campaign) newTags.push(input.campaign.toLowerCase().replace(/\s+/g, '_'));
+//     if (input.utm_campaign) newTags.push(input.utm_campaign);
+
+//     // ---- Custom Fields ----
+//     const cf = input.form_fields || {};
+//     const customFields = {
+//       chess_rating: cf.chess_rating || cf.rating || null,
+//       location: cf.location || cf.area || null,
+//       coaching_experience: cf.coaching_experience || null,
+//       availability: cf.availability || null,
+//       age_group_pref: cf.age_group_pref || null
+//     };
+
+//     // ---- Metadata ----
+//     const metadata = {
+//       source_details: {
+//         campaign: input.campaign || input.utm_campaign || null,
+//         ad_id: input.ad_id || null,
+//         form_id: input.form_id || null,
+//         utm_source: input.utm_source || null,
+//         utm_medium: input.utm_medium || null,
+//         utm_content: input.utm_content || null
+//       },
+//       captured_at: new Date().toISOString(),
+//       ip_address: req.ip.includes('::ffff:') ? req.ip.split(':').pop() : req.ip,
+//       user_agent: req.get('User-Agent') || null
+//     };
+
+//     const payload = {
+//       phone_number: phone,
+//       name: input.name || input.full_name || 'New Lead',
+//       email: input.email || null,
+//       lead_source: source,
+//       company_id: input.company_id || 1,
+//       tags: newTags,
+//       custom_fields: customFields,
+//       metadata
+//     };
+
+//     // ---- Check existing lead ----
+//     const { rows: [existing] } = await client.query(
+//       `SELECT id, tags, metadata FROM leads WHERE phone_number = $1 LIMIT 1`,
+//       [phone]
+//     );
+
+//     let lead;
+//     if (existing) {
+//       // ---- Merge tags (dedupe) ----
+//       const existingTags = existing.tags || [];
+//       const mergedTags = Array.from(new Set([...existingTags, ...payload.tags]));
+
+//       // ---- Update lead + custom fields ----
+//       const { rows } = await client.query(
+//         `UPDATE leads
+//          SET 
+//            name = COALESCE($1, name),
+//            email = COALESCE($2, email),
+//            tags = $3,
+//            metadata = metadata || $4::jsonb,
+//            last_contacted = CURRENT_TIMESTAMP,
+//            updated_at = CURRENT_TIMESTAMP,
+//            chess_rating = COALESCE($5, chess_rating),
+//            location = COALESCE($6, location),
+//            coaching_experience = COALESCE($7, coaching_experience),
+//            availability = COALESCE($8, availability),
+//            age_group_pref = COALESCE($9, age_group_pref)
+//          WHERE phone_number = $10
+//          RETURNING *`,
+//         [
+//           payload.name, payload.email,
+//           mergedTags, JSON.stringify(payload.metadata),
+//           customFields.chess_rating, customFields.location,
+//           customFields.coaching_experience, customFields.availability,
+//           customFields.age_group_pref,
+//           phone
+//         ]
+//       );
+//       lead = rows[0];
+//     } else {
+//       // ---- Insert new lead ----
+//       const { rows } = await client.query(
+//         `INSERT INTO leads (
+//           company_id, phone_number, name, email, lead_source,
+//           lead_status, interest_level, tags, metadata,
+//           chess_rating, location, coaching_experience,
+//           availability, age_group_pref
+//         ) VALUES (
+//           $1, $2, $3, $4, $5, 'new', 1, $6, $7, $8, $9, $10, $11, $12
+//         ) RETURNING *`,
+//         [
+//           payload.company_id, phone, payload.name, payload.email, payload.lead_source,
+//           JSON.stringify(payload.tags), JSON.stringify(payload.metadata),
+//           customFields.chess_rating, customFields.location,
+//           customFields.coaching_experience, customFields.availability,
+//           customFields.age_group_pref
+//         ]
+//       );
+//       lead = rows[0];
+//     }
+
+//     // ---- Conversation (upsert) ----
+//     await client.query(
+//       `INSERT INTO conversations (lead_id, phone_number, conversation_history, message_count)
+//        VALUES ($1, $2, '', 0)
+//        ON CONFLICT (lead_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
+//       [lead.id, phone]
+//     );
+
+//     // ---- Welcome Notification ----
+//     const welcomeMsg = `Hi ${lead.name.split(' ')[0]}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
+//     await client.query(
+//       `INSERT INTO notifications (
+//         lead_id, phone_number, notification_type, title, message,
+//         delivery_channel, scheduled_time, status
+//       ) VALUES ($1, $2, 'welcome', 'Welcome to 4champz!', $3, 'whatsapp', CURRENT_TIMESTAMP, 'pending')`,
+//       [lead.id, phone, welcomeMsg]
+//     );
+
+//     // ---- Schedule Call (2h from now) ----
+//     await client.query(
+//       `INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time, status)
+//        VALUES ($1, $2, 'qualification', $3, 'pending')`,
+//       [lead.company_id, lead.id, new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()]
+//     );
+
+//     // ---- Analytics Event ----
+//     await client.query(
+//       `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties)
+//        VALUES ('lead_captured', $1, $2, $3)`,
+//       [lead.id, lead.company_id, JSON.stringify(payload.metadata)]
+//     );
+
+//     await client.query('COMMIT');
+
+//     logRequest('POST', '/api/webhook/lead-capture', 200);
+//     res.json({
+//       success: true,
+//       lead_id: lead.id,
+//       phone_number: lead.phone_number,
+//       message: 'Lead captured successfully'
+//     });
+//   } catch (err) {
+//     await client.query('ROLLBACK');
+//     logRequest('POST', '/api/webhook/lead-capture', 400);
+//     res.status(400).json({ success: false, error: err.message });
+//   } finally {
+//     client.release();
+//   }
+// });
+
+
+
+// app.get('/api/lead/:phone', async (req, res) => {
+//   try {
+//     const { rows } = await pool.query(`SELECT * FROM leads WHERE phone_number = $1`, [req.params.phone]);
+//     if (!rows.length) {
+//       logRequest('GET', `/api/lead/${req.params.phone}`, 404);
+//       return res.status(404).json({ success: false, error: 'Lead not found' });
+//     }
+//     logRequest('GET', `/api/lead/${req.params.phone}`, 200);
+//     res.json({ success: true, data: rows[0] });
+//   } catch (e) {
+//     logRequest('GET', `/api/lead/${req.params.phone}`, 500);
+//     handleError(res, e);
+//   }
+// });
+
+
+
+// app.patch('/api/lead/:phone', async (req, res) => {
+//   const { tags, metadata, ...updates } = req.body;
+//   try {
+//     const { rows: [lead] } = await pool.query(
+//       `SELECT tags FROM leads WHERE phone_number = $1`, [req.params.phone]
+//     );
+//     if (!lead) return res.status(404).json({ success: false, error: 'Lead not found' });
+
+//     const mergedTags = Array.from(new Set([...(lead.tags || []), ...(tags || [])]));
+
+//     const setClauses = [];
+//     const values = [];
+//     let idx = 1;
+
+//     if (updates.name) { setClauses.push(`name = $${idx++}`); values.push(updates.name); }
+//     if (updates.email) { setClauses.push(`email = $${idx++}`); values.push(updates.email); }
+//     if (tags) { setClauses.push(`tags = $${idx++}`); values.push(mergedTags); }
+//     if (metadata) { setClauses.push(`metadata = metadata || $${idx++}`); values.push(JSON.stringify(metadata)); }
+
+//     if (setClauses.length === 0) {
+//       return res.status(400).json({ success: false, error: 'No fields to update' });
+//     }
+
+//     setClauses.push('updated_at = CURRENT_TIMESTAMP');
+//     values.push(req.params.phone);
+
+//     const query = `
+//       UPDATE leads SET ${setClauses.join(', ')}
+//       WHERE phone_number = $${idx}
+//       RETURNING *
+//     `;
+
+//     const { rows } = await pool.query(query, values);
+//     logRequest('PATCH', `/api/lead/${req.params.phone}`, 200);
+//     res.json({ success: true, data: rows[0] });
+//   } catch (e) {
+//     logRequest('PATCH', `/api/lead/${req.params.phone}`, 500);
+//     handleError(res, e);
+//   }
+// });
+
+
+
+// app.get('/api/notifications/pending', async (req, res) => {
+//   try {
+//     const { rows } = await pool.query(`
+//       SELECT n.*, l.phone_number AS lead_phone
+//       FROM notifications n
+//       JOIN leads l ON n.lead_id = l.id
+//       WHERE n.status = 'pending' 
+//         AND n.scheduled_time <= NOW()
+//       ORDER BY n.scheduled_time ASC
+//       LIMIT 50
+//     `);
+//     logRequest('GET', '/api/notifications/pending', 200);
+//     res.json({ success: true, count: rows.length, data: rows });
+//   } catch (e) {
+//     logRequest('GET', '/api/notifications/pending', 500);
+//     handleError(res, e);
+//   }
+// });
+
+
+
+
+// app.get('/api/scheduled-calls/pending', async (req, res) => {
+//   try {
+//     const { rows } = await pool.query(`
+//       SELECT sc.*, l.phone_number, l.name, l.company_id
+//       FROM scheduled_calls sc
+//       JOIN leads l ON sc.lead_id = l.id
+//       WHERE sc.status = 'pending' 
+//         AND sc.scheduled_time <= NOW()
+//       ORDER BY sc.scheduled_time ASC
+//     `);
+//     logRequest('GET', '/api/scheduled-calls/pending', 200);
+//     res.json({ success: true, count: rows.length, data: rows });
+//   } catch (e) {
+//     logRequest('GET', '/api/scheduled-calls/pending', 500);
+//     handleError(res, e);
+//   }
+// });
+
+
+
+
+// app.post('/api/analytics/event', async (req, res) => {
+//   const { event_name, lead_id, company_id, event_properties } = req.body;
+//   if (!event_name) {
+//     return res.status(400).json({ success: false, error: 'event_name is required' });
+//   }
+//   try {
+//     await pool.query(
+//       `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties, created_at)
+//        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+//       [
+//         event_name,
+//         lead_id || null,
+//         company_id || null,
+//         event_properties ? JSON.stringify(event_properties).slice(0, 4000) : null
+//       ]
+//     );
+//     logRequest('POST', '/api/analytics/event', 201);
+//     res.status(201).json({ success: true });
+//   } catch (e) {
+//     logRequest('POST', '/api/analytics/event', 500);
+//     handleError(res, e);
+//   }
+// });
+
+
+
+
 // ============================================
 // ERROR HANDLING
 // ============================================
