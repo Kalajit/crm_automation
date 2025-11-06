@@ -584,14 +584,81 @@ app.patch('/api/leads/:lead_id', async (req, res) => {
   }
 });
 
+
+
+// GET SINGLE LEAD BY ID
+app.get('/api/leads/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const query = `
+      SELECT l.*, c.name as company_name
+      FROM leads l
+      LEFT JOIN companies c ON l.company_id = c.id
+      WHERE l.id = $1
+    `;
+    
+    const result = await pool.query(query, [lead_id]);
+    
+    if (result.rows.length === 0) {
+      logRequest('GET', `/api/leads/${lead_id}`, 404);
+      return res.status(404).json({ success: false, error: 'Lead not found' });
+    }
+    
+    logRequest('GET', `/api/leads/${lead_id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/leads/${lead_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+// GET LEAD BY ID (must come before /api/leads/:phone)
+app.get('/api/leads/id/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const query = `
+      SELECT l.*, c.name as company_name
+      FROM leads l
+      LEFT JOIN companies c ON l.company_id = c.id
+      WHERE l.id = $1
+    `;
+    
+    const result = await pool.query(query, [lead_id]);
+    
+    if (result.rows.length === 0) {
+      logRequest('GET', `/api/leads/id/${lead_id}`, 404);
+      return res.status(404).json({ success: false, error: 'Lead not found' });
+    }
+    
+    logRequest('GET', `/api/leads/id/${lead_id}`, 200);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    logRequest('GET', `/api/leads/id/${lead_id}`, 500);
+    handleError(res, error);
+  }
+});
+
+
+
+
+
 // Get lead by phone number
 // Get lead by phone number
-app.get('/api/leads/:phone', async (req, res) => {
-  const { phone } = req.params;
+app.get('/api/leads/by-phone/:phone', async (req, res) => {
+  let  { phone } = req.params;
 
   try {
     if (!phone) {
       return res.status(400).json({ success: false, error: 'Phone parameter is required' });
+    }
+
+  // Normalize phone — always ensure it starts with '+'
+    if (!phone.startsWith('+')) {
+      phone = `+${phone}`;
     }
 
     // Query DB
@@ -600,15 +667,15 @@ app.get('/api/leads/:phone', async (req, res) => {
 
     // Always return 200 OK
     if (result.rows.length === 0) {
-      logRequest('GET', `/api/leads/${phone}`, 200);
+      logRequest('GET', `/api/leads/by-phone/${phone}`, 200);
       return res.json({ success: false, data: null, message: 'Lead not found' });
     }
 
     // Lead found
-    logRequest('GET', `/api/leads/${phone}`, 200);
+    logRequest('GET', `/api/leads/by-phone/${phone}`, 200);
     return res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    logRequest('GET', `/api/leads/${phone}`, 500);
+    logRequest('GET', `/api/leads/by-phone/${phone}`, 500);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -4249,20 +4316,103 @@ setInterval(() => {
 // WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
 // ============================================
 
+// app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
+//   try {
+//     const { entry } = req.body;
+    
+//     // Verify webhook (Meta requires this)
+//     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
+//       const verifyToken = req.query['hub.verify_token'];
+      
+//       // Check if verify token matches any agent instance
+//       const agent = await pool.query(
+//         'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
+//         [verifyToken]
+//       );
+      
+//       if (agent.rows.length > 0) {
+//         return res.send(req.query['hub.challenge']);
+//       }
+//       return res.status(403).send('Invalid verify token');
+//     }
+
+//     // Process incoming message
+//     for (const change of entry[0].changes) {
+//       if (change.field !== 'messages') continue;
+
+//       const message = change.value.messages[0];
+//       const fromPhone = message.from; // Lead's phone number
+//       const toPhone = change.value.metadata.display_phone_number; // Client's WhatsApp number
+//       // Always prefix with '+' for consistent matching
+//       const normalizedToPhone = toPhone.startsWith('+') ? toPhone : `+${toPhone}`;
+
+
+//       // 1. Identify which client owns this WhatsApp number
+//       const agentResult = await pool.query(`
+//         SELECT 
+//           ai.*, 
+//           ai.whatsapp_credentials,
+//           ac.prompt_preamble,
+//           ac.initial_message,
+//           c.name as company_name
+//         FROM agent_instances ai
+//         LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+//         LEFT JOIN companies c ON ai.company_id = c.id
+//         WHERE ai.whatsapp_number = $1 AND ai.agent_type = 'whatsapp' AND ai.is_active = TRUE
+//       `, [normalizedToPhone]);
+
+//       if (agentResult.rows.length === 0) {
+//         console.log('⚠️ Unknown WhatsApp number:', toPhone);
+//         return res.sendStatus(404);
+//       }
+
+//       const agentInstance = agentResult.rows[0];
+      
+//       // 2. Forward to n8n webhook with agent instance data
+//       await axios.post(process.env.N8N_WHATSAPP_WEBHOOK_URL || 'http://n8n:5678/webhook/whatsapp-trigger', {
+//         message: {
+//           from: fromPhone,
+//           text: { body: message.text?.body || '' },
+//           type: message.type
+//         },
+//         contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
+//         agent_instance: {
+//           id: agentInstance.id,
+//           company_id: agentInstance.company_id,
+//           phone_number: agentInstance.whatsapp_number,
+//           prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
+//           credentials: agentInstance.whatsapp_credentials
+//         }
+//       });
+//     }
+
+//     res.sendStatus(200);
+//   } catch (error) {
+//     console.error('❌ WhatsApp webhook error:', error);
+//     res.sendStatus(500);
+//   }
+// });
+
+
+
+
+
+// ============================================
+// WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
+// ============================================
+
 app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
   try {
     const { entry } = req.body;
-    
+
     // Verify webhook (Meta requires this)
     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
       const verifyToken = req.query['hub.verify_token'];
-      
-      // Check if verify token matches any agent instance
       const agent = await pool.query(
         'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
         [verifyToken]
       );
-      
+
       if (agent.rows.length > 0) {
         return res.send(req.query['hub.challenge']);
       }
@@ -4274,10 +4424,11 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       if (change.field !== 'messages') continue;
 
       const message = change.value.messages[0];
-      const fromPhone = message.from; // Lead's phone number
-      const toPhone = change.value.metadata.display_phone_number; // Client's WhatsApp number
+      const fromPhone = message.from;
+      const toPhone = change.value.metadata.display_phone_number;
+      const normalizedToPhone = toPhone.startsWith('+') ? toPhone : `+${toPhone}`;
 
-      // 1. Identify which client owns this WhatsApp number
+      // 1️⃣ Identify which client owns this WhatsApp number
       const agentResult = await pool.query(`
         SELECT 
           ai.*, 
@@ -4288,8 +4439,10 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
         FROM agent_instances ai
         LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
         LEFT JOIN companies c ON ai.company_id = c.id
-        WHERE ai.whatsapp_number = $1 AND ai.agent_type = 'whatsapp' AND ai.is_active = TRUE
-      `, [toPhone]);
+        WHERE ai.whatsapp_number = $1 
+          AND ai.agent_type = 'whatsapp' 
+          AND ai.is_active = TRUE
+      `, [normalizedToPhone]);
 
       if (agentResult.rows.length === 0) {
         console.log('⚠️ Unknown WhatsApp number:', toPhone);
@@ -4297,23 +4450,84 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       }
 
       const agentInstance = agentResult.rows[0];
-      
-      // 2. Forward to n8n webhook with agent instance data
-      await axios.post(process.env.N8N_WEBHOOK_URL || 'http://n8n:5678/webhook/whatsapp-trigger', {
-        message: {
-          from: fromPhone,
-          text: { body: message.text?.body || '' },
-          type: message.type
-        },
-        contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
-        agent_instance: {
-          id: agentInstance.id,
-          company_id: agentInstance.company_id,
-          phone_number: agentInstance.whatsapp_number,
-          prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
-          credentials: agentInstance.whatsapp_credentials
+      const text = message.text?.body || '';
+
+      // ============================================
+      // ✅ NEW SECTION: Store incoming user message
+      // ============================================
+
+      try {
+        // 1. Get or create lead
+        const phone = '+' + fromPhone;
+        let leadRes = await pool.query(
+          'SELECT id FROM leads WHERE phone_number = $1;',
+          [phone]
+        );
+
+        let leadId;
+        if (leadRes.rows.length === 0) {
+          const newLead = await pool.query(
+            `INSERT INTO leads (phone_number, name, lead_source, last_contacted)
+             VALUES ($1, $2, 'whatsapp', NOW()) RETURNING id;`,
+            [phone, message.profile?.name || 'Unknown']
+          );
+          leadId = newLead.rows[0].id;
+        } else {
+          leadId = leadRes.rows[0].id;
+          await pool.query(`UPDATE leads SET last_contacted = NOW() WHERE id = $1;`, [leadId]);
         }
-      });
+
+        // 2. Get or create conversation
+        let convRes = await pool.query(
+          'SELECT id FROM conversations WHERE lead_id = $1;',
+          [leadId]
+        );
+
+        let convId;
+        if (convRes.rows.length === 0) {
+          const newConv = await pool.query(
+            `INSERT INTO conversations (lead_id, phone_number, conversation_history)
+             VALUES ($1, $2, $3) RETURNING id;`,
+            // [leadId, phone, text]
+            [leadId, phone]
+          );
+          convId = newConv.rows[0].id;
+        } else {
+          convId = convRes.rows[0].id;
+        }
+
+        // 3. Insert message record
+        await pool.query(
+          `INSERT INTO whatsapp_messages 
+           (conversation_id, lead_id, phone_number, message_type, message_body, sender, message_id, is_from_user)
+           VALUES ($1, $2, $3, 'text', $4, 'user', $5, TRUE);`,
+          [convId, leadId, phone, text, message.id || `usr_${Date.now()}`]
+        );
+      } catch (err) {
+        console.error('⚠️ DB insert error for user message:', err);
+      }
+
+      // ============================================
+      // ✅ EXISTING SECTION: Forward to n8n
+      // ============================================
+      await axios.post(
+        process.env.N8N_WHATSAPP_WEBHOOK_URL || 'http://n8n:5678/webhook/whatsapp-trigger',
+        {
+          message: {
+            from: fromPhone,
+            text: { body: text },
+            type: message.type
+          },
+          contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
+          agent_instance: {
+            id: agentInstance.id,
+            company_id: agentInstance.company_id,
+            phone_number: agentInstance.whatsapp_number,
+            prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
+            credentials: agentInstance.whatsapp_credentials
+          }
+        }
+      );
     }
 
     res.sendStatus(200);
@@ -4321,6 +4535,36 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
     console.error('❌ WhatsApp webhook error:', error);
     res.sendStatus(500);
   }
+});
+
+
+
+
+
+
+// Meta will call this GET endpoint to verify your webhook
+app.get('/api/webhooks/whatsapp-universal', async (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token) {
+    // Look for matching verify token in DB
+    const result = await pool.query(
+      'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
+      [token]
+    );
+
+    if (result.rows.length > 0) {
+      console.log('✅ Webhook verified successfully!');
+      return res.status(200).send(challenge);
+    } else {
+      console.log('❌ Invalid verify token:', token);
+      return res.sendStatus(403);
+    }
+  }
+
+  res.sendStatus(400);
 });
 
 // ============================================
@@ -4458,6 +4702,407 @@ app.get('/callback', async (req, res) => {
   });
 
   res.redirect('/dashboard?success=true');
+});
+
+
+
+
+
+// ADD THESE ENDPOINTS TO YOUR EXISTING server.js FILE
+
+// ============================================
+// CAMPAIGNS ENDPOINTS (Add after existing campaign endpoints)
+// ============================================
+
+// Get campaigns for company
+app.get('/api/campaigns', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    let query = 'SELECT * FROM campaigns WHERE 1=1';
+    const params = [];
+    
+    if (company_id) {
+      params.push(parseInt(company_id));
+      query += ` AND company_id = $${params.length}`;
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/campaigns', 200);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    logRequest('GET', '/api/campaigns', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// BULK SEND WHATSAPP MESSAGE
+// ============================================
+
+app.post('/api/whatsapp/send-bulk', async (req, res) => {
+  try {
+    const { agent_instance_id, messages } = req.body;
+    
+    if (!agent_instance_id || !messages || !Array.isArray(messages)) {
+      return res.status(400).json({ 
+        error: 'agent_instance_id and messages array required' 
+      });
+    }
+    
+    // Get agent credentials
+    const agent = await pool.query(
+      'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+      [agent_instance_id]
+    );
+    
+    if (agent.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    
+    const credentials = agent.rows[0].whatsapp_credentials;
+    const results = [];
+    const errors = [];
+    
+    // Send messages with rate limiting
+    for (const msg of messages) {
+      try {
+        const response = await axios.post(
+          `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+          {
+            messaging_product: 'whatsapp',
+            to: msg.to,
+            type: 'text',
+            text: { body: msg.message }
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${credentials.access_token}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        results.push({ to: msg.to, success: true, message_id: response.data.messages[0].id });
+        
+        // Rate limit: 1 message per second
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (error) {
+        errors.push({ to: msg.to, error: error.message });
+      }
+    }
+    
+    logRequest('POST', '/api/whatsapp/send-bulk', 200);
+    res.json({ 
+      success: true, 
+      sent: results.length,
+      failed: errors.length,
+      results,
+      errors 
+    });
+    
+  } catch (error) {
+    logRequest('POST', '/api/whatsapp/send-bulk', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// GET LEAD CUSTOM DATA
+// ============================================
+
+app.get('/api/leads/:lead_id/custom-fields', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const query = `
+      SELECT 
+        lcd.field_key,
+        lcd.field_value,
+        cfd.field_label,
+        cfd.field_type,
+        cfd.field_category
+      FROM lead_custom_data lcd
+      JOIN custom_field_definitions cfd ON lcd.field_definition_id = cfd.id
+      WHERE lcd.lead_id = $1
+      ORDER BY cfd.display_order, cfd.field_label
+    `;
+    
+    const result = await pool.query(query, [lead_id]);
+    
+    // Format as key-value object
+    const customFields = {};
+    result.rows.forEach(row => {
+      customFields[row.field_key] = {
+        value: row.field_value,
+        label: row.field_label,
+        type: row.field_type,
+        category: row.field_category
+      };
+    });
+    
+    logRequest('GET', `/api/leads/${lead_id}/custom-fields`, 200);
+    res.json({ success: true, data: customFields });
+    
+  } catch (error) {
+    logRequest('GET', `/api/leads/${lead_id}/custom-fields`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// UPDATE LEAD STATUS
+// ============================================
+
+app.patch('/api/leads/:lead_id/status', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    const { lead_status, interest_level, notes } = req.body;
+    
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+    
+    if (lead_status) {
+      paramCount++;
+      updates.push(`lead_status = $${paramCount}`);
+      params.push(lead_status);
+    }
+    
+    if (interest_level !== undefined) {
+      paramCount++;
+      updates.push(`interest_level = $${paramCount}`);
+      params.push(interest_level);
+    }
+    
+    if (notes) {
+      paramCount++;
+      updates.push(`notes = $${paramCount}`);
+      params.push(notes);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    paramCount++;
+    params.push(lead_id);
+    
+    const query = `
+      UPDATE leads
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    logRequest('PATCH', `/api/leads/${lead_id}/status`, 200);
+    res.json({ success: true, data: result.rows[0] });
+    
+  } catch (error) {
+    logRequest('PATCH', `/api/leads/${lead_id}/status`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// SEND MANUAL WHATSAPP MESSAGE
+// ============================================
+
+app.post('/api/whatsapp/send-manual', async (req, res) => {
+  try {
+    const { agent_instance_id, to, message, lead_id } = req.body;
+    
+    if (!agent_instance_id || !to || !message) {
+      return res.status(400).json({ 
+        error: 'agent_instance_id, to, and message required' 
+      });
+    }
+    
+    // Get agent credentials
+    const agent = await pool.query(
+      'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+      [agent_instance_id]
+    );
+    
+    if (agent.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    
+    const credentials = agent.rows[0].whatsapp_credentials;
+    
+    // Send via Meta API
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'text',
+        text: { body: message }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${credentials.access_token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    // Log in database
+    if (lead_id) {
+      await pool.query(`
+        INSERT INTO whatsapp_messages 
+        (lead_id, phone_number, message_type, message_body, sender, is_from_user)
+        VALUES ($1, $2, 'text', $3, 'agent', false)
+      `, [lead_id, to, message]);
+    }
+    
+    logRequest('POST', '/api/whatsapp/send-manual', 200);
+    res.json({ success: true, message_id: response.data.messages[0].id });
+    
+  } catch (error) {
+    logRequest('POST', '/api/whatsapp/send-manual', 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// GET CONVERSATION WITH MESSAGES
+// ============================================
+
+app.get('/api/conversations/:phone/messages', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { limit } = req.query;
+    
+    const query = `
+      SELECT 
+        wm.*,
+        l.name as lead_name
+      FROM whatsapp_messages wm
+      LEFT JOIN leads l ON wm.lead_id = l.id
+      WHERE wm.phone_number = $1
+      ORDER BY wm.timestamp DESC
+      LIMIT $2
+    `;
+    
+    const result = await pool.query(query, [phone, parseInt(limit) || 100]);
+    
+    logRequest('GET', `/api/conversations/${phone}/messages`, 200);
+    res.json({ success: true, data: result.rows });
+    
+  } catch (error) {
+    logRequest('GET', `/api/conversations/${phone}/messages`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// GET AGENT PERFORMANCE STATS
+// ============================================
+
+app.get('/api/agent-instances/:id/stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get call stats
+    const callStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_calls,
+        COUNT(*) FILTER (WHERE call_status = 'completed') as completed_calls,
+        AVG(call_duration) as avg_duration
+      FROM call_logs
+      WHERE company_id = (SELECT company_id FROM agent_instances WHERE id = $1)
+      AND created_at >= NOW() - INTERVAL '30 days'
+    `, [id]);
+    
+    // Get message stats
+    const messageStats = await pool.query(`
+      SELECT COUNT(*) as total_messages
+      FROM whatsapp_messages
+      WHERE lead_id IN (
+        SELECT id FROM leads 
+        WHERE company_id = (SELECT company_id FROM agent_instances WHERE id = $1)
+      )
+      AND timestamp >= NOW() - INTERVAL '30 days'
+    `, [id]);
+    
+    logRequest('GET', `/api/agent-instances/${id}/stats`, 200);
+    res.json({ 
+      success: true, 
+      data: {
+        ...callStats.rows[0],
+        ...messageStats.rows[0]
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', `/api/agent-instances/${id}/stats`, 500);
+    handleError(res, error);
+  }
+});
+
+// ============================================
+// EXPORT LEADS TO CSV
+// ============================================
+
+app.get('/api/leads/export/csv', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    const query = `
+      SELECT 
+        l.*,
+        COUNT(cl.id) as total_calls,
+        COUNT(wm.id) as total_messages
+      FROM leads l
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN whatsapp_messages wm ON l.id = wm.lead_id
+      WHERE l.company_id = $1
+      GROUP BY l.id
+      ORDER BY l.created_at DESC
+    `;
+    
+    const result = await pool.query(query, [company_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No leads to export' });
+    }
+    
+    // Convert to CSV
+    const headers = Object.keys(result.rows[0]);
+    const csvRows = [headers.join(',')];
+    
+    for (const row of result.rows) {
+      const values = headers.map(header => {
+        const val = row[header];
+        return typeof val === 'string' ? `"${val.replace(/"/g, '""')}"` : val;
+      });
+      csvRows.push(values.join(','));
+    }
+    
+    const csv = csvRows.join('\n');
+    
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="leads_${Date.now()}.csv"`);
+    res.send(csv);
+    
+    logRequest('GET', '/api/leads/export/csv', 200);
+    
+  } catch (error) {
+    logRequest('GET', '/api/leads/export/csv', 500);
+    handleError(res, error);
+  }
 });
 
 

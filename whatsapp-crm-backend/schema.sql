@@ -1838,6 +1838,12 @@ CREATE INDEX IF NOT EXISTS idx_conversation_history ON call_logs USING GIN (conv
 CREATE INDEX IF NOT EXISTS idx_agent_instances_whatsapp_number ON agent_instances(whatsapp_number);
 
 
+
+
+
+
+
+
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
 -- ============================================

@@ -268,35 +268,35 @@ services:
 
 
 
-  # ========================================
-  # Python AI Agent (Voice + WhatsApp AI)
-  # ========================================
-  python-agent:
-    build:
-      context: ../../call automation
-      dockerfile: Dockerfile
-    container_name: whatsapp-crm-ai-agent
-    depends_on:
-      postgres:
-        condition: service_healthy
-      indictrans:
-        condition: service_healthy
-    environment:
-      PORT: 8000
-      DB_HOST: postgres
-      DB_USER: ajsal
-      DB_PASSWORD: "ajsalpv@4champz.in"
-      DB_NAME: whatsapp_crm
-      DB_PORT: 5432
-      INDICTRANS_URL: http://indictrans:5000
-      DEEPL_API_KEY: ${DEEPL_API_KEY:-}
-    ports:
-      - "8000:8000"
-    volumes:
-      - ../call automation:/app:ro
-    restart: unless-stopped
-    networks:
-      - whatsapp-crm-network
+  # # ========================================
+  # # Python AI Agent (Voice + WhatsApp AI)
+  # # ========================================
+  # python-agent:
+  #   build:
+  #     context: ../../call automation
+  #     dockerfile: Dockerfile
+  #   container_name: whatsapp-crm-ai-agent
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     indictrans:
+  #       condition: service_healthy
+  #   environment:
+  #     PORT: 8000
+  #     DB_HOST: postgres
+  #     DB_USER: ajsal
+  #     DB_PASSWORD: "ajsalpv@4champz.in"
+  #     DB_NAME: whatsapp_crm
+  #     DB_PORT: 5432
+  #     INDICTRANS_URL: http://indictrans:5000
+  #     DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ../call automation:/app:ro
+  #   restart: unless-stopped
+  #   networks:
+  #     - whatsapp-crm-network
 
 
 
