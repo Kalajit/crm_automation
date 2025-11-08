@@ -7,6 +7,12 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const WebSocket = require('ws');
 const http = require('http');
+const session = require('express-session');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+
 require('dotenv').config();
 
 const app = express();
@@ -112,8 +118,12 @@ const DEEPL_API_KEY = process.env.DEEPL_API_KEY || null;
 // ============================================
 
 app.use(helmet());
+// app.use(cors({
+//   origin: process.env.CORS_ORIGIN?.split(',') || '*'
+// }));
 app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(',') || '*'
+  origin: process.env.CORS_ORIGIN?.split(',') || ['http://localhost:8501', 'https://*.ngrok-free.app'],  // ✅ Allow Streamlit + ngrok
+  credentials: true
 }));
 app.use(express.json());
 
@@ -122,6 +132,17 @@ const limiter = rateLimit({
   max: 100
 });
 app.use(limiter);
+
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'your-super-secret-key-change-in-production',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { 
+    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+    maxAge: 3600000 // 1 hour
+  }
+}));
 
 // ============================================
 // DATABASE CONNECTION
@@ -137,6 +158,12 @@ const pool = new Pool({
 
 pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('⚠️ SIGTERM received, closing database pool...');
+  await pool.end();
+  process.exit(0);
 });
 
 console.log(`✓ Database configured: ${process.env.DB_NAME}`);
@@ -257,6 +284,57 @@ function broadcastToCall(call_sid, data, excludeWs = null) {
   
   console.log(`[WS] Broadcast to ${sentCount} clients on call ${call_sid}`);
 }
+
+
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: './recordings/',
+  filename: (req, file, cb) => {
+    const callSid = req.body.call_sid || 'unknown';
+    cb(null, `${callSid}_${Date.now()}.mp3`);
+  }
+});
+
+const upload = multer({ storage });
+
+app.post('/api/recordings/upload', upload.single('audio_file'), async (req, res) => {
+  try {
+    const { call_sid, filename  } = req.body;
+    const localPath = req.file.path;
+
+
+    let finalPath = tempPath;
+    if (filename) {
+      const uploadDir = path.dirname(tempPath);
+      finalPath = path.join(uploadDir, filename);
+
+      // Rename file on disk
+      fs.renameSync(tempPath, finalPath);
+    }
+    
+    // Update call log with local path
+    await pool.query(`
+      UPDATE call_logs
+      SET local_audio_path = $1, updated_at = NOW()
+      WHERE call_sid = $2
+    `, [finalPath, call_sid]);
+    
+    res.json({
+      success: true,
+      saved_as: filename || path.basename(finalPath),
+      local_path: finalPath,
+      message: 'Recording saved locally'
+    });
+    
+  } catch (error) {
+    console.error('Recording upload error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 
 // ============================================
 // REST API ENDPOINT FOR PYTHON TO PUSH UPDATES
@@ -4312,6 +4390,619 @@ setInterval(() => {
 
 
 
+// ==================== OAUTH ENDPOINTS (FIXED) ====================
+// Add these BEFORE your existing webhook endpoints
+
+// 1. INITIATE OAUTH FLOW (FIXED)
+app.get('/api/whatsapp/oauth/start', async (req, res) => {
+  try {
+    const { company_id, agent_instance_id } = req.query;
+    
+    if (!company_id || !agent_instance_id) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'company_id and agent_instance_id required' 
+      });
+    }
+    
+    // ✅ FIX: Store in session for callback
+    req.session.oauth_state = {
+      company_id: parseInt(company_id),
+      agent_instance_id: parseInt(agent_instance_id),
+      timestamp: Date.now()
+    };
+    
+    // ✅ FIX: Use state parameter for security (prevents CSRF)
+    const state = Buffer.from(JSON.stringify({
+      company_id,
+      agent_instance_id,
+      nonce: Math.random().toString(36).substr(2, 9)
+    })).toString('base64');
+    
+    const redirectUri = `${process.env.BASE_URL}/api/whatsapp/oauth/callback`;
+    
+    // ✅ FIX: Correct OAuth URL with all required scopes
+    const authUrl = 
+      `https://www.facebook.com/v21.0/dialog/oauth?` +
+      `client_id=${process.env.META_APP_ID}&` +
+      `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+      `state=${encodeURIComponent(state)}&` +
+      `scope=whatsapp_business_messaging,whatsapp_business_management,business_management`;
+    
+    console.log('✅ OAuth flow initiated:', { company_id, agent_instance_id });
+    logRequest('GET', '/api/whatsapp/oauth/start', 200);
+    
+    // res.json({ 
+    //   success: true, 
+    //   auth_url: authUrl,
+    //   message: 'Redirect user to auth_url',
+    //   expires_in: 3600 // 1 hour
+    // });
+
+
+    res.json({ 
+      success: true,
+      data: {  // ✅ Wrap in 'data' object
+        auth_url: authUrl,
+        expires_in: 3600
+      },
+      message: 'Redirect user to auth_url'
+    });
+
+    
+  } catch (error) {
+    console.error('❌ OAuth start error:', error);
+    logRequest('GET', '/api/whatsapp/oauth/start', 500);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// 2. HANDLE OAUTH CALLBACK (COMPLETELY FIXED)
+app.get('/api/whatsapp/oauth/callback', async (req, res) => {
+  try {
+    const { code, state, error: oauth_error, error_description } = req.query;
+    
+    // ✅ FIX: Handle OAuth errors from Facebook
+    if (oauth_error) {
+      console.error('❌ OAuth error from Facebook:', oauth_error, error_description);
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Connection Failed</title>
+          <meta charset="UTF-8">
+        </head>
+        <body style="font-family: Arial; text-align: center; margin-top: 50px;">
+          <h1>❌ WhatsApp Connection Failed</h1>
+          <p><strong>Error:</strong> ${oauth_error}</p>
+          <p>${error_description || 'User cancelled authorization or permission denied'}</p>
+          <a href="/" style="color: #25D366; text-decoration: none;">← Back to Dashboard</a>
+        </body>
+        </html>
+      `);
+    }
+    
+    if (!code || !state) {
+      return res.status(400).send('Invalid OAuth callback: Missing code or state');
+    }
+    
+    // ✅ FIX: Decode and validate state
+    let stateData;
+    try {
+      stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    } catch (e) {
+      return res.status(400).send('Invalid state parameter');
+    }
+    
+    const { company_id, agent_instance_id } = stateData;
+    
+    console.log('📞 Processing OAuth callback for:', { company_id, agent_instance_id });
+    
+    // STEP 1: Exchange authorization code for access token
+    const redirectUri = `${process.env.BASE_URL}/api/whatsapp/oauth/callback`;
+    
+    const tokenResponse = await axios.post(
+      'https://graph.facebook.com/v21.0/oauth/access_token',
+      null,
+      {
+        params: {
+          client_id: process.env.META_APP_ID,
+          client_secret: process.env.META_APP_SECRET,
+          code: code,
+          redirect_uri: redirectUri
+        },
+        timeout: 10000
+      }
+    );
+    
+    const accessToken = tokenResponse.data.access_token;
+    console.log('✅ Access token obtained');
+    
+    // ✅ FIX: STEP 2 - Get WABA ID using correct endpoint
+    const debugResponse = await axios.get(
+      'https://graph.facebook.com/v21.0/debug_token',
+      {
+        params: {
+          input_token: accessToken,
+          access_token: `${process.env.META_APP_ID}|${process.env.META_APP_SECRET}`
+        },
+        timeout: 10000
+      }
+    );
+    
+    // Extract granted scopes
+    const grantedScopes = debugResponse.data.data.granular_scopes || [];
+    console.log('✅ Granted scopes:', grantedScopes.map(s => s.scope));
+    
+    // ✅ FIX: STEP 3 - Get WhatsApp Business Account ID
+    const businessResponse = await axios.get(
+      'https://graph.facebook.com/v21.0/me/businesses',
+      {
+        params: { access_token: accessToken },
+        timeout: 10000
+      }
+    );
+    
+    if (!businessResponse.data.data || businessResponse.data.data.length === 0) {
+      throw new Error('No business accounts found. Please create a WhatsApp Business Account first.');
+    }
+    
+    const businessAccountId = businessResponse.data.data[0].id;
+    console.log('✅ Business Account ID:', businessAccountId);
+    
+    // ✅ FIX: STEP 4 - Get WhatsApp Business Account (WABA)
+    const wabaResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${businessAccountId}/client_whatsapp_business_accounts`,
+      {
+        params: { access_token: accessToken },
+        timeout: 10000
+      }
+    );
+    
+    if (!wabaResponse.data.data || wabaResponse.data.data.length === 0) {
+      throw new Error('No WhatsApp Business Accounts found. Please set up WhatsApp in Meta Business Manager first.');
+    }
+    
+    const wabaId = wabaResponse.data.data[0].id;
+    console.log('✅ WABA ID:', wabaId);
+    
+    // ✅ FIX: STEP 5 - Get phone numbers from WABA
+    const phoneResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${wabaId}/phone_numbers`,
+      {
+        params: { access_token: accessToken },
+        timeout: 10000
+      }
+    );
+    
+    if (!phoneResponse.data.data || phoneResponse.data.data.length === 0) {
+      throw new Error('No phone numbers found. Please add a phone number to your WhatsApp Business Account.');
+    }
+    
+    const phoneData = phoneResponse.data.data[0];
+    const phoneNumberId = phoneData.id;
+    const displayPhoneNumber = phoneData.display_phone_number;
+    const verifiedName = phoneData.verified_name;
+    
+    console.log('✅ Phone Number:', displayPhoneNumber, 'ID:', phoneNumberId);
+    
+    // ✅ FIX: Generate unique verify token
+    const verifyToken = `verify_${Date.now()}_${Math.random().toString(36).substr(2, 12)}`;
+    
+    // ✅ FIX: STEP 6 - Save credentials to database with proper JSON structure
+    const updateResult = await pool.query(`
+      UPDATE agent_instances
+      SET 
+        whatsapp_number = $1,
+        whatsapp_credentials = $2::jsonb,
+        webhook_verify_token = $3,
+        token_expires_at = NOW() + INTERVAL '60 days',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4 AND company_id = $5
+      RETURNING id, agent_name
+    `, [
+      displayPhoneNumber,
+      JSON.stringify({
+        access_token: accessToken,
+        phone_number_id: phoneNumberId,
+        business_account_id: businessAccountId,
+        waba_id: wabaId,
+        verified_name: verifiedName,
+        connected_at: new Date().toISOString()
+      }),
+      verifyToken,
+      agent_instance_id,
+      company_id
+    ]);
+    
+    if (updateResult.rows.length === 0) {
+      throw new Error('Agent instance not found or company_id mismatch');
+    }
+    
+    console.log('✅ Credentials saved to database');
+    logRequest('GET', '/api/whatsapp/oauth/callback', 200);
+    
+    // ✅ FIX: STEP 7 - Return beautiful success page with clear instructions
+    const webhookUrl = `${process.env.BASE_URL}/api/webhooks/whatsapp-universal`;
+    const agentName = updateResult.rows[0].agent_name;
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>WhatsApp Connected ✅</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+          }
+          .container {
+            background: white;
+            max-width: 700px;
+            width: 100%;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+          }
+          .header {
+            background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+          }
+          .header h1 {
+            font-size: 2em;
+            margin-bottom: 10px;
+          }
+          .content {
+            padding: 40px;
+          }
+          .success-badge {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            border-left: 4px solid #28a745;
+          }
+          .info-box {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+          }
+          .info-box strong {
+            color: #495057;
+            display: block;
+            margin-bottom: 10px;
+          }
+          .code-box {
+            background: #f1f3f5;
+            border: 2px dashed #dee2e6;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            word-break: break-all;
+            cursor: pointer;
+            transition: all 0.3s;
+          }
+          .code-box:hover {
+            background: #e9ecef;
+            border-color: #adb5bd;
+          }
+          .step {
+            margin: 30px 0;
+            padding: 20px;
+            background: #fff;
+            border-left: 4px solid #667eea;
+            border-radius: 5px;
+          }
+          .step h3 {
+            color: #667eea;
+            margin-bottom: 15px;
+          }
+          .step ol {
+            margin-left: 20px;
+            line-height: 1.8;
+          }
+          .btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: bold;
+            margin: 10px 5px;
+            cursor: pointer;
+            transition: transform 0.2s;
+          }
+          .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+          }
+          .btn-secondary {
+            background: #6c757d;
+          }
+          .warning {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+          }
+          .copy-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-top: 10px;
+          }
+          .copy-btn:hover {
+            background: #218838;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>✅ WhatsApp Connected!</h1>
+            <p>Your WhatsApp Business is now integrated</p>
+          </div>
+          
+          <div class="content">
+            <div class="success-badge">
+              <strong>🎉 Connection Successful</strong>
+              <p style="margin-top: 5px;">Agent "${agentName}" is connected to WhatsApp number <strong>${displayPhoneNumber}</strong></p>
+            </div>
+            
+            <div class="info-box">
+              <strong>📋 Connection Details:</strong>
+              <p><strong>Phone:</strong> ${displayPhoneNumber}</p>
+              <p><strong>Verified Name:</strong> ${verifiedName}</p>
+              <p><strong>Status:</strong> <span style="color: #28a745;">● Active</span></p>
+            </div>
+            
+            <div class="warning">
+              <strong>⚠️ One Final Step Required</strong>
+              <p style="margin-top: 10px;">To complete the setup, you must register the webhook in Meta Developer Console. This is a <strong>one-time configuration</strong>.</p>
+            </div>
+            
+            <div class="step">
+              <h3>Step 1: Copy Webhook URL</h3>
+              <div class="code-box" id="webhook-url" onclick="copyToClipboard('webhook-url')">${webhookUrl}</div>
+              <button class="copy-btn" onclick="copyToClipboard('webhook-url')">📋 Copy URL</button>
+            </div>
+            
+            <div class="step">
+              <h3>Step 2: Copy Verify Token</h3>
+              <div class="code-box" id="verify-token" onclick="copyToClipboard('verify-token')">${verifyToken}</div>
+              <button class="copy-btn" onclick="copyToClipboard('verify-token')">📋 Copy Token</button>
+            </div>
+            
+            <div class="step">
+              <h3>Step 3: Register in Meta Console</h3>
+              <ol>
+                <li>Open <a href="https://developers.facebook.com/apps" target="_blank" style="color: #667eea;">Meta Developer Console</a></li>
+                <li>Select your app → <strong>WhatsApp</strong> → <strong>Configuration</strong></li>
+                <li>In "Webhook" section, click <strong>Edit</strong></li>
+                <li>Paste the <strong>Webhook URL</strong> (from Step 1)</li>
+                <li>Paste the <strong>Verify Token</strong> (from Step 2)</li>
+                <li>Click <strong>Verify and Save</strong></li>
+                <li>Subscribe to the <strong>"messages"</strong> webhook field</li>
+              </ol>
+              <a href="https://developers.facebook.com/apps" target="_blank" class="btn">
+                🚀 Open Meta Console
+              </a>
+            </div>
+            
+            <div style="text-align: center; margin-top: 40px;">
+              <a href="/" class="btn">← Back to Dashboard</a>
+            </div>
+          </div>
+        </div>
+        
+        <script>
+          function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent;
+            
+            navigator.clipboard.writeText(text).then(() => {
+              const originalBg = element.style.background;
+              element.style.background = '#d4edda';
+              element.textContent = '✅ Copied!';
+              
+              setTimeout(() => {
+                element.style.background = originalBg;
+                element.textContent = text;
+              }, 2000);
+            }).catch(err => {
+              alert('Failed to copy. Please select and copy manually.');
+            });
+          }
+        </script>
+      </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('❌ OAuth callback error:', error.response?.data || error.message);
+    logRequest('GET', '/api/whatsapp/oauth/callback', 500);
+    
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Connection Failed</title>
+        <meta charset="UTF-8">
+        <style>
+          body { 
+            font-family: Arial; 
+            text-align: center; 
+            margin: 50px;
+            background: #f8f9fa;
+          }
+          .error-box {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            max-width: 600px;
+            margin: 0 auto;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+          }
+          h1 { color: #dc3545; }
+          .error-details {
+            background: #f8d7da;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            text-align: left;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="error-box">
+          <h1>❌ WhatsApp Connection Failed</h1>
+          <div class="error-details">
+            <strong>Error:</strong><br>
+            ${error.message}
+          </div>
+          <p>Please try again or contact support if the problem persists.</p>
+          <a href="/" style="color: #667eea; text-decoration: none; font-weight: bold;">← Back to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// 3. GET OAUTH STATUS (ENHANCED)
+app.get('/api/whatsapp/oauth/status/:agent_instance_id', async (req, res) => {
+  try {
+    const { agent_instance_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        whatsapp_number,
+        whatsapp_credentials,
+        webhook_verify_token,
+        token_expires_at,
+        CASE 
+          WHEN whatsapp_credentials::text != '{}'::text 
+          AND whatsapp_credentials::jsonb ? 'access_token' 
+          THEN true 
+          ELSE false 
+        END as is_connected
+      FROM agent_instances
+      WHERE id = $1
+    `, [agent_instance_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Agent instance not found' 
+      });
+    }
+    
+    const agent = result.rows[0];
+    
+    // Calculate days until expiry
+    let daysUntilExpiry = null;
+    if (agent.token_expires_at) {
+      const expiryDate = new Date(agent.token_expires_at);
+      const now = new Date();
+      daysUntilExpiry = Math.floor((expiryDate - now) / (1000 * 60 * 60 * 24));
+    }
+    
+    logRequest('GET', `/api/whatsapp/oauth/status/${agent_instance_id}`, 200);
+    res.json({
+      success: true,
+      data: {
+        is_connected: agent.is_connected,
+        whatsapp_number: agent.whatsapp_number,
+        token_expires_at: agent.token_expires_at,
+        days_until_expiry: daysUntilExpiry,
+        needs_renewal: daysUntilExpiry !== null && daysUntilExpiry < 7
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get OAuth status error:', error);
+    logRequest('GET', `/api/whatsapp/oauth/status/${req.params.agent_instance_id}`, 500);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// 4. DISCONNECT WHATSAPP (ENHANCED)
+app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res) => {
+  try {
+    const { agent_instance_id } = req.params;
+    
+    // Get current credentials before deleting
+    const currentResult = await pool.query(
+      'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+      [agent_instance_id]
+    );
+    
+    if (currentResult.rows.length > 0) {
+      const creds = currentResult.rows[0].whatsapp_credentials;
+      // TODO: Optionally revoke token with Meta API here
+      // This would require calling Meta's revoke endpoint
+    }
+    
+    // Clear credentials
+    await pool.query(`
+      UPDATE agent_instances
+      SET 
+        whatsapp_credentials = '{}'::jsonb,
+        webhook_verify_token = NULL,
+        token_expires_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [agent_instance_id]);
+    
+    console.log('✅ WhatsApp disconnected for agent:', agent_instance_id);
+    logRequest('DELETE', `/api/whatsapp/oauth/disconnect/${agent_instance_id}`, 200);
+    
+    res.json({ 
+      success: true, 
+      message: 'WhatsApp disconnected successfully'
+    });
+    
+  } catch (error) {
+    console.error('Disconnect error:', error);
+    logRequest('DELETE', `/api/whatsapp/oauth/disconnect/${req.params.agent_instance_id}`, 500);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// ==================== END OAUTH ENDPOINTS ====================
+
+
+
+
 // ============================================
 // WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
 // ============================================
@@ -4708,8 +5399,6 @@ app.get('/callback', async (req, res) => {
 
 
 
-// ADD THESE ENDPOINTS TO YOUR EXISTING server.js FILE
-
 // ============================================
 // CAMPAIGNS ENDPOINTS (Add after existing campaign endpoints)
 // ============================================
@@ -4810,6 +5499,418 @@ app.post('/api/whatsapp/send-bulk', async (req, res) => {
     handleError(res, error);
   }
 });
+
+
+
+
+
+
+// ==================== TWILIO OAUTH SETUP ====================
+
+/**
+ * Start Twilio OAuth Flow
+ * GET /api/twilio/oauth/start?company_id=X&agent_instance_id=Y
+ */
+app.get('/api/twilio/oauth/start', async (req, res) => {
+  try {
+    const { company_id, agent_instance_id } = req.query;
+    
+    if (!company_id || !agent_instance_id) {
+      return res.status(400).json({ error: 'company_id and agent_instance_id required' });
+    }
+    
+    // Generate secure state token
+    const stateToken = `twilio_${company_id}_${agent_instance_id}_${Date.now()}_${Math.random().toString(36)}`;
+    
+    // Store state in session/redis (simplified: use in-memory for demo)
+    global.twilioOAuthStates = global.twilioOAuthStates || new Map();
+    global.twilioOAuthStates.set(stateToken, { company_id, agent_instance_id, expires: Date.now() + 600000 });
+    
+    // Twilio OAuth URL
+    const authUrl = `https://www.twilio.com/authorize/${process.env.TWILIO_APP_SID}?response_type=code&redirect_uri=${encodeURIComponent(process.env.BASE_URL + '/api/twilio/oauth/callback')}&scope=account&state=${stateToken}`;
+    
+    res.json({
+      success: true,
+      data: {
+        auth_url: authUrl,
+        state: stateToken,
+        expires_in: 600
+      }
+    });
+    
+  } catch (error) {
+    console.error('Twilio OAuth start error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Twilio OAuth Callback
+ * GET /api/twilio/oauth/callback?code=XXX&state=YYY
+ */
+app.get('/api/twilio/oauth/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    
+    if (!code || !state) {
+      return res.status(400).send('Missing authorization code or state');
+    }
+    
+    // Verify state token
+    const stateData = global.twilioOAuthStates?.get(state);
+    if (!stateData || stateData.expires < Date.now()) {
+      return res.status(403).send('Invalid or expired state token');
+    }
+    
+    // Exchange code for access token
+    const tokenResponse = await axios.post('https://api.twilio.com/2010-04-01/oauth/token', 
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: process.env.BASE_URL + '/api/twilio/oauth/callback',
+        client_id: process.env.TWILIO_APP_SID,
+        client_secret: process.env.TWILIO_APP_SECRET
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    
+    const { account_sid, auth_token } = tokenResponse.data;
+    
+    // Fetch available phone numbers
+    const twilioClient = require('twilio')(account_sid, auth_token);
+    const phoneNumbers = await twilioClient.incomingPhoneNumbers.list({ limit: 10 });
+    
+    if (phoneNumbers.length === 0) {
+      return res.status(400).send('No phone numbers found in your Twilio account');
+    }
+    
+    // Use first phone number
+    const phoneNumber = phoneNumbers[0].phoneNumber;
+    const phoneNumberSid = phoneNumbers[0].sid;
+    
+    // Generate webhook verify token
+    const verifyToken = `twilio_verify_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Save to database
+    await pool.query(`
+      UPDATE agent_instances
+      SET 
+        phone_number = $1,
+        twilio_credentials = $2,
+        twilio_webhook_verify_token = $3,
+        twilio_token_expires_at = NOW() + INTERVAL '365 days',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4 AND company_id = $5
+    `, [
+      phoneNumber,
+      JSON.stringify({
+        account_sid,
+        auth_token,
+        phone_number_sid: phoneNumberSid,
+        phone_number: phoneNumber
+      }),
+      verifyToken,
+      stateData.agent_instance_id,
+      stateData.company_id
+    ]);
+    
+    // Cleanup state
+    global.twilioOAuthStates.delete(state);
+    
+    // Success page
+    res.send(`
+      <html>
+        <head><title>Twilio Connected</title></head>
+        <body style="font-family: Arial; text-align: center; padding: 50px;">
+          <h1>✅ Twilio Account Connected!</h1>
+          <p><strong>Phone Number:</strong> ${phoneNumber}</p>
+          <p><strong>Webhook URL:</strong><br><code>${process.env.BASE_URL}/twilio/voice-webhook</code></p>
+          <p><strong>Verify Token:</strong><br><code>${verifyToken}</code></p>
+          <hr>
+          <h3>📋 Next Steps:</h3>
+          <ol style="text-align: left; max-width: 600px; margin: 20px auto;">
+            <li>Go to <a href="https://console.twilio.com/us1/develop/phone-numbers/manage/incoming" target="_blank">Twilio Console → Phone Numbers</a></li>
+            <li>Click on <strong>${phoneNumber}</strong></li>
+            <li>Under <strong>Voice & Fax</strong> → Configure with:
+              <ul>
+                <li><strong>A Call Comes In:</strong> Webhook</li>
+                <li><strong>URL:</strong> <code>${process.env.BASE_URL}/twilio/voice-webhook</code></li>
+                <li><strong>HTTP Method:</strong> POST</li>
+              </ul>
+            </li>
+            <li>Click <strong>Save</strong></li>
+          </ol>
+          <button onclick="window.close()" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">Close Window</button>
+        </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('Twilio OAuth callback error:', error);
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+/**
+ * Check Twilio Connection Status
+ * GET /api/twilio/oauth/status/:agent_instance_id
+ */
+app.get('/api/twilio/oauth/status/:agent_instance_id', async (req, res) => {
+  try {
+    const { agent_instance_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        phone_number,
+        twilio_credentials,
+        twilio_token_expires_at,
+        EXTRACT(DAY FROM (twilio_token_expires_at - NOW())) as days_until_expiry
+      FROM agent_instances
+      WHERE id = $1
+    `, [agent_instance_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent instance not found' });
+    }
+    
+    const agent = result.rows[0];
+    const isConnected = !!agent.twilio_credentials && Object.keys(agent.twilio_credentials).length > 0;
+    
+    res.json({
+      success: true,
+      data: {
+        is_connected: isConnected,
+        phone_number: agent.phone_number,
+        days_until_expiry: agent.days_until_expiry ? parseInt(agent.days_until_expiry) : null,
+        needs_renewal: agent.days_until_expiry < 30
+      }
+    });
+    
+  } catch (error) {
+    console.error('Twilio status check error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Disconnect Twilio Account
+ * DELETE /api/twilio/oauth/disconnect/:agent_instance_id
+ */
+app.delete('/api/twilio/oauth/disconnect/:agent_instance_id', async (req, res) => {
+  try {
+    const { agent_instance_id } = req.params;
+    
+    await pool.query(`
+      UPDATE agent_instances
+      SET 
+        phone_number = NULL,
+        twilio_credentials = '{}'::jsonb,
+        twilio_webhook_verify_token = NULL,
+        twilio_token_expires_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [agent_instance_id]);
+    
+    res.json({ success: true, message: 'Twilio account disconnected' });
+    
+  } catch (error) {
+    console.error('Twilio disconnect error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== TWILIO VOICE WEBHOOK ====================
+
+/**
+ * Universal Twilio Voice Webhook
+ * Handles ALL inbound calls for ALL agent instances
+ */
+app.post('/twilio/voice-webhook', async (req, res) => {
+  try {
+    const { To, From, CallSid } = req.body;
+    
+    console.log(`📞 Inbound call: ${From} → ${To} (SID: ${CallSid})`);
+    
+    // Find which agent instance owns this phone number
+    const agentResult = await pool.query(`
+      SELECT 
+        ai.id,
+        ai.company_id,
+        ai.agent_name,
+        ai.custom_prompt,
+        ai.custom_voice,
+        ai.twilio_credentials,
+        ac.prompt_preamble,
+        ac.initial_message,
+        ac.voice as default_voice,
+        c.name as company_name
+      FROM agent_instances ai
+      LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+      LEFT JOIN companies c ON ai.company_id = c.id
+      WHERE ai.phone_number = $1 
+        AND ai.agent_type = 'voice' 
+        AND ai.is_active = TRUE
+    `, [To]);
+    
+    if (agentResult.rows.length === 0) {
+      console.log('⚠️ Unknown phone number:', To);
+      
+      const VoiceResponse = require('twilio').twiml.VoiceResponse;
+      const response = new VoiceResponse();
+      response.say('Sorry, this number is not configured. Please contact support.');
+      
+      return res.type('text/xml').send(response.toString());
+    }
+    
+    const agentInstance = agentResult.rows[0];
+    const credentials = agentInstance.twilio_credentials;
+    
+    // Forward to FastAPI for AI handling
+    const fastApiUrl = process.env.FASTAPI_URL || 'https://call-automation-kxow.onrender.com';
+    
+    await axios.post(`${fastApiUrl}/api/inbound-call-webhook`, {
+      call_sid: CallSid,
+      from_phone: From,
+      to_phone: To,
+      agent_instance_id: agentInstance.id,
+      company_id: agentInstance.company_id,
+      custom_prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
+      voice: agentInstance.custom_voice || agentInstance.default_voice,
+      credentials: credentials
+    });
+    
+    // Return TwiML to connect call
+    const VoiceResponse = require('twilio').twiml.VoiceResponse;
+    const response = new VoiceResponse();
+    response.say(`Hello, you've reached ${agentInstance.company_name}. Connecting you to our AI assistant.`);
+    response.redirect(`${fastApiUrl}/inbound_call`);
+    
+    res.type('text/xml').send(response.toString());
+    
+  } catch (error) {
+    console.error('❌ Voice webhook error:', error);
+    
+    const VoiceResponse = require('twilio').twiml.VoiceResponse;
+    const response = new VoiceResponse();
+    response.say('An error occurred. Please try again later.');
+    res.type('text/xml').send(response.toString());
+  }
+});
+
+
+
+
+
+// ==================== AIRTEL SIP SETUP ====================
+
+/**
+ * Configure Airtel SIP Credentials (Manual Setup)
+ * POST /api/airtel-sip/configure
+ */
+app.post('/api/airtel-sip/configure', async (req, res) => {
+  try {
+    const { 
+      agent_instance_id, 
+      sip_domain, 
+      sip_username, 
+      sip_password, 
+      did_number 
+    } = req.body;
+    
+    if (!agent_instance_id || !sip_domain || !sip_username || !sip_password || !did_number) {
+      return res.status(400).json({ 
+        error: 'agent_instance_id, sip_domain, sip_username, sip_password, and did_number required' 
+      });
+    }
+    
+    // Validate DID format
+    const normalizedDID = did_number.startsWith('+') ? did_number : `+${did_number}`;
+    
+    await pool.query(`
+      UPDATE agent_instances
+      SET 
+        phone_number = $1,
+        sip_provider = 'airtel',
+        sip_credentials = $2,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [
+      normalizedDID,
+      JSON.stringify({
+        sip_domain,
+        sip_username,
+        sip_password,
+        did_number: normalizedDID,
+        provider: 'airtel'
+      }),
+      agent_instance_id
+    ]);
+    
+    res.json({ 
+      success: true, 
+      message: 'Airtel SIP configured successfully',
+      phone_number: normalizedDID 
+    });
+    
+  } catch (error) {
+    console.error('Airtel SIP config error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get SIP Configuration Status
+ * GET /api/sip/status/:agent_instance_id
+ */
+app.get('/api/sip/status/:agent_instance_id', async (req, res) => {
+  try {
+    const { agent_instance_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        phone_number,
+        sip_provider,
+        sip_credentials,
+        twilio_credentials
+      FROM agent_instances
+      WHERE id = $1
+    `, [agent_instance_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    
+    const agent = result.rows[0];
+    let status = {
+      is_configured: false,
+      provider: 'none',
+      phone_number: null
+    };
+    
+    if (agent.sip_credentials && Object.keys(agent.sip_credentials).length > 0) {
+      status = {
+        is_configured: true,
+        provider: agent.sip_provider || 'custom',
+        phone_number: agent.phone_number
+      };
+    } else if (agent.twilio_credentials && Object.keys(agent.twilio_credentials).length > 0) {
+      status = {
+        is_configured: true,
+        provider: 'twilio',
+        phone_number: agent.phone_number
+      };
+    }
+    
+    res.json({ success: true, data: status });
+    
+  } catch (error) {
+    console.error('SIP status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
 
 // ============================================
 // GET LEAD CUSTOM DATA

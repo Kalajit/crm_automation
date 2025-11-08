@@ -1464,7 +1464,31 @@ CREATE TABLE agent_configs (
 
 
 
--- AGENT INSTANCES (Multiple AI agents per company)
+-- -- AGENT INSTANCES (Multiple AI agents per company)
+-- DROP TABLE IF EXISTS agent_instances CASCADE;
+-- CREATE TABLE agent_instances (
+--   id SERIAL PRIMARY KEY,
+--   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+--   agent_name VARCHAR(255) NOT NULL,
+--   agent_type VARCHAR(50) DEFAULT 'voice', -- 'voice' or 'whatsapp'
+--   phone_number VARCHAR(20), -- Dedicated number for this agent
+--   whatsapp_number VARCHAR(20), -- WhatsApp number if applicable
+--   agent_config_id INTEGER REFERENCES agent_configs(id) ON DELETE SET NULL,
+--   custom_prompt TEXT, -- Override default prompt
+--   custom_voice VARCHAR(50), -- Override default voice
+--   is_active BOOLEAN DEFAULT TRUE,
+--   metadata JSONB DEFAULT '{}'::jsonb,
+--   supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'], -- NEW: Add supported languages
+--   whatsapp_credentials JSONB DEFAULT '{}'::jsonb, -- NEW: WhatsApp API credentials
+--   webhook_verify_token VARCHAR(255), -- NEW: For webhook verification
+--   token_expires_at TIMESTAMP, -- NEW: WhatsApp token expiration
+--   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--   UNIQUE(company_id, agent_name)
+-- );
+
+
+
 DROP TABLE IF EXISTS agent_instances CASCADE;
 CREATE TABLE agent_instances (
   id SERIAL PRIMARY KEY,
@@ -1478,15 +1502,25 @@ CREATE TABLE agent_instances (
   custom_voice VARCHAR(50), -- Override default voice
   is_active BOOLEAN DEFAULT TRUE,
   metadata JSONB DEFAULT '{}'::jsonb,
-  supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'], -- NEW: Add supported languages
-  whatsapp_credentials JSONB DEFAULT '{}'::jsonb, -- NEW: WhatsApp API credentials
-  webhook_verify_token VARCHAR(255), -- NEW: For webhook verification
-  token_expires_at TIMESTAMP, -- NEW: WhatsApp token expiration
+  supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'],
+  whatsapp_credentials JSONB DEFAULT '{}'::jsonb, -- WhatsApp API credentials
+  webhook_verify_token VARCHAR(255), -- For webhook verification
+  token_expires_at TIMESTAMP, -- WhatsApp token expiration
+  twilio_credentials JSONB DEFAULT '{}'::jsonb, -- Stores Twilio Account SID, Auth Token, Phone Number
+  twilio_webhook_verify_token VARCHAR(255), -- For Twilio webhook verification
+  twilio_token_expires_at TIMESTAMP, -- Twilio token expiration
+  sip_credentials JSONB DEFAULT '{}'::jsonb, -- SIP credentials for Airtel/other providers
+  sip_provider VARCHAR(50) DEFAULT 'twilio', -- 'twilio', 'airtel', 'custom'
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, agent_name)
 );
 
+
+COMMENT ON COLUMN agent_instances.twilio_credentials IS 'Stores Twilio Account SID, Auth Token, Phone Number';
+COMMENT ON COLUMN agent_instances.sip_credentials IS 'SIP credentials for Airtel/other providers';
+COMMENT ON COLUMN agent_instances.sip_provider IS 'SIP provider: twilio, airtel, or custom';
+  
 
 
 -- 13. CALL LOGS
@@ -1784,6 +1818,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_configs_company ON agent_configs(company_id
 
 CREATE INDEX IF NOT EXISTS idx_agent_instances_company ON agent_instances(company_id);
 CREATE INDEX IF NOT EXISTS idx_agent_instances_phone ON agent_instances(phone_number);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_twilio_phone ON agent_instances(phone_number);
+
 CREATE INDEX IF NOT EXISTS idx_agent_instances_type ON agent_instances(agent_type);
 
 
@@ -1836,6 +1872,9 @@ CREATE INDEX IF NOT EXISTS idx_conversation_history ON call_logs USING GIN (conv
 
 -- Add index for faster lookups
 CREATE INDEX IF NOT EXISTS idx_agent_instances_whatsapp_number ON agent_instances(whatsapp_number);
+
+
+CREATE INDEX IF NOT EXISTS idx_agent_instances_webhook_token ON agent_instances(webhook_verify_token);
 
 
 
