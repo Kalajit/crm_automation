@@ -26,81 +26,304 @@ const wss = new WebSocket.Server({ server });
 // Track active WebSocket connections per call_sid
 const activeConnections = new Map(); // call_sid -> Set of WebSocket clients
 
-// Translation function using Google Translate API
+// // Translation function using Google Translate API
+// async function translateText(text, targetLang, sourceLang = 'en') {
+//   if (targetLang === sourceLang || !text) return text;
+  
+//   try {
+//     // Primary: LibreTranslate
+//     const response = await axios.post(`${INDICTRANS_URL}/translate`, {
+//       q: text,
+//       source: sourceLang,
+//       target: targetLang,
+//       format: 'text'
+//     }, { timeout: 15000 });
+    
+//     const translated = response.data.translatedText;
+    
+//     if (translated && translated !== text) {
+//       console.log(`LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
+//       return translated;
+//     }
+    
+//   } catch (error) {
+//     console.error('LibreTranslate error:', error.message);
+    
+//     // Fallback: DeepL (if API key set)
+//     if (DEEPL_API_KEY && !['hi', 'kn', 'ml', 'ta', 'te'].includes(targetLang)) {
+//       try {
+//         const deepl = require('deepl-node');
+//         const translator = new deepl.Translator(DEEPL_API_KEY);
+//         const result = await translator.translateText(text, sourceLang, targetLang);
+//         console.log(`DeepL fallback used: ${text.substring(0, 50)}...`);
+//         return result.text;
+//       } catch (deeplError) {
+//         console.error('DeepL fallback error:', deeplError.message);
+//       }
+//     }
+//   }
+
+//   // Ultimate fallback: return original
+//   console.warn(`Translation failed, returning original: ${text.substring(0, 50)}...`);
+//   return text;
+// }
+
+
+
+
+// /**
+//  * Detect language from text using Unicode ranges + keywords
+//  * (No external API needed, instant detection)
+//  */
+// function detectLanguage(text) {
+//   const lowerText = text.toLowerCase();
+  
+//   // Keyword-based detection
+//   if (lowerText.includes('hindi') || lowerText.includes('हिंदी') || /[\u0900-\u097F]/.test(text)) {
+//     return 'hi';
+//   }
+  
+//   if (lowerText.includes('kannada') || lowerText.includes('ಕನ್ನಡ') || /[\u0C80-\u0CFF]/.test(text)) {
+//     return 'kn';
+//   }
+  
+//   if (lowerText.includes('malayalam') || lowerText.includes('മലയാളം') || /[\u0D00-\u0D7F]/.test(text)) {
+//     return 'ml';
+//   }
+  
+//   if (lowerText.includes('tamil') || lowerText.includes('தமிழ்') || /[\u0B80-\u0BFF]/.test(text)) {
+//     return 'ta';
+//   }
+  
+//   if (lowerText.includes('telugu') || lowerText.includes('తెలుగు') || /[\u0C00-\u0C7F]/.test(text)) {
+//     return 'te';
+//   }
+  
+//   return 'en';
+// }
+
+
+// ============================================
+// ✅ UPDATED: Translation Function (LibreTranslate + DeepL Fallback)
+// ============================================
+
+/**
+ * Translates text using LibreTranslate (free) with DeepL fallback (paid)
+ * @param {string} text - Text to translate
+ * @param {string} targetLang - Target language code (hi, kn, ml, ta, te, en)
+ * @param {string} sourceLang - Source language code (default: 'en')
+ * @returns {Promise<string>} - Translated text (or original if translation fails)
+ */
 async function translateText(text, targetLang, sourceLang = 'en') {
-  if (targetLang === sourceLang || !text) return text;
+  // Skip translation if same language or empty text
+  if (targetLang === sourceLang || !text || text.trim().length === 0) {
+    return text;
+  }
   
   try {
-    // Primary: LibreTranslate
+    // ========================================
+    // PRIMARY: LibreTranslate (Free Public API)
+    // ========================================
+    console.log(`🌐 Translating: ${sourceLang} → ${targetLang} | "${text.substring(0, 50)}..."`);
+    
     const response = await axios.post(`${INDICTRANS_URL}/translate`, {
       q: text,
       source: sourceLang,
       target: targetLang,
       format: 'text'
-    }, { timeout: 15000 });
+    }, { 
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
     
     const translated = response.data.translatedText;
     
-    if (translated && translated !== text) {
-      console.log(`LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
+    // Validate translation quality
+    if (translated && translated !== text && translated.trim().length > 0) {
+      console.log(`✅ LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
       return translated;
+    } else {
+      console.warn(`⚠️ LibreTranslate returned invalid/same text, trying fallback...`);
     }
     
   } catch (error) {
-    console.error('LibreTranslate error:', error.message);
-    
-    // Fallback: DeepL (if API key set)
-    if (DEEPL_API_KEY && !['hi', 'kn', 'ml', 'ta', 'te'].includes(targetLang)) {
-      try {
-        const deepl = require('deepl-node');
-        const translator = new deepl.Translator(DEEPL_API_KEY);
-        const result = await translator.translateText(text, sourceLang, targetLang);
-        console.log(`DeepL fallback used: ${text.substring(0, 50)}...`);
-        return result.text;
-      } catch (deeplError) {
-        console.error('DeepL fallback error:', deeplError.message);
-      }
+    console.error(`❌ LibreTranslate error (${error.message}), trying fallback...`);
+  }
+  
+  // ========================================
+  // FALLBACK: DeepL (Paid, for non-Indic languages)
+  // ========================================
+  if (DEEPL_API_KEY && !['hi', 'kn', 'ml', 'ta', 'te'].includes(targetLang)) {
+    try {
+      console.log(`🔄 Using DeepL fallback for ${sourceLang} → ${targetLang}`);
+      
+      const deepl = require('deepl-node');
+      const translator = new deepl.Translator(DEEPL_API_KEY);
+      
+      const result = await translator.translateText(
+        text, 
+        sourceLang.toUpperCase(), 
+        targetLang.toUpperCase()
+      );
+      
+      console.log(`✅ DeepL: ${text.substring(0, 50)}... → ${result.text.substring(0, 50)}...`);
+      return result.text;
+      
+    } catch (deeplError) {
+      console.error(`❌ DeepL fallback error: ${deeplError.message}`);
     }
   }
-
-  // Ultimate fallback: return original
-  console.warn(`Translation failed, returning original: ${text.substring(0, 50)}...`);
+  
+  // ========================================
+  // LAST RESORT: Return original text
+  // ========================================
+  console.warn(`⚠️ Translation failed for "${text.substring(0, 50)}...", returning original`);
   return text;
 }
 
-
-
+// ============================================
+// ✅ UPDATED: Language Detection Function
+// ============================================
 
 /**
- * Detect language from text using Unicode ranges + keywords
- * (No external API needed, instant detection)
+ * Detects language from text using Unicode ranges + keywords
+ * @param {string} text - Text to analyze
+ * @returns {string} - Detected language code (hi, kn, ml, ta, te, en)
  */
 function detectLanguage(text) {
+  if (!text || text.trim().length < 3) {
+    return 'en'; // Default to English for short/empty text
+  }
+  
   const lowerText = text.toLowerCase();
   
-  // Keyword-based detection
-  if (lowerText.includes('hindi') || lowerText.includes('हिंदी') || /[\u0900-\u097F]/.test(text)) {
-    return 'hi';
+  // ========================================
+  // 1. Keyword-based detection (explicit language requests)
+  // ========================================
+  const languageKeywords = {
+    'hi': ['hindi', 'hindi mein', 'हिंदी', 'hindi me bolo', 'speak hindi', 'हिन्दी में'],
+    'kn': ['kannada', 'kannada mein', 'ಕನ್ನಡ', 'kannada nalli', 'speak kannada', 'ಕನ್ನಡದಲ್ಲಿ'],
+    'ml': ['malayalam', 'malayalam il', 'മലയാളം', 'malayalam parayamo', 'speak malayalam', 'മലയാളത്തിൽ'],
+    'ta': ['tamil', 'tamil la', 'தமிழ்', 'tamil paesu', 'speak tamil', 'தமிழில்'],
+    'te': ['telugu', 'telugu lo', 'తెలుగు', 'telugu cheppu', 'speak telugu', 'తెలుగులో'],
+    'en': ['english', 'english mein', 'speak english', 'english please', 'talk in english']
+  };
+  
+  for (const [langCode, keywords] of Object.entries(languageKeywords)) {
+    if (keywords.some(keyword => lowerText.includes(keyword))) {
+      console.log(`🔍 Detected language via keyword: ${langCode}`);
+      return langCode;
+    }
   }
   
-  if (lowerText.includes('kannada') || lowerText.includes('ಕನ್ನಡ') || /[\u0C80-\u0CFF]/.test(text)) {
-    return 'kn';
+  // ========================================
+  // 2. Unicode range detection (script-based)
+  // ========================================
+  const unicodeRanges = {
+    'hi': /[\u0900-\u097F]/,  // Devanagari (Hindi)
+    'kn': /[\u0C80-\u0CFF]/,  // Kannada
+    'ml': /[\u0D00-\u0D7F]/,  // Malayalam
+    'ta': /[\u0B80-\u0BFF]/,  // Tamil
+    'te': /[\u0C00-\u0C7F]/   // Telugu
+  };
+  
+  for (const [langCode, regex] of Object.entries(unicodeRanges)) {
+    if (regex.test(text)) {
+      console.log(`🔍 Detected language via Unicode: ${langCode}`);
+      return langCode;
+    }
   }
   
-  if (lowerText.includes('malayalam') || lowerText.includes('മലയാളം') || /[\u0D00-\u0D7F]/.test(text)) {
-    return 'ml';
+  // ========================================
+  // 3. Advanced: Use langdetect library (optional)
+  // ========================================
+  try {
+    const { detect } = require('langdetect');
+    const detectedLang = detect(text)[0].lang;
+    
+    // Map langdetect codes to our system
+    const langMap = {
+      'hi': 'hi',
+      'kn': 'kn', 
+      'ml': 'ml',
+      'ta': 'ta',
+      'te': 'te',
+      'en': 'en'
+    };
+    
+    if (langMap[detectedLang]) {
+      console.log(`🔍 Detected language via langdetect: ${detectedLang}`);
+      return langMap[detectedLang];
+    }
+  } catch (detectError) {
+    console.debug(`langdetect not available or failed: ${detectError.message}`);
   }
   
-  if (lowerText.includes('tamil') || lowerText.includes('தமிழ்') || /[\u0B80-\u0BFF]/.test(text)) {
-    return 'ta';
-  }
-  
-  if (lowerText.includes('telugu') || lowerText.includes('తెలుగు') || /[\u0C00-\u0C7F]/.test(text)) {
-    return 'te';
-  }
-  
+  // ========================================
+  // 4. Default to English
+  // ========================================
+  console.log(`🔍 No language detected, defaulting to English`);
   return 'en';
 }
+
+// ============================================
+// ✅ NEW: Batch Translation Function (for efficiency)
+// ============================================
+
+/**
+ * Translates multiple texts in a single batch (more efficient)
+ * @param {Array<string>} texts - Array of texts to translate
+ * @param {string} targetLang - Target language code
+ * @param {string} sourceLang - Source language code (default: 'en')
+ * @returns {Promise<Array<string>>} - Array of translated texts
+ */
+async function translateBatch(texts, targetLang, sourceLang = 'en') {
+  if (targetLang === sourceLang || !texts || texts.length === 0) {
+    return texts;
+  }
+  
+  try {
+    console.log(`🌐 Batch translating ${texts.length} texts: ${sourceLang} → ${targetLang}`);
+    
+    // Join texts with delimiter for batch processing
+    const combinedText = texts.join(' ||| ');
+    const translated = await translateText(combinedText, targetLang, sourceLang);
+    
+    // Split back
+    const translatedTexts = translated.split(' ||| ');
+    
+    // Validate lengths match
+    if (translatedTexts.length === texts.length) {
+      console.log(`✅ Batch translation complete: ${texts.length} texts`);
+      return translatedTexts;
+    } else {
+      console.warn(`⚠️ Batch translation length mismatch, falling back to individual`);
+      // Fallback to individual translations
+      return await Promise.all(
+        texts.map(text => translateText(text, targetLang, sourceLang))
+      );
+    }
+    
+  } catch (error) {
+    console.error(`❌ Batch translation error: ${error.message}`);
+    // Fallback to individual translations
+    return await Promise.all(
+      texts.map(text => translateText(text, targetLang, sourceLang))
+    );
+  }
+}
+
+// ============================================
+// ✅ EXPORT FUNCTIONS
+// ============================================
+
+module.exports = {
+  translateText,
+  detectLanguage,
+  translateBatch
+};
 
 // // LibreTranslate Configuration
 // const LIBRETRANSLATE_URL = process.env.LIBRETRANSLATE_URL || 'http://libretranslate:5000';
@@ -111,6 +334,10 @@ const INDICTRANS_URL = process.env.INDICTRANS_URL || 'http://indictrans:5000';
 
 // Optional: DeepL Configuration
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || null;
+
+
+const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || 'my_secret_verify_token_2025';
+
 
 
 // ============================================
@@ -943,6 +1170,10 @@ app.post('/api/conversations', async (req, res) => {
 app.get('/api/conversations/:phone', async (req, res) => {
   try {
     const { phone } = req.params;
+    // 🔧 FIX: Normalize phone number
+    if (!phone.startsWith('+')) {
+      phone = '+' + phone;
+    }
 
     const query = `
       SELECT 
@@ -4461,25 +4692,491 @@ app.get('/api/whatsapp/oauth/start', async (req, res) => {
 });
 
 // 2. HANDLE OAUTH CALLBACK (COMPLETELY FIXED)
+// app.get('/api/whatsapp/oauth/callback', async (req, res) => {
+//   try {
+//     const { code, state, error: oauth_error, error_description } = req.query;
+    
+//     // ✅ FIX: Handle OAuth errors from Facebook
+//     if (oauth_error) {
+//       console.error('❌ OAuth error from Facebook:', oauth_error, error_description);
+//       return res.status(400).send(`
+//         <!DOCTYPE html>
+//         <html>
+//         <head>
+//           <title>Connection Failed</title>
+//           <meta charset="UTF-8">
+//         </head>
+//         <body style="font-family: Arial; text-align: center; margin-top: 50px;">
+//           <h1>❌ WhatsApp Connection Failed</h1>
+//           <p><strong>Error:</strong> ${oauth_error}</p>
+//           <p>${error_description || 'User cancelled authorization or permission denied'}</p>
+//           <a href="/" style="color: #25D366; text-decoration: none;">← Back to Dashboard</a>
+//         </body>
+//         </html>
+//       `);
+//     }
+    
+//     if (!code || !state) {
+//       return res.status(400).send('Invalid OAuth callback: Missing code or state');
+//     }
+    
+//     // ✅ FIX: Decode and validate state
+//     let stateData;
+//     try {
+//       stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+//     } catch (e) {
+//       return res.status(400).send('Invalid state parameter');
+//     }
+    
+//     const { company_id, agent_instance_id } = stateData;
+    
+//     console.log('📞 Processing OAuth callback for:', { company_id, agent_instance_id });
+    
+//     // STEP 1: Exchange authorization code for access token
+//     const redirectUri = `${process.env.BASE_URL}/api/whatsapp/oauth/callback`;
+    
+//     const tokenResponse = await axios.post(
+//       'https://graph.facebook.com/v21.0/oauth/access_token',
+//       null,
+//       {
+//         params: {
+//           client_id: process.env.META_APP_ID,
+//           client_secret: process.env.META_APP_SECRET,
+//           code: code,
+//           redirect_uri: redirectUri
+//         },
+//         timeout: 10000
+//       }
+//     );
+    
+//     const accessToken = tokenResponse.data.access_token;
+//     console.log('✅ Access token obtained');
+    
+//     // ✅ FIX: STEP 2 - Get WABA ID using correct endpoint
+//     const debugResponse = await axios.get(
+//       'https://graph.facebook.com/v21.0/debug_token',
+//       {
+//         params: {
+//           input_token: accessToken,
+//           access_token: `${process.env.META_APP_ID}|${process.env.META_APP_SECRET}`
+//         },
+//         timeout: 10000
+//       }
+//     );
+    
+//     // Extract granted scopes
+//     const grantedScopes = debugResponse.data.data.granular_scopes || [];
+//     console.log('✅ Granted scopes:', grantedScopes.map(s => s.scope));
+    
+//     // ✅ FIX: STEP 3 - Get WhatsApp Business Account ID
+//     const businessResponse = await axios.get(
+//       'https://graph.facebook.com/v21.0/me/businesses',
+//       {
+//         params: { access_token: accessToken },
+//         timeout: 10000
+//       }
+//     );
+    
+//     if (!businessResponse.data.data || businessResponse.data.data.length === 0) {
+//       throw new Error('No business accounts found. Please create a WhatsApp Business Account first.');
+//     }
+    
+//     const businessAccountId = businessResponse.data.data[0].id;
+//     console.log('✅ Business Account ID:', businessAccountId);
+    
+//     // ✅ FIX: STEP 4 - Get WhatsApp Business Account (WABA)
+//     const wabaResponse = await axios.get(
+//       `https://graph.facebook.com/v21.0/${businessAccountId}/client_whatsapp_business_accounts`,
+//       {
+//         params: { access_token: accessToken },
+//         timeout: 10000
+//       }
+//     );
+    
+//     if (!wabaResponse.data.data || wabaResponse.data.data.length === 0) {
+//       throw new Error('No WhatsApp Business Accounts found. Please set up WhatsApp in Meta Business Manager first.');
+//     }
+    
+//     const wabaId = wabaResponse.data.data[0].id;
+//     console.log('✅ WABA ID:', wabaId);
+    
+//     // ✅ FIX: STEP 5 - Get phone numbers from WABA
+//     const phoneResponse = await axios.get(
+//       `https://graph.facebook.com/v21.0/${wabaId}/phone_numbers`,
+//       {
+//         params: { access_token: accessToken },
+//         timeout: 10000
+//       }
+//     );
+    
+//     if (!phoneResponse.data.data || phoneResponse.data.data.length === 0) {
+//       throw new Error('No phone numbers found. Please add a phone number to your WhatsApp Business Account.');
+//     }
+    
+//     const phoneData = phoneResponse.data.data[0];
+//     const phoneNumberId = phoneData.id;
+//     const displayPhoneNumber = phoneData.display_phone_number;
+//     const verifiedName = phoneData.verified_name;
+    
+//     console.log('✅ Phone Number:', displayPhoneNumber, 'ID:', phoneNumberId);
+    
+//     // ✅ FIX: Generate unique verify token
+//     const verifyToken = `verify_${Date.now()}_${Math.random().toString(36).substr(2, 12)}`;
+    
+//     // ✅ FIX: STEP 6 - Save credentials to database with proper JSON structure
+//     // const updateResult = await pool.query(`
+//     //   UPDATE agent_instances
+//     //   SET 
+//     //     whatsapp_number = $1,
+//     //     whatsapp_credentials = $2::jsonb,
+//     //     webhook_verify_token = $3,
+//     //     token_expires_at = NOW() + INTERVAL '60 days',
+//     //     updated_at = CURRENT_TIMESTAMP
+//     //   WHERE id = $4 AND company_id = $5
+//     //   RETURNING id, agent_name
+//     // `, [
+//     //   displayPhoneNumber,
+//     //   JSON.stringify({
+//     //     access_token: accessToken,
+//     //     phone_number_id: phoneNumberId,
+//     //     business_account_id: businessAccountId,
+//     //     waba_id: wabaId,
+//     //     verified_name: verifiedName,
+//     //     connected_at: new Date().toISOString()
+//     //   }),
+//     //   verifyToken,
+//     //   agent_instance_id,
+//     //   company_id
+//     // ]);
+
+
+//     const updateResult = await pool.query(`
+//       UPDATE agent_instances
+//       SET 
+//         whatsapp_number = $1,
+//         whatsapp_credentials = $2::jsonb,
+//         // webhook_verify_token = $3,
+//         token_expires_at = NOW() + INTERVAL '60 days',
+//         updated_at = CURRENT_TIMESTAMP
+//       WHERE id = $4 AND company_id = $5
+//       RETURNING id, agent_name
+//     `, [
+//       displayPhoneNumber,
+//       JSON.stringify({
+//         access_token: accessToken,
+//         phone_number_id: phoneNumberId,
+//         business_account_id: businessAccountId,
+//         waba_id: wabaId,
+//         verified_name: verifiedName,
+//         connected_at: new Date().toISOString()
+//       }),
+//       // verifyToken,
+//       agent_instance_id,
+//       company_id
+//     ]);
+    
+//     if (updateResult.rows.length === 0) {
+//       throw new Error('Agent instance not found or company_id mismatch');
+//     }
+    
+//     console.log('✅ Credentials saved to database');
+//     logRequest('GET', '/api/whatsapp/oauth/callback', 200);
+    
+//     // ✅ FIX: STEP 7 - Return beautiful success page with clear instructions
+//     const webhookUrl = `${process.env.BASE_URL}/api/webhooks/whatsapp-universal`;
+//     const agentName = updateResult.rows[0].agent_name;
+    
+//     res.send(`
+//       <!DOCTYPE html>
+//       <html>
+//       <head>
+//         <title>WhatsApp Connected ✅</title>
+//         <meta charset="UTF-8">
+//         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+//         <style>
+//           * { margin: 0; padding: 0; box-sizing: border-box; }
+//           body { 
+//             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+//             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+//             min-height: 100vh;
+//             padding: 20px;
+//             display: flex;
+//             align-items: center;
+//             justify-content: center;
+//           }
+//           .container {
+//             background: white;
+//             max-width: 700px;
+//             width: 100%;
+//             border-radius: 20px;
+//             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+//             overflow: hidden;
+//           }
+//           .header {
+//             background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
+//             color: white;
+//             padding: 40px;
+//             text-align: center;
+//           }
+//           .header h1 {
+//             font-size: 2em;
+//             margin-bottom: 10px;
+//           }
+//           .content {
+//             padding: 40px;
+//           }
+//           .success-badge {
+//             background: #d4edda;
+//             color: #155724;
+//             padding: 15px;
+//             border-radius: 10px;
+//             margin-bottom: 30px;
+//             border-left: 4px solid #28a745;
+//           }
+//           .info-box {
+//             background: #f8f9fa;
+//             padding: 20px;
+//             border-radius: 10px;
+//             margin: 20px 0;
+//           }
+//           .info-box strong {
+//             color: #495057;
+//             display: block;
+//             margin-bottom: 10px;
+//           }
+//           .code-box {
+//             background: #f1f3f5;
+//             border: 2px dashed #dee2e6;
+//             padding: 15px;
+//             border-radius: 8px;
+//             font-family: 'Courier New', monospace;
+//             font-size: 13px;
+//             word-break: break-all;
+//             cursor: pointer;
+//             transition: all 0.3s;
+//           }
+//           .code-box:hover {
+//             background: #e9ecef;
+//             border-color: #adb5bd;
+//           }
+//           .step {
+//             margin: 30px 0;
+//             padding: 20px;
+//             background: #fff;
+//             border-left: 4px solid #667eea;
+//             border-radius: 5px;
+//           }
+//           .step h3 {
+//             color: #667eea;
+//             margin-bottom: 15px;
+//           }
+//           .step ol {
+//             margin-left: 20px;
+//             line-height: 1.8;
+//           }
+//           .btn {
+//             display: inline-block;
+//             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+//             color: white;
+//             padding: 15px 40px;
+//             border: none;
+//             border-radius: 10px;
+//             text-decoration: none;
+//             font-weight: bold;
+//             margin: 10px 5px;
+//             cursor: pointer;
+//             transition: transform 0.2s;
+//           }
+//           .btn:hover {
+//             transform: translateY(-2px);
+//             box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+//           }
+//           .btn-secondary {
+//             background: #6c757d;
+//           }
+//           .warning {
+//             background: #fff3cd;
+//             border-left: 4px solid #ffc107;
+//             padding: 15px;
+//             border-radius: 5px;
+//             margin: 20px 0;
+//           }
+//           .copy-btn {
+//             background: #28a745;
+//             color: white;
+//             border: none;
+//             padding: 8px 15px;
+//             border-radius: 5px;
+//             cursor: pointer;
+//             font-size: 12px;
+//             margin-top: 10px;
+//           }
+//           .copy-btn:hover {
+//             background: #218838;
+//           }
+//         </style>
+//       </head>
+//       <body>
+//         <div class="container">
+//           <div class="header">
+//             <h1>✅ WhatsApp Connected!</h1>
+//             <p>Your WhatsApp Business is now integrated</p>
+//           </div>
+          
+//           <div class="content">
+//             <div class="success-badge">
+//               <strong>🎉 Connection Successful</strong>
+//               <p style="margin-top: 5px;">Agent "${agentName}" is connected to WhatsApp number <strong>${displayPhoneNumber}</strong></p>
+//             </div>
+            
+//             <div class="info-box">
+//               <strong>📋 Connection Details:</strong>
+//               <p><strong>Phone:</strong> ${displayPhoneNumber}</p>
+//               <p><strong>Verified Name:</strong> ${verifiedName}</p>
+//               <p><strong>Status:</strong> <span style="color: #28a745;">● Active</span></p>
+//             </div>
+            
+//             <div class="warning">
+//               <strong>⚠️ One Final Step Required</strong>
+//               <p style="margin-top: 10px;">To complete the setup, you must register the webhook in Meta Developer Console. This is a <strong>one-time configuration</strong>.</p>
+//             </div>
+            
+//             <div class="step">
+//               <h3>Step 1: Copy Webhook URL</h3>
+//               <div class="code-box" id="webhook-url" onclick="copyToClipboard('webhook-url')">${webhookUrl}</div>
+//               <button class="copy-btn" onclick="copyToClipboard('webhook-url')">📋 Copy URL</button>
+//             </div>
+            
+//             <div class="step">
+//               <h3>Step 2: Copy Verify Token</h3>
+//               <div class="code-box" id="verify-token" onclick="copyToClipboard('verify-token')">${verifyToken}</div>
+//               <button class="copy-btn" onclick="copyToClipboard('verify-token')">📋 Copy Token</button>
+//             </div>
+            
+//             <div class="step">
+//               <h3>Step 3: Register in Meta Console</h3>
+//               <ol>
+//                 <li>Open <a href="https://developers.facebook.com/apps" target="_blank" style="color: #667eea;">Meta Developer Console</a></li>
+//                 <li>Select your app → <strong>WhatsApp</strong> → <strong>Configuration</strong></li>
+//                 <li>In "Webhook" section, click <strong>Edit</strong></li>
+//                 <li>Paste the <strong>Webhook URL</strong> (from Step 1)</li>
+//                 <li>Paste the <strong>Verify Token</strong> (from Step 2)</li>
+//                 <li>Click <strong>Verify and Save</strong></li>
+//                 <li>Subscribe to the <strong>"messages"</strong> webhook field</li>
+//               </ol>
+//               <a href="https://developers.facebook.com/apps" target="_blank" class="btn">
+//                 🚀 Open Meta Console
+//               </a>
+//             </div>
+            
+//             <div style="text-align: center; margin-top: 40px;">
+//               <a href="/" class="btn">← Back to Dashboard</a>
+//             </div>
+//           </div>
+//         </div>
+        
+//         <script>
+//           function copyToClipboard(elementId) {
+//             const element = document.getElementById(elementId);
+//             const text = element.textContent;
+            
+//             navigator.clipboard.writeText(text).then(() => {
+//               const originalBg = element.style.background;
+//               element.style.background = '#d4edda';
+//               element.textContent = '✅ Copied!';
+              
+//               setTimeout(() => {
+//                 element.style.background = originalBg;
+//                 element.textContent = text;
+//               }, 2000);
+//             }).catch(err => {
+//               alert('Failed to copy. Please select and copy manually.');
+//             });
+//           }
+//         </script>
+//       </body>
+//       </html>
+//     `);
+    
+//   } catch (error) {
+//     // console.error('❌ OAuth callback error:', error.response?.data || error.message);
+//     console.error('OAuth callback error:', {
+//       message: error.message,
+//       response: error.response?.data,
+//       status: error.response?.status,
+//       config: {
+//         url: error.config?.url,
+//         method: error.config?.method
+//       }
+//     });
+//     logRequest('GET', '/api/whatsapp/oauth/callback', 500);
+    
+//     res.status(500).send(`
+//       <!DOCTYPE html>
+//       <html>
+//       <head>
+//         <title>Connection Failed</title>
+//         <meta charset="UTF-8">
+//         <style>
+//           body { 
+//             font-family: Arial; 
+//             text-align: center; 
+//             margin: 50px;
+//             background: #f8f9fa;
+//           }
+//           .error-box {
+//             background: white;
+//             padding: 40px;
+//             border-radius: 10px;
+//             max-width: 600px;
+//             margin: 0 auto;
+//             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+//           }
+//           h1 { color: #dc3545; }
+//           .error-details {
+//             background: #f8d7da;
+//             padding: 15px;
+//             border-radius: 5px;
+//             margin: 20px 0;
+//             text-align: left;
+//           }
+//         </style>
+//       </head>
+//       <body>
+//         <div class="error-box">
+//           <h1>❌ WhatsApp Connection Failed</h1>
+//           <div class="error-details">
+//             <strong>Error:</strong><br>
+//             ${error.message}
+//           </div>
+//           <p>Please try again or contact support if the problem persists.</p>
+//           <a href="/" style="color: #667eea; text-decoration: none; font-weight: bold;">← Back to Dashboard</a>
+//         </div>
+//       </body>
+//       </html>
+//     `);
+//   }
+// });
+
+
+// ✅ FINAL WORKING VERSION - Tested in both Dev and Live modes
+// ✅ FINAL WORKING VERSION - Tested in both Dev and Live modes
 app.get('/api/whatsapp/oauth/callback', async (req, res) => {
   try {
     const { code, state, error: oauth_error, error_description } = req.query;
     
-    // ✅ FIX: Handle OAuth errors from Facebook
+    // Handle OAuth errors
     if (oauth_error) {
       console.error('❌ OAuth error from Facebook:', oauth_error, error_description);
       return res.status(400).send(`
         <!DOCTYPE html>
         <html>
-        <head>
-          <title>Connection Failed</title>
-          <meta charset="UTF-8">
-        </head>
+        <head><title>Connection Failed</title></head>
         <body style="font-family: Arial; text-align: center; margin-top: 50px;">
           <h1>❌ WhatsApp Connection Failed</h1>
           <p><strong>Error:</strong> ${oauth_error}</p>
-          <p>${error_description || 'User cancelled authorization or permission denied'}</p>
-          <a href="/" style="color: #25D366; text-decoration: none;">← Back to Dashboard</a>
+          <p>${error_description || 'User cancelled authorization'}</p>
+          <a href="/" style="color: #25D366;">← Back to Dashboard</a>
         </body>
         </html>
       `);
@@ -4489,7 +5186,7 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
       return res.status(400).send('Invalid OAuth callback: Missing code or state');
     }
     
-    // ✅ FIX: Decode and validate state
+    // Decode state
     let stateData;
     try {
       stateData = JSON.parse(Buffer.from(state, 'base64').toString());
@@ -4498,10 +5195,11 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     }
     
     const { company_id, agent_instance_id } = stateData;
-    
     console.log('📞 Processing OAuth callback for:', { company_id, agent_instance_id });
     
-    // STEP 1: Exchange authorization code for access token
+    // ============================================
+    // STEP 1: Exchange code for access token
+    // ============================================
     const redirectUri = `${process.env.BASE_URL}/api/whatsapp/oauth/callback`;
     
     const tokenResponse = await axios.post(
@@ -4521,7 +5219,9 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     const accessToken = tokenResponse.data.access_token;
     console.log('✅ Access token obtained');
     
-    // ✅ FIX: STEP 2 - Get WABA ID using correct endpoint
+    // ============================================
+    // STEP 2: Get token debug info (contains WABA in scopes)
+    // ============================================
     const debugResponse = await axios.get(
       'https://graph.facebook.com/v21.0/debug_token',
       {
@@ -4533,66 +5233,150 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
       }
     );
     
-    // Extract granted scopes
-    const grantedScopes = debugResponse.data.data.granular_scopes || [];
+    const tokenData = debugResponse.data.data;
+    const grantedScopes = tokenData.granular_scopes || [];
     console.log('✅ Granted scopes:', grantedScopes.map(s => s.scope));
     
-    // ✅ FIX: STEP 3 - Get WhatsApp Business Account ID
-    const businessResponse = await axios.get(
-      'https://graph.facebook.com/v21.0/me/businesses',
-      {
-        params: { access_token: accessToken },
-        timeout: 10000
-      }
-    );
+    // ============================================
+    // STEP 3: Extract WABA ID from granted scopes
+    // 🔥 KEY FIX: This works in both Dev and Live mode
+    // ============================================
+    let wabaId = null;
     
-    if (!businessResponse.data.data || businessResponse.data.data.length === 0) {
-      throw new Error('No business accounts found. Please create a WhatsApp Business Account first.');
+    // Method 1: From granular_scopes.target_ids (most reliable)
+    for (const scope of grantedScopes) {
+      if (scope.scope === 'whatsapp_business_messaging' || 
+          scope.scope === 'whatsapp_business_management') {
+        if (scope.target_ids && scope.target_ids.length > 0) {
+          wabaId = scope.target_ids[0];
+          console.log('✅ WABA ID from scopes:', wabaId);
+          break;
+        }
+      }
     }
     
-    const businessAccountId = businessResponse.data.data[0].id;
-    console.log('✅ Business Account ID:', businessAccountId);
-    
-    // ✅ FIX: STEP 4 - Get WhatsApp Business Account (WABA)
-    const wabaResponse = await axios.get(
-      `https://graph.facebook.com/v21.0/${businessAccountId}/client_whatsapp_business_accounts`,
-      {
-        params: { access_token: accessToken },
-        timeout: 10000
+    // Method 2: Fallback - Try direct WABA query (works in Live mode)
+    if (!wabaId) {
+      console.log('⚠️ WABA not in scopes, trying direct query...');
+      
+      try {
+        const directWabaResponse = await axios.get(
+          'https://graph.facebook.com/v21.0/me',
+          {
+            params: {
+              access_token: accessToken,
+              fields: 'whatsapp_business_account'
+            },
+            timeout: 10000
+          }
+        );
+        
+        if (directWabaResponse.data.whatsapp_business_account) {
+          wabaId = directWabaResponse.data.whatsapp_business_account.id;
+          console.log('✅ WABA ID from direct query:', wabaId);
+        }
+      } catch (err) {
+        console.log('⚠️ Direct WABA query failed:', err.message);
       }
-    );
-    
-    if (!wabaResponse.data.data || wabaResponse.data.data.length === 0) {
-      throw new Error('No WhatsApp Business Accounts found. Please set up WhatsApp in Meta Business Manager first.');
     }
     
-    const wabaId = wabaResponse.data.data[0].id;
-    console.log('✅ WABA ID:', wabaId);
+    // If still no WABA, show helpful error
+    if (!wabaId) {
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Setup Required</title></head>
+        <body style="font-family: Arial; text-align: center; padding: 50px; background: #f8f9fa;">
+          <div style="background: white; padding: 40px; border-radius: 10px; max-width: 700px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h1 style="color: #ff9800;">⚠️ Additional Setup Required</h1>
+            <div style="background: #fff3cd; padding: 20px; border-radius: 5px; margin: 20px 0; text-align: left;">
+              <p><strong>Your app is in Development Mode.</strong></p>
+              <p style="margin-top: 15px;">To complete the setup:</p>
+              <ol style="text-align: left; line-height: 2;">
+                <li><strong>Go to Meta Developer Console</strong></li>
+                <li>Select your app → <strong>WhatsApp</strong> → <strong>API Setup</strong></li>
+                <li><strong>Add a phone number</strong> to your WhatsApp Business Account</li>
+                <li><strong>Add test numbers</strong> in the Test Numbers section</li>
+                <li>Then try connecting again</li>
+              </ol>
+            </div>
+            <div style="background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; text-align: left;">
+              <strong>📚 Need Help?</strong>
+              <p style="margin-top: 10px;">
+                Check Meta's guide: 
+                <a href="https://developers.facebook.com/docs/whatsapp/cloud-api/get-started" target="_blank">
+                  WhatsApp Cloud API Setup
+                </a>
+              </p>
+            </div>
+            <a href="https://developers.facebook.com/apps/${process.env.META_APP_ID}/whatsapp-business/wa-dev-console/" 
+               target="_blank" 
+               style="display: inline-block; background: #25D366; color: white; padding: 15px 30px; border-radius: 8px; text-decoration: none; margin: 20px 10px;">
+              🚀 Open WhatsApp Console
+            </a>
+            <a href="/" 
+               style="display: inline-block; background: #6c757d; color: white; padding: 15px 30px; border-radius: 8px; text-decoration: none; margin: 20px 10px;">
+              ← Back to Dashboard
+            </a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
     
-    // ✅ FIX: STEP 5 - Get phone numbers from WABA
+    // ============================================
+    // STEP 4: Get phone numbers from WABA
+    // ============================================
     const phoneResponse = await axios.get(
       `https://graph.facebook.com/v21.0/${wabaId}/phone_numbers`,
       {
-        params: { access_token: accessToken },
+        params: { 
+          access_token: accessToken,
+          fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status'
+        },
         timeout: 10000
       }
     );
     
+    console.log('✅ Phone Response:', phoneResponse.data);
+    
     if (!phoneResponse.data.data || phoneResponse.data.data.length === 0) {
-      throw new Error('No phone numbers found. Please add a phone number to your WhatsApp Business Account.');
+      throw new Error('No phone numbers found. Please add a phone number to your WhatsApp Business Account in Meta Console.');
     }
     
     const phoneData = phoneResponse.data.data[0];
     const phoneNumberId = phoneData.id;
     const displayPhoneNumber = phoneData.display_phone_number;
-    const verifiedName = phoneData.verified_name;
+    const verifiedName = phoneData.verified_name || 'Business';
     
     console.log('✅ Phone Number:', displayPhoneNumber, 'ID:', phoneNumberId);
     
-    // ✅ FIX: Generate unique verify token
+    // ============================================
+    // STEP 5: Get Business Account ID (optional, for reference)
+    // ============================================
+    let businessAccountId = null;
+    try {
+      const businessResponse = await axios.get(
+        'https://graph.facebook.com/v21.0/me/businesses',
+        {
+          params: { access_token: accessToken },
+          timeout: 10000
+        }
+      );
+      
+      if (businessResponse.data.data && businessResponse.data.data.length > 0) {
+        businessAccountId = businessResponse.data.data[0].id;
+        console.log('✅ Business Account ID:', businessAccountId);
+      }
+    } catch (err) {
+      console.log('⚠️ Could not fetch business account (non-critical):', err.message);
+    }
+    
+    // ============================================
+    // STEP 6: Save to database
+    // ============================================
     const verifyToken = `verify_${Date.now()}_${Math.random().toString(36).substr(2, 12)}`;
     
-    // ✅ FIX: STEP 6 - Save credentials to database with proper JSON structure
     const updateResult = await pool.query(`
       UPDATE agent_instances
       SET 
@@ -4608,10 +5392,13 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
       JSON.stringify({
         access_token: accessToken,
         phone_number_id: phoneNumberId,
-        business_account_id: businessAccountId,
         waba_id: wabaId,
+        business_account_id: businessAccountId,
         verified_name: verifiedName,
-        connected_at: new Date().toISOString()
+        quality_rating: phoneData.quality_rating || 'UNKNOWN',
+        code_verification_status: phoneData.code_verification_status || 'UNKNOWN',
+        connected_at: new Date().toISOString(),
+        scopes: grantedScopes.map(s => s.scope)
       }),
       verifyToken,
       agent_instance_id,
@@ -4625,7 +5412,9 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     console.log('✅ Credentials saved to database');
     logRequest('GET', '/api/whatsapp/oauth/callback', 200);
     
-    // ✅ FIX: STEP 7 - Return beautiful success page with clear instructions
+    // ============================================
+    // STEP 7: Success page with webhook instructions
+    // ============================================
     const webhookUrl = `${process.env.BASE_URL}/api/webhooks/whatsapp-universal`;
     const agentName = updateResult.rows[0].agent_name;
     
@@ -4661,13 +5450,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
             padding: 40px;
             text-align: center;
           }
-          .header h1 {
-            font-size: 2em;
-            margin-bottom: 10px;
-          }
-          .content {
-            padding: 40px;
-          }
+          .header h1 { font-size: 2em; margin-bottom: 10px; }
+          .content { padding: 40px; }
           .success-badge {
             background: #d4edda;
             color: #155724;
@@ -4682,26 +5466,18 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
             border-radius: 10px;
             margin: 20px 0;
           }
-          .info-box strong {
-            color: #495057;
-            display: block;
-            margin-bottom: 10px;
-          }
           .code-box {
             background: #f1f3f5;
             border: 2px dashed #dee2e6;
             padding: 15px;
             border-radius: 8px;
-            font-family: 'Courier New', monospace;
+            font-family: monospace;
             font-size: 13px;
             word-break: break-all;
             cursor: pointer;
             transition: all 0.3s;
           }
-          .code-box:hover {
-            background: #e9ecef;
-            border-color: #adb5bd;
-          }
+          .code-box:hover { background: #e9ecef; }
           .step {
             margin: 30px 0;
             padding: 20px;
@@ -4709,14 +5485,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
             border-left: 4px solid #667eea;
             border-radius: 5px;
           }
-          .step h3 {
-            color: #667eea;
-            margin-bottom: 15px;
-          }
-          .step ol {
-            margin-left: 20px;
-            line-height: 1.8;
-          }
+          .step h3 { color: #667eea; margin-bottom: 15px; }
+          .step ol { margin-left: 20px; line-height: 1.8; }
           .btn {
             display: inline-block;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -4728,21 +5498,6 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
             font-weight: bold;
             margin: 10px 5px;
             cursor: pointer;
-            transition: transform 0.2s;
-          }
-          .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-          }
-          .btn-secondary {
-            background: #6c757d;
-          }
-          .warning {
-            background: #fff3cd;
-            border-left: 4px solid #ffc107;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 20px 0;
           }
           .copy-btn {
             background: #28a745;
@@ -4754,8 +5509,12 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
             font-size: 12px;
             margin-top: 10px;
           }
-          .copy-btn:hover {
-            background: #218838;
+          .warning {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
           }
         </style>
       </head>
@@ -4769,71 +5528,65 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
           <div class="content">
             <div class="success-badge">
               <strong>🎉 Connection Successful</strong>
-              <p style="margin-top: 5px;">Agent "${agentName}" is connected to WhatsApp number <strong>${displayPhoneNumber}</strong></p>
+              <p style="margin-top: 5px;">Agent "${agentName}" is connected to <strong>${displayPhoneNumber}</strong></p>
             </div>
             
             <div class="info-box">
               <strong>📋 Connection Details:</strong>
               <p><strong>Phone:</strong> ${displayPhoneNumber}</p>
-              <p><strong>Verified Name:</strong> ${verifiedName}</p>
+              <p><strong>Name:</strong> ${verifiedName}</p>
+              <p><strong>WABA ID:</strong> ${wabaId}</p>
               <p><strong>Status:</strong> <span style="color: #28a745;">● Active</span></p>
             </div>
             
             <div class="warning">
-              <strong>⚠️ One Final Step Required</strong>
-              <p style="margin-top: 10px;">To complete the setup, you must register the webhook in Meta Developer Console. This is a <strong>one-time configuration</strong>.</p>
+              <strong>⚠️ Final Step: Register Webhook</strong>
+              <p style="margin-top: 10px;">To receive messages, configure the webhook in Meta Console.</p>
             </div>
             
             <div class="step">
               <h3>Step 1: Copy Webhook URL</h3>
-              <div class="code-box" id="webhook-url" onclick="copyToClipboard('webhook-url')">${webhookUrl}</div>
-              <button class="copy-btn" onclick="copyToClipboard('webhook-url')">📋 Copy URL</button>
+              <div class="code-box" id="webhook-url">${webhookUrl}</div>
+              <button class="copy-btn" onclick="copyToClipboard('webhook-url')">📋 Copy</button>
             </div>
             
             <div class="step">
               <h3>Step 2: Copy Verify Token</h3>
-              <div class="code-box" id="verify-token" onclick="copyToClipboard('verify-token')">${verifyToken}</div>
-              <button class="copy-btn" onclick="copyToClipboard('verify-token')">📋 Copy Token</button>
+              <div class="code-box" id="verify-token">${verifyToken}</div>
+              <button class="copy-btn" onclick="copyToClipboard('verify-token')">📋 Copy</button>
             </div>
             
             <div class="step">
-              <h3>Step 3: Register in Meta Console</h3>
+              <h3>Step 3: Configure in Meta</h3>
               <ol>
-                <li>Open <a href="https://developers.facebook.com/apps" target="_blank" style="color: #667eea;">Meta Developer Console</a></li>
-                <li>Select your app → <strong>WhatsApp</strong> → <strong>Configuration</strong></li>
-                <li>In "Webhook" section, click <strong>Edit</strong></li>
-                <li>Paste the <strong>Webhook URL</strong> (from Step 1)</li>
-                <li>Paste the <strong>Verify Token</strong> (from Step 2)</li>
+                <li>Open <a href="https://developers.facebook.com/apps/${process.env.META_APP_ID}/whatsapp-business/wa-settings/" target="_blank" style="color: #667eea;">WhatsApp Settings</a></li>
+                <li>Scroll to <strong>Webhook</strong> section</li>
+                <li>Click <strong>Edit</strong></li>
+                <li>Paste Webhook URL and Verify Token</li>
                 <li>Click <strong>Verify and Save</strong></li>
-                <li>Subscribe to the <strong>"messages"</strong> webhook field</li>
+                <li>Subscribe to <strong>messages</strong> field</li>
               </ol>
-              <a href="https://developers.facebook.com/apps" target="_blank" class="btn">
-                🚀 Open Meta Console
-              </a>
+              <a href="https://developers.facebook.com/apps/${process.env.META_APP_ID}/whatsapp-business/wa-settings/" target="_blank" class="btn">🚀 Open Settings</a>
             </div>
             
             <div style="text-align: center; margin-top: 40px;">
-              <a href="/" class="btn">← Back to Dashboard</a>
+              <a href="/" class="btn">← Dashboard</a>
             </div>
           </div>
         </div>
         
         <script>
-          function copyToClipboard(elementId) {
-            const element = document.getElementById(elementId);
-            const text = element.textContent;
-            
+          function copyToClipboard(id) {
+            const el = document.getElementById(id);
+            const text = el.textContent;
             navigator.clipboard.writeText(text).then(() => {
-              const originalBg = element.style.background;
-              element.style.background = '#d4edda';
-              element.textContent = '✅ Copied!';
-              
+              const bg = el.style.background;
+              el.style.background = '#d4edda';
+              el.textContent = '✅ Copied!';
               setTimeout(() => {
-                element.style.background = originalBg;
-                element.textContent = text;
+                el.style.background = bg;
+                el.textContent = text;
               }, 2000);
-            }).catch(err => {
-              alert('Failed to copy. Please select and copy manually.');
             });
           }
         </script>
@@ -4848,43 +5601,15 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     res.status(500).send(`
       <!DOCTYPE html>
       <html>
-      <head>
-        <title>Connection Failed</title>
-        <meta charset="UTF-8">
-        <style>
-          body { 
-            font-family: Arial; 
-            text-align: center; 
-            margin: 50px;
-            background: #f8f9fa;
-          }
-          .error-box {
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            max-width: 600px;
-            margin: 0 auto;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-          }
-          h1 { color: #dc3545; }
-          .error-details {
-            background: #f8d7da;
-            padding: 15px;
-            border-radius: 5px;
-            margin: 20px 0;
-            text-align: left;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="error-box">
-          <h1>❌ WhatsApp Connection Failed</h1>
-          <div class="error-details">
-            <strong>Error:</strong><br>
-            ${error.message}
+      <head><title>Connection Failed</title></head>
+      <body style="font-family: Arial; text-align: center; margin: 50px; background: #f8f9fa;">
+        <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+          <h1 style="color: #dc3545;">❌ Connection Failed</h1>
+          <div style="background: #f8d7da; padding: 15px; border-radius: 5px; margin: 20px 0; text-align: left;">
+            <strong>Error:</strong><br>${error.message}
           </div>
-          <p>Please try again or contact support if the problem persists.</p>
-          <a href="/" style="color: #667eea; text-decoration: none; font-weight: bold;">← Back to Dashboard</a>
+          <p>Try again or contact support.</p>
+          <a href="/" style="color: #667eea; font-weight: bold; text-decoration: none;">← Back</a>
         </div>
       </body>
       </html>
@@ -5092,9 +5817,154 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
 // WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
 // ============================================
 
+// app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
+//   try {
+//     const { entry } = req.body;
+
+//     // Verify webhook (Meta requires this)
+//     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
+//       const verifyToken = req.query['hub.verify_token'];
+//       const agent = await pool.query(
+//         'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
+//         [verifyToken]
+//       );
+
+//       if (agent.rows.length > 0) {
+//         return res.send(req.query['hub.challenge']);
+//       }
+//       return res.status(403).send('Invalid verify token');
+//     }
+
+//     // Process incoming message
+//     for (const change of entry[0].changes) {
+//       if (change.field !== 'messages') continue;
+
+//       const message = change.value.messages[0];
+//       const fromPhone = message.from;
+//       const toPhone = change.value.metadata.display_phone_number;
+//       const normalizedToPhone = toPhone.startsWith('+') ? toPhone : `+${toPhone}`;
+
+//       // 1️⃣ Identify which client owns this WhatsApp number
+//       const agentResult = await pool.query(`
+//         SELECT 
+//           ai.*, 
+//           ai.whatsapp_credentials,
+//           ac.prompt_preamble,
+//           ac.initial_message,
+//           c.name as company_name
+//         FROM agent_instances ai
+//         LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
+//         LEFT JOIN companies c ON ai.company_id = c.id
+//         WHERE ai.whatsapp_number = $1 
+//           AND ai.agent_type = 'whatsapp' 
+//           AND ai.is_active = TRUE
+//       `, [normalizedToPhone]);
+
+//       if (agentResult.rows.length === 0) {
+//         console.log('⚠️ Unknown WhatsApp number:', toPhone);
+//         return res.sendStatus(404);
+//       }
+
+//       const agentInstance = agentResult.rows[0];
+//       const text = message.text?.body || '';
+
+//       // ============================================
+//       // ✅ NEW SECTION: Store incoming user message
+//       // ============================================
+
+//       try {
+//         // 1. Get or create lead
+//         const phone = '+' + fromPhone;
+//         let leadRes = await pool.query(
+//           'SELECT id FROM leads WHERE phone_number = $1;',
+//           [phone]
+//         );
+
+//         let leadId;
+//         if (leadRes.rows.length === 0) {
+//           const newLead = await pool.query(
+//             `INSERT INTO leads (phone_number, name, lead_source, last_contacted)
+//              VALUES ($1, $2, 'whatsapp', NOW()) RETURNING id;`,
+//             [phone, message.profile?.name || 'Unknown']
+//           );
+//           leadId = newLead.rows[0].id;
+//         } else {
+//           leadId = leadRes.rows[0].id;
+//           await pool.query(`UPDATE leads SET last_contacted = NOW() WHERE id = $1;`, [leadId]);
+//         }
+
+//         // 2. Get or create conversation
+//         let convRes = await pool.query(
+//           'SELECT id FROM conversations WHERE lead_id = $1;',
+//           [leadId]
+//         );
+
+//         let convId;
+//         if (convRes.rows.length === 0) {
+//           const newConv = await pool.query(
+//             `INSERT INTO conversations (lead_id, phone_number, conversation_history)
+//              VALUES ($1, $2, $3) RETURNING id;`,
+//             [leadId, phone, text]
+//             // [leadId, phone]
+//           );
+//           convId = newConv.rows[0].id;
+//         } else {
+//           convId = convRes.rows[0].id;
+//         }
+
+//         // 3. Insert message record
+//         await pool.query(
+//           `INSERT INTO whatsapp_messages 
+//            (conversation_id, lead_id, phone_number, message_type, message_body, sender, message_id, is_from_user)
+//            VALUES ($1, $2, $3, 'text', $4, 'user', $5, TRUE);`,
+//           [convId, leadId, phone, text, message.id || `usr_${Date.now()}`]
+//         );
+//       } catch (err) {
+//         console.error('⚠️ DB insert error for user message:', err);
+//       }
+
+//       // ============================================
+//       // ✅ EXISTING SECTION: Forward to n8n
+//       // ============================================
+//       await axios.post(
+//         process.env.N8N_WHATSAPP_WEBHOOK_URL,
+//         {
+//           message: {
+//             from: fromPhone,
+//             text: { body: text },
+//             type: message.type
+//           },
+//           contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
+//           agent_instance: {
+//             id: agentInstance.id,
+//             company_id: agentInstance.company_id,
+//             phone_number: agentInstance.whatsapp_number,
+//             prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
+//             credentials: agentInstance.whatsapp_credentials
+//           }
+//         }
+//       );
+//     }
+
+//     res.sendStatus(200);
+//   } catch (error) {
+//     console.error('❌ WhatsApp webhook error:', error);
+//     res.sendStatus(500);
+//   }
+// });
+
+
+
+
+// ✅ FIXED: WhatsApp Universal Webhook Handler
 app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
   try {
     const { entry } = req.body;
+
+    // ✅ FIX 2: Add this check
+    if (!entry || entry.length === 0) {
+      return res.sendStatus(200);
+    }
 
     // Verify webhook (Meta requires this)
     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
@@ -5144,7 +6014,7 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       const text = message.text?.body || '';
 
       // ============================================
-      // ✅ NEW SECTION: Store incoming user message
+      // ✅ Store incoming user message in database
       // ============================================
 
       try {
@@ -5179,8 +6049,7 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
           const newConv = await pool.query(
             `INSERT INTO conversations (lead_id, phone_number, conversation_history)
              VALUES ($1, $2, $3) RETURNING id;`,
-            // [leadId, phone, text]
-            [leadId, phone]
+            [leadId, phone, text]
           );
           convId = newConv.rows[0].id;
         } else {
@@ -5199,35 +6068,88 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       }
 
       // ============================================
-      // ✅ EXISTING SECTION: Forward to n8n
+      // ✅ FIXED: Forward to n8n with proper error handling
       // ============================================
-      await axios.post(
-        process.env.N8N_WHATSAPP_WEBHOOK_URL || 'http://n8n:5678/webhook/whatsapp-trigger',
-        {
-          message: {
-            from: fromPhone,
-            text: { body: text },
-            type: message.type
+      
+      // 🔧 FIX 1: Use correct n8n webhook URL (from workflow)
+      const n8nWebhookUrl = process.env.N8N_WHATSAPP_WEBHOOK_URL || 
+                            'https://n8n-render-host-n0ym.onrender.com/webhook/whatsapp-trigger';
+      
+      console.log('🔄 Forwarding to n8n:', n8nWebhookUrl);
+
+      try {
+        const n8nResponse = await axios.post(
+          n8nWebhookUrl,
+          {
+            message: {
+              from: fromPhone,
+              text: { body: text },
+              type: message.type
+            },
+            contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
+            agent_instance: {
+              id: agentInstance.id,
+              company_id: agentInstance.company_id,
+              phone_number: agentInstance.whatsapp_number,
+              prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
+              credentials: agentInstance.whatsapp_credentials
+            }
           },
-          contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
-          agent_instance: {
-            id: agentInstance.id,
-            company_id: agentInstance.company_id,
-            phone_number: agentInstance.whatsapp_number,
-            prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
-            credentials: agentInstance.whatsapp_credentials
+          {
+            timeout: 30000, // 30 second timeout
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+
+        console.log('✅ n8n webhook successful:', n8nResponse.status);
+        
+      } catch (n8nError) {
+        // 🔧 FIX 2: Better error handling - don't crash the webhook
+        console.error('❌ n8n webhook error:', {
+          status: n8nError.response?.status,
+          statusText: n8nError.response?.statusText,
+          data: n8nError.response?.data,
+          message: n8nError.message
+        });
+
+        // 🔧 FIX 3: If n8n fails, send fallback response directly via WhatsApp
+        if (n8nError.response?.status === 404) {
+          console.error('🚨 CRITICAL: n8n webhook not found. Check these:');
+          console.error('1. Is n8n workflow activated?');
+          console.error('2. Is webhook URL correct?', n8nWebhookUrl);
+          console.error('3. Check n8n workflow webhook node settings');
+          
+          // Send fallback message
+          try {
+            await axios.post(
+              'https://noily-deena-ancestrally.ngrok-free.dev/api/whatsapp/send',
+              {
+                to: fromPhone,
+                message: "Hi! We're experiencing technical difficulties. Our team will get back to you shortly. 🙏",
+                agent_instance_id: agentInstance.id
+              }
+            );
+            console.log('✅ Sent fallback message to user');
+          } catch (fallbackError) {
+            console.error('❌ Failed to send fallback message:', fallbackError.message);
           }
         }
-      );
+        
+        // Don't throw - continue processing
+      }
     }
 
+    // ✅ Always return 200 to WhatsApp to prevent retries
     res.sendStatus(200);
+    
   } catch (error) {
     console.error('❌ WhatsApp webhook error:', error);
-    res.sendStatus(500);
+    // ✅ Still return 200 to prevent WhatsApp from retrying
+    res.sendStatus(200);
   }
 });
-
 
 
 
@@ -5239,15 +6161,25 @@ app.get('/api/webhooks/whatsapp-universal', async (req, res) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode && token) {
-    // Look for matching verify token in DB
-    const result = await pool.query(
-      'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
-      [token]
-    );
+  // if (mode && token) {
+  //   // Look for matching verify token in DB
+  //   const result = await pool.query(
+  //     'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
+  //     [token]
+  //   );
 
-    if (result.rows.length > 0) {
-      console.log('✅ Webhook verified successfully!');
+  //   if (result.rows.length > 0) {
+  //     console.log('✅ Webhook verified successfully!');
+  //     return res.status(200).send(challenge);
+  //   } else {
+  //     console.log('❌ Invalid verify token:', token);
+  //     return res.sendStatus(403);
+  //   }
+
+  if (mode && token) {
+    // 🆕 CHANGED: Use hardcoded token instead of database lookup
+    if (token === WEBHOOK_VERIFY_TOKEN) {
+      console.log('✅ Webhook verified successfully with hardcoded token!');
       return res.status(200).send(challenge);
     } else {
       console.log('❌ Invalid verify token:', token);
@@ -6210,310 +7142,1288 @@ app.get('/api/leads/export/csv', async (req, res) => {
 
 
 
-// app.post('/api/webhook/lead-capture', async (req, res) => {
-//   const apiKey = req.header('X-API-Key');
-//   if (apiKey !== process.env.LEAD_WEBHOOK_KEY) {
-//     logRequest('POST', '/api/webhook/lead-capture', 401);
-//     return res.status(401).json({ success: false, error: 'Invalid API key' });
-//   }
+app.post('/api/webhook/lead-capture', async (req, res) => {
+  const apiKey = req.header('X-API-Key');
+  if (apiKey !== process.env.LEAD_WEBHOOK_KEY) {
+    logRequest('POST', '/api/webhook/lead-capture', 401);
+    return res.status(401).json({ success: false, error: 'Invalid API key' });
+  }
 
-//   const client = await pool.connect();
-//   try {
-//     await client.query('BEGIN');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-//     const input = req.body;
+    const input = req.body;
 
-//     // ---- Validate ----
-//     if (!input.phone && !input.phone_number) {
-//       throw new Error('Phone number is required');
-//     }
+    // ---- Validate ----
+    if (!input.phone && !input.phone_number) {
+      throw new Error('Phone number is required');
+    }
 
-//     // ---- Normalize phone ----
-//     let phone = (input.phone || input.phone_number).replace(/\D/g, '');
-//     if (phone.length === 10) phone = `+91${phone}`;
-//     else if (!phone.startsWith('+')) phone = `+${phone}`;
+    // ---- Normalize phone ----
+    let phone = (input.phone || input.phone_number).replace(/\D/g, '');
+    if (phone.length === 10) phone = `+91${phone}`;
+    else if (!phone.startsWith('+')) phone = `+${phone}`;
 
-//     // ---- Source & Tags ----
-//     const source = input.source || input.lead_source || 'unknown';
-//     const newTags = [source];
-//     if (input.campaign) newTags.push(input.campaign.toLowerCase().replace(/\s+/g, '_'));
-//     if (input.utm_campaign) newTags.push(input.utm_campaign);
+    // ---- Source & Tags ----
+    const source = input.source || input.lead_source || 'unknown';
+    const newTags = [source];
+    if (input.campaign) newTags.push(input.campaign.toLowerCase().replace(/\s+/g, '_'));
+    if (input.utm_campaign) newTags.push(input.utm_campaign);
 
-//     // ---- Custom Fields ----
-//     const cf = input.form_fields || {};
-//     const customFields = {
-//       chess_rating: cf.chess_rating || cf.rating || null,
-//       location: cf.location || cf.area || null,
-//       coaching_experience: cf.coaching_experience || null,
-//       availability: cf.availability || null,
-//       age_group_pref: cf.age_group_pref || null
-//     };
+    // ---- Custom Fields ----
+    const cf = input.form_fields || {};
+    const customFields = {
+      chess_rating: cf.chess_rating || cf.rating || null,
+      location: cf.location || cf.area || null,
+      coaching_experience: cf.coaching_experience || null,
+      availability: cf.availability || null,
+      age_group_pref: cf.age_group_pref || null
+    };
 
-//     // ---- Metadata ----
-//     const metadata = {
-//       source_details: {
-//         campaign: input.campaign || input.utm_campaign || null,
-//         ad_id: input.ad_id || null,
-//         form_id: input.form_id || null,
-//         utm_source: input.utm_source || null,
-//         utm_medium: input.utm_medium || null,
-//         utm_content: input.utm_content || null
-//       },
-//       captured_at: new Date().toISOString(),
-//       ip_address: req.ip.includes('::ffff:') ? req.ip.split(':').pop() : req.ip,
-//       user_agent: req.get('User-Agent') || null
-//     };
+    // ---- Metadata ----
+    const metadata = {
+      source_details: {
+        campaign: input.campaign || input.utm_campaign || null,
+        ad_id: input.ad_id || null,
+        form_id: input.form_id || null,
+        utm_source: input.utm_source || null,
+        utm_medium: input.utm_medium || null,
+        utm_content: input.utm_content || null
+      },
+      captured_at: new Date().toISOString(),
+      ip_address: req.ip.includes('::ffff:') ? req.ip.split(':').pop() : req.ip,
+      user_agent: req.get('User-Agent') || null
+    };
 
-//     const payload = {
-//       phone_number: phone,
-//       name: input.name || input.full_name || 'New Lead',
-//       email: input.email || null,
-//       lead_source: source,
-//       company_id: input.company_id || 1,
-//       tags: newTags,
-//       custom_fields: customFields,
-//       metadata
-//     };
+    if (!input.company_id) {
+      throw new Error('company_id is required');
+    }
 
-//     // ---- Check existing lead ----
-//     const { rows: [existing] } = await client.query(
-//       `SELECT id, tags, metadata FROM leads WHERE phone_number = $1 LIMIT 1`,
-//       [phone]
-//     );
+    const payload = {
+      phone_number: phone,
+      name: input.name || input.full_name || 'New Lead',
+      email: input.email || null,
+      lead_source: source,
+      company_id: input.company_id,
+      tags: newTags,
+      custom_fields: customFields,
+      metadata
+    };
 
-//     let lead;
-//     if (existing) {
-//       // ---- Merge tags (dedupe) ----
-//       const existingTags = existing.tags || [];
-//       const mergedTags = Array.from(new Set([...existingTags, ...payload.tags]));
+    // ---- Check existing lead ----
+    const { rows: [existing] } = await client.query(
+      `SELECT id, tags, metadata FROM leads WHERE phone_number = $1 LIMIT 1`,
+      [phone]
+    );
 
-//       // ---- Update lead + custom fields ----
-//       const { rows } = await client.query(
-//         `UPDATE leads
-//          SET 
-//            name = COALESCE($1, name),
-//            email = COALESCE($2, email),
-//            tags = $3,
-//            metadata = metadata || $4::jsonb,
-//            last_contacted = CURRENT_TIMESTAMP,
-//            updated_at = CURRENT_TIMESTAMP,
-//            chess_rating = COALESCE($5, chess_rating),
-//            location = COALESCE($6, location),
-//            coaching_experience = COALESCE($7, coaching_experience),
-//            availability = COALESCE($8, availability),
-//            age_group_pref = COALESCE($9, age_group_pref)
-//          WHERE phone_number = $10
-//          RETURNING *`,
-//         [
-//           payload.name, payload.email,
-//           mergedTags, JSON.stringify(payload.metadata),
-//           customFields.chess_rating, customFields.location,
-//           customFields.coaching_experience, customFields.availability,
-//           customFields.age_group_pref,
-//           phone
-//         ]
-//       );
-//       lead = rows[0];
-//     } else {
-//       // ---- Insert new lead ----
-//       const { rows } = await client.query(
-//         `INSERT INTO leads (
-//           company_id, phone_number, name, email, lead_source,
-//           lead_status, interest_level, tags, metadata,
-//           chess_rating, location, coaching_experience,
-//           availability, age_group_pref
-//         ) VALUES (
-//           $1, $2, $3, $4, $5, 'new', 1, $6, $7, $8, $9, $10, $11, $12
-//         ) RETURNING *`,
-//         [
-//           payload.company_id, phone, payload.name, payload.email, payload.lead_source,
-//           JSON.stringify(payload.tags), JSON.stringify(payload.metadata),
-//           customFields.chess_rating, customFields.location,
-//           customFields.coaching_experience, customFields.availability,
-//           customFields.age_group_pref
-//         ]
-//       );
-//       lead = rows[0];
-//     }
+    let lead;
+    if (existing) {
+      // ---- Merge tags (dedupe) ----
+      const existingTags = existing.tags || [];
+      const mergedTags = Array.from(new Set([...existingTags, ...payload.tags]));
 
-//     // ---- Conversation (upsert) ----
-//     await client.query(
-//       `INSERT INTO conversations (lead_id, phone_number, conversation_history, message_count)
-//        VALUES ($1, $2, '', 0)
-//        ON CONFLICT (lead_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
-//       [lead.id, phone]
-//     );
+      // ---- Update lead + custom fields ----
+      const { rows } = await client.query(
+        `UPDATE leads
+         SET 
+           name = COALESCE($1, name),
+           email = COALESCE($2, email),
+           tags = $3,
+           metadata = metadata || $4::jsonb,
+           last_contacted = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP,
+           chess_rating = COALESCE($5, chess_rating),
+           location = COALESCE($6, location),
+           coaching_experience = COALESCE($7, coaching_experience),
+           availability = COALESCE($8, availability),
+           age_group_pref = COALESCE($9, age_group_pref)
+         WHERE phone_number = $10
+         RETURNING *`,
+        [
+          payload.name, payload.email,
+          mergedTags, JSON.stringify(payload.metadata),
+          customFields.chess_rating, customFields.location,
+          customFields.coaching_experience, customFields.availability,
+          customFields.age_group_pref,
+          phone
+        ]
+      );
+      lead = rows[0];
+    } else {
+      // ---- Insert new lead ----
+      const { rows } = await client.query(
+        `INSERT INTO leads (
+          company_id, phone_number, name, email, lead_source,
+          lead_status, interest_level, tags, metadata,
+          chess_rating, location, coaching_experience,
+          availability, age_group_pref
+        ) VALUES (
+          $1, $2, $3, $4, $5, 'new', 1, $6, $7, $8, $9, $10, $11, $12
+        ) RETURNING *`,
+        [
+          payload.company_id, phone, payload.name, payload.email, payload.lead_source,
+          JSON.stringify(payload.tags), JSON.stringify(payload.metadata),
+          customFields.chess_rating, customFields.location,
+          customFields.coaching_experience, customFields.availability,
+          customFields.age_group_pref
+        ]
+      );
+      lead = rows[0];
+    }
 
-//     // ---- Welcome Notification ----
-//     const welcomeMsg = `Hi ${lead.name.split(' ')[0]}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
-//     await client.query(
-//       `INSERT INTO notifications (
-//         lead_id, phone_number, notification_type, title, message,
-//         delivery_channel, scheduled_time, status
-//       ) VALUES ($1, $2, 'welcome', 'Welcome to 4champz!', $3, 'whatsapp', CURRENT_TIMESTAMP, 'pending')`,
-//       [lead.id, phone, welcomeMsg]
-//     );
+    // ---- Conversation (upsert) ----
+    await client.query(
+      `INSERT INTO conversations (lead_id, phone_number, conversation_history, message_count)
+       VALUES ($1, $2, '', 0)
+       ON CONFLICT (lead_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP`,
+      [lead.id, phone]
+    );
 
-//     // ---- Schedule Call (2h from now) ----
-//     await client.query(
-//       `INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time, status)
-//        VALUES ($1, $2, 'qualification', $3, 'pending')`,
-//       [lead.company_id, lead.id, new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()]
-//     );
+    // ---- Welcome Notification ----
+    // const welcomeMsg = `Hi ${lead.name.split(' ')[0]}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
+    const firstName = (lead.name || "there").trim().split(" ")[0];
+    const welcomeMsg = `Hi ${firstName}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
+    await client.query(
+      `INSERT INTO notifications (
+        lead_id, phone_number, notification_type, title, message,
+        delivery_channel, scheduled_time, status
+      ) VALUES ($1, $2, 'welcome', 'Welcome to 4champz!', $3, 'whatsapp', CURRENT_TIMESTAMP, 'pending')`,
+      [lead.id, phone, welcomeMsg]
+    );
 
-//     // ---- Analytics Event ----
-//     await client.query(
-//       `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties)
-//        VALUES ('lead_captured', $1, $2, $3)`,
-//       [lead.id, lead.company_id, JSON.stringify(payload.metadata)]
-//     );
+    // ---- Schedule Call (2h from now) ----
+    await client.query(
+      `INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time, status)
+       VALUES ($1, $2, 'qualification', $3, 'pending')`,
+      [lead.company_id, lead.id, new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()]
+    );
 
-//     await client.query('COMMIT');
+    // ---- Analytics Event ----
+    await client.query(
+      `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties)
+       VALUES ('lead_captured', $1, $2, $3)`,
+      [lead.id, lead.company_id, JSON.stringify(payload.metadata)]
+    );
 
-//     logRequest('POST', '/api/webhook/lead-capture', 200);
-//     res.json({
-//       success: true,
-//       lead_id: lead.id,
-//       phone_number: lead.phone_number,
-//       message: 'Lead captured successfully'
-//     });
-//   } catch (err) {
-//     await client.query('ROLLBACK');
-//     logRequest('POST', '/api/webhook/lead-capture', 400);
-//     res.status(400).json({ success: false, error: err.message });
-//   } finally {
-//     client.release();
-//   }
-// });
+    await client.query('COMMIT');
 
-
-
-// app.get('/api/lead/:phone', async (req, res) => {
-//   try {
-//     const { rows } = await pool.query(`SELECT * FROM leads WHERE phone_number = $1`, [req.params.phone]);
-//     if (!rows.length) {
-//       logRequest('GET', `/api/lead/${req.params.phone}`, 404);
-//       return res.status(404).json({ success: false, error: 'Lead not found' });
-//     }
-//     logRequest('GET', `/api/lead/${req.params.phone}`, 200);
-//     res.json({ success: true, data: rows[0] });
-//   } catch (e) {
-//     logRequest('GET', `/api/lead/${req.params.phone}`, 500);
-//     handleError(res, e);
-//   }
-// });
+    logRequest('POST', '/api/webhook/lead-capture', 200);
+    res.json({
+      success: true,
+      lead_id: lead.id,
+      phone_number: lead.phone_number,
+      message: 'Lead captured successfully'
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logRequest('POST', '/api/webhook/lead-capture', 400);
+    res.status(400).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 
 
-// app.patch('/api/lead/:phone', async (req, res) => {
-//   const { tags, metadata, ...updates } = req.body;
-//   try {
-//     const { rows: [lead] } = await pool.query(
-//       `SELECT tags FROM leads WHERE phone_number = $1`, [req.params.phone]
-//     );
-//     if (!lead) return res.status(404).json({ success: false, error: 'Lead not found' });
-
-//     const mergedTags = Array.from(new Set([...(lead.tags || []), ...(tags || [])]));
-
-//     const setClauses = [];
-//     const values = [];
-//     let idx = 1;
-
-//     if (updates.name) { setClauses.push(`name = $${idx++}`); values.push(updates.name); }
-//     if (updates.email) { setClauses.push(`email = $${idx++}`); values.push(updates.email); }
-//     if (tags) { setClauses.push(`tags = $${idx++}`); values.push(mergedTags); }
-//     if (metadata) { setClauses.push(`metadata = metadata || $${idx++}`); values.push(JSON.stringify(metadata)); }
-
-//     if (setClauses.length === 0) {
-//       return res.status(400).json({ success: false, error: 'No fields to update' });
-//     }
-
-//     setClauses.push('updated_at = CURRENT_TIMESTAMP');
-//     values.push(req.params.phone);
-
-//     const query = `
-//       UPDATE leads SET ${setClauses.join(', ')}
-//       WHERE phone_number = $${idx}
-//       RETURNING *
-//     `;
-
-//     const { rows } = await pool.query(query, values);
-//     logRequest('PATCH', `/api/lead/${req.params.phone}`, 200);
-//     res.json({ success: true, data: rows[0] });
-//   } catch (e) {
-//     logRequest('PATCH', `/api/lead/${req.params.phone}`, 500);
-//     handleError(res, e);
-//   }
-// });
+app.get('/api/lead/:phone', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM leads WHERE phone_number = $1`, [req.params.phone]);
+    if (!rows.length) {
+      logRequest('GET', `/api/lead/${req.params.phone}`, 404);
+      return res.status(404).json({ success: false, error: 'Lead not found' });
+    }
+    logRequest('GET', `/api/lead/${req.params.phone}`, 200);
+    res.json({ success: true, data: rows[0] });
+  } catch (e) {
+    logRequest('GET', `/api/lead/${req.params.phone}`, 500);
+    handleError(res, e);
+  }
+});
 
 
 
-// app.get('/api/notifications/pending', async (req, res) => {
-//   try {
-//     const { rows } = await pool.query(`
-//       SELECT n.*, l.phone_number AS lead_phone
-//       FROM notifications n
-//       JOIN leads l ON n.lead_id = l.id
-//       WHERE n.status = 'pending' 
-//         AND n.scheduled_time <= NOW()
-//       ORDER BY n.scheduled_time ASC
-//       LIMIT 50
-//     `);
-//     logRequest('GET', '/api/notifications/pending', 200);
-//     res.json({ success: true, count: rows.length, data: rows });
-//   } catch (e) {
-//     logRequest('GET', '/api/notifications/pending', 500);
-//     handleError(res, e);
-//   }
-// });
+app.patch('/api/lead/:phone', async (req, res) => {
+  const { tags, metadata, ...updates } = req.body;
+  try {
+    const { rows: [lead] } = await pool.query(
+      `SELECT tags FROM leads WHERE phone_number = $1`, [req.params.phone]
+    );
+    if (!lead) return res.status(404).json({ success: false, error: 'Lead not found' });
+
+    const mergedTags = Array.from(new Set([...(lead.tags || []), ...(tags || [])]));
+
+    const setClauses = [];
+    const values = [];
+    let idx = 1;
+
+    if (updates.name) { setClauses.push(`name = $${idx++}`); values.push(updates.name); }
+    if (updates.email) { setClauses.push(`email = $${idx++}`); values.push(updates.email); }
+    if (tags) { setClauses.push(`tags = $${idx++}`); values.push(mergedTags); }
+    if (metadata) { setClauses.push(`metadata = metadata || $${idx++}`); values.push(JSON.stringify(metadata)); }
+
+    if (setClauses.length === 0) {
+      return res.status(400).json({ success: false, error: 'No fields to update' });
+    }
+
+    setClauses.push('updated_at = CURRENT_TIMESTAMP');
+    values.push(req.params.phone);
+
+    const query = `
+      UPDATE leads SET ${setClauses.join(', ')}
+      WHERE phone_number = $${idx}
+      RETURNING *
+    `;
+
+    const { rows } = await pool.query(query, values);
+    logRequest('PATCH', `/api/lead/${req.params.phone}`, 200);
+    res.json({ success: true, data: rows[0] });
+  } catch (e) {
+    logRequest('PATCH', `/api/lead/${req.params.phone}`, 500);
+    handleError(res, e);
+  }
+});
 
 
 
-
-// app.get('/api/scheduled-calls/pending', async (req, res) => {
-//   try {
-//     const { rows } = await pool.query(`
-//       SELECT sc.*, l.phone_number, l.name, l.company_id
-//       FROM scheduled_calls sc
-//       JOIN leads l ON sc.lead_id = l.id
-//       WHERE sc.status = 'pending' 
-//         AND sc.scheduled_time <= NOW()
-//       ORDER BY sc.scheduled_time ASC
-//     `);
-//     logRequest('GET', '/api/scheduled-calls/pending', 200);
-//     res.json({ success: true, count: rows.length, data: rows });
-//   } catch (e) {
-//     logRequest('GET', '/api/scheduled-calls/pending', 500);
-//     handleError(res, e);
-//   }
-// });
+app.get('/api/notifications/pending', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT n.*, l.phone_number AS lead_phone
+      FROM notifications n
+      JOIN leads l ON n.lead_id = l.id
+      WHERE n.status = 'pending' 
+        AND n.scheduled_time <= NOW()
+      ORDER BY n.scheduled_time ASC
+      LIMIT 50
+    `);
+    logRequest('GET', '/api/notifications/pending', 200);
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (e) {
+    logRequest('GET', '/api/notifications/pending', 500);
+    handleError(res, e);
+  }
+});
 
 
 
 
-// app.post('/api/analytics/event', async (req, res) => {
-//   const { event_name, lead_id, company_id, event_properties } = req.body;
-//   if (!event_name) {
-//     return res.status(400).json({ success: false, error: 'event_name is required' });
-//   }
-//   try {
-//     await pool.query(
-//       `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties, created_at)
-//        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
-//       [
-//         event_name,
-//         lead_id || null,
-//         company_id || null,
-//         event_properties ? JSON.stringify(event_properties).slice(0, 4000) : null
-//       ]
-//     );
-//     logRequest('POST', '/api/analytics/event', 201);
-//     res.status(201).json({ success: true });
-//   } catch (e) {
-//     logRequest('POST', '/api/analytics/event', 500);
-//     handleError(res, e);
-//   }
-// });
+app.get('/api/scheduled-calls/pending', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT sc.*, l.phone_number, l.name, l.company_id
+      FROM scheduled_calls sc
+      JOIN leads l ON sc.lead_id = l.id
+      WHERE sc.status = 'pending' 
+        AND sc.scheduled_time <= NOW()
+      ORDER BY sc.scheduled_time ASC
+    `);
+    logRequest('GET', '/api/scheduled-calls/pending', 200);
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (e) {
+    logRequest('GET', '/api/scheduled-calls/pending', 500);
+    handleError(res, e);
+  }
+});
+
+
+
+
+app.post('/api/analytics/event', async (req, res) => {
+  const { event_name, lead_id, company_id, event_properties } = req.body;
+  if (!event_name) {
+    return res.status(400).json({ success: false, error: 'event_name is required' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties, created_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+      [
+        event_name,
+        lead_id || null,
+        company_id || null,
+        event_properties ? JSON.stringify(event_properties).slice(0, 4000) : null
+      ]
+    );
+    logRequest('POST', '/api/analytics/event', 201);
+    res.status(201).json({ success: true });
+  } catch (e) {
+    logRequest('POST', '/api/analytics/event', 500);
+    handleError(res, e);
+  }
+});
+
+
+
+// ============================================
+// OAUTH & LEAD INTEGRATION ENDPOINTS
+// ============================================
+
+// 1. START OAUTH FLOW (Meta/Facebook)
+app.get('/api/oauth/meta/start', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id required' });
+    }
+    
+    // Store state for verification
+    const state = Buffer.from(JSON.stringify({
+      company_id,
+      platform: 'meta',
+      timestamp: Date.now(),
+      nonce: Math.random().toString(36).substr(2, 9)
+    })).toString('base64');
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/meta/callback`;
+    
+    const authUrl = 
+      `https://www.facebook.com/v21.0/dialog/oauth?` +
+      `client_id=${process.env.META_APP_ID}&` +
+      `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+      `state=${encodeURIComponent(state)}&` +
+      `scope=ads_read,leads_retrieval,business_management`;
+    
+    res.json({ success: true, auth_url: authUrl });
+  } catch (error) {
+    console.error('Meta OAuth start error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// 2. OAUTH CALLBACK (Meta/Facebook)
+app.get('/api/oauth/meta/callback', async (req, res) => {
+  try {
+    const { code, state, error: oauth_error } = req.query;
+    
+    if (oauth_error) {
+      return res.status(400).send(`OAuth Error: ${oauth_error}`);
+    }
+    
+    const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    const { company_id } = stateData;
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/meta/callback`;
+    
+    // Exchange code for token
+    const tokenResponse = await axios.post(
+      'https://graph.facebook.com/v21.0/oauth/access_token',
+      null,
+      {
+        params: {
+          client_id: process.env.META_APP_ID,
+          client_secret: process.env.META_APP_SECRET,
+          code: code,
+          redirect_uri: redirectUri
+        }
+      }
+    );
+    
+    const accessToken = tokenResponse.data.access_token;
+    
+    // Get Ad Accounts
+    const accountsResponse = await axios.get(
+      'https://graph.facebook.com/v21.0/me/adaccounts',
+      {
+        params: {
+          access_token: accessToken,
+          fields: 'id,name,account_status'
+        }
+      }
+    );
+    
+    const accounts = accountsResponse.data.data;
+    
+    if (accounts.length === 0) {
+      return res.status(400).send('No ad accounts found');
+    }
+    
+    const primaryAccount = accounts[0];
+    
+    // Store credentials
+    await pool.query(`
+      INSERT INTO oauth_credentials (
+        company_id, platform, access_token, account_id, 
+        account_name, token_expires_at, scopes
+      )
+      VALUES ($1, 'meta', $2, $3, $4, NOW() + INTERVAL '60 days', $5)
+      ON CONFLICT (company_id, platform) DO UPDATE
+      SET 
+        access_token = EXCLUDED.access_token,
+        account_id = EXCLUDED.account_id,
+        account_name = EXCLUDED.account_name,
+        token_expires_at = EXCLUDED.token_expires_at,
+        updated_at = CURRENT_TIMESTAMP
+    `, [company_id, accessToken, primaryAccount.id, primaryAccount.name, ['ads_read', 'leads_retrieval']]);
+    
+    // Get Lead Forms
+    const formsResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${primaryAccount.id}/leadgen_forms`,
+      {
+        params: {
+          access_token: accessToken,
+          fields: 'id,name,status,leads_count'
+        }
+      }
+    );
+    
+    const forms = formsResponse.data.data;
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Meta Ads Connected</title>
+        <style>
+          body { font-family: Arial; padding: 50px; background: #f5f5f5; }
+          .container { background: white; padding: 40px; border-radius: 10px; max-width: 800px; margin: 0 auto; }
+          .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+          .form-list { margin: 20px 0; }
+          .form-item { padding: 15px; background: #f8f9fa; margin: 10px 0; border-radius: 5px; }
+          .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="success">✅ Meta Ads Connected Successfully!</div>
+          <p><strong>Account:</strong> ${primaryAccount.name}</p>
+          <p><strong>Account ID:</strong> ${primaryAccount.id}</p>
+          
+          <h3>Lead Forms Found (${forms.length}):</h3>
+          <div class="form-list">
+            ${forms.map(form => `
+              <div class="form-item">
+                <strong>${form.name}</strong><br>
+                Form ID: ${form.id} | Leads: ${form.leads_count || 0}
+              </div>
+            `).join('')}
+          </div>
+          
+          <p style="margin-top: 30px;">
+            <strong>Next Step:</strong> Configure webhooks in your CRM dashboard to start receiving leads.
+          </p>
+          
+          <a href="/dashboard?tab=integrations" class="btn">Go to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('Meta OAuth callback error:', error);
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+
+
+
+
+// 3. START OAUTH FLOW (Google Ads)
+app.get('/api/oauth/google-ads/start', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id required' });
+    }
+    
+    const state = Buffer.from(JSON.stringify({
+      company_id,
+      platform: 'google_ads',
+      timestamp: Date.now()
+    })).toString('base64');
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/google-ads/callback`;
+    
+    const authUrl = 
+      `https://accounts.google.com/o/oauth2/v2/auth?` +
+      `client_id=${process.env.GOOGLE_CLIENT_ID}&` +
+      `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+      `response_type=code&` +
+      `scope=https://www.googleapis.com/auth/adwords&` +
+      `access_type=offline&` +
+      `state=${encodeURIComponent(state)}&` +
+      `prompt=consent`;
+    
+    res.json({ success: true, auth_url: authUrl });
+  } catch (error) {
+    console.error('Google Ads OAuth start error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. OAUTH CALLBACK (Google Ads)
+app.get('/api/oauth/google-ads/callback', async (req, res) => {
+  try {
+    const { code, state, error: oauth_error } = req.query;
+    
+    if (oauth_error) {
+      return res.status(400).send(`OAuth Error: ${oauth_error}`);
+    }
+    
+    const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    const { company_id } = stateData;
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/google-ads/callback`;
+    
+    // Exchange code for token
+    const tokenResponse = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code'
+      }
+    );
+    
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+    // Get Google Ads accounts
+    const accountsResponse = await axios.get(
+      'https://googleads.googleapis.com/v14/customers:listAccessibleCustomers',
+      {
+        headers: {
+          'Authorization': `Bearer ${access_token}`,
+          'developer-token': process.env.GOOGLE_ADS_DEVELOPER_TOKEN
+        }
+      }
+    );
+    
+    const customerIds = accountsResponse.data.resourceNames.map(name => name.split('/')[1]);
+    const primaryCustomer = customerIds[0];
+    
+    // Store credentials
+    await pool.query(`
+      INSERT INTO oauth_credentials (
+        company_id, platform, access_token, refresh_token,
+        account_id, token_expires_at, scopes
+      )
+      VALUES ($1, 'google_ads', $2, $3, $4, NOW() + INTERVAL '${expires_in} seconds', $5)
+      ON CONFLICT (company_id, platform) DO UPDATE
+      SET 
+        access_token = EXCLUDED.access_token,
+        refresh_token = EXCLUDED.refresh_token,
+        account_id = EXCLUDED.account_id,
+        token_expires_at = EXCLUDED.token_expires_at,
+        updated_at = CURRENT_TIMESTAMP
+    `, [company_id, access_token, refresh_token, primaryCustomer, ['adwords']]);
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Ads Connected</title>
+        <style>
+          body { font-family: Arial; padding: 50px; background: #f5f5f5; }
+          .container { background: white; padding: 40px; border-radius: 10px; max-width: 800px; margin: 0 auto; }
+          .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+          .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="success">✅ Google Ads Connected Successfully!</div>
+          <p><strong>Customer ID:</strong> ${primaryCustomer}</p>
+          <p><strong>Accounts Found:</strong> ${customerIds.length}</p>
+          
+          <p style="margin-top: 30px;">
+            <strong>Next Step:</strong> Configure lead form extensions in your CRM dashboard.
+          </p>
+          
+          <a href="/dashboard?tab=integrations" class="btn">Go to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('Google Ads OAuth callback error:', error);
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+
+
+
+
+
+// 5. START OAUTH FLOW (LinkedIn)
+app.get('/api/oauth/linkedin/start', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id required' });
+    }
+    
+    const state = Buffer.from(JSON.stringify({
+      company_id,
+      platform: 'linkedin',
+      timestamp: Date.now()
+    })).toString('base64');
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/linkedin/callback`;
+    
+    const authUrl = 
+      `https://www.linkedin.com/oauth/v2/authorization?` +
+      `response_type=code&` +
+      `client_id=${process.env.LINKEDIN_CLIENT_ID}&` +
+      `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+      `state=${encodeURIComponent(state)}&` +
+      `scope=r_ads,r_ads_leadgen_automation,r_ads_reporting`;
+    
+    res.json({ success: true, auth_url: authUrl });
+  } catch (error) {
+    console.error('LinkedIn OAuth start error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. OAUTH CALLBACK (LinkedIn)
+app.get('/api/oauth/linkedin/callback', async (req, res) => {
+  try {
+    const { code, state, error: oauth_error } = req.query;
+    
+    if (oauth_error) {
+      return res.status(400).send(`OAuth Error: ${oauth_error}`);
+    }
+    
+    const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    const { company_id } = stateData;
+    
+    const redirectUri = `${process.env.BASE_URL}/api/oauth/linkedin/callback`;
+    
+    // Exchange code for token
+    const tokenResponse = await axios.post(
+      'https://www.linkedin.com/oauth/v2/accessToken',
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: redirectUri,
+        client_id: process.env.LINKEDIN_CLIENT_ID,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET
+      }),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      }
+    );
+    
+    const { access_token, expires_in } = tokenResponse.data;
+    
+    // Get Ad Accounts
+    const accountsResponse = await axios.get(
+      'https://api.linkedin.com/v2/adAccountsV2?q=search',
+      {
+        headers: {
+          'Authorization': `Bearer ${access_token}`,
+          'LinkedIn-Version': '202401'
+        }
+      }
+    );
+    
+    const accounts = accountsResponse.data.elements;
+    const primaryAccount = accounts[0];
+    
+    // Store credentials
+    await pool.query(`
+      INSERT INTO oauth_credentials (
+        company_id, platform, access_token, account_id,
+        account_name, token_expires_at, scopes
+      )
+      VALUES ($1, 'linkedin', $2, $3, $4, NOW() + INTERVAL '${expires_in} seconds', $5)
+      ON CONFLICT (company_id, platform) DO UPDATE
+      SET 
+        access_token = EXCLUDED.access_token,
+        account_id = EXCLUDED.account_id,
+        account_name = EXCLUDED.account_name,
+        token_expires_at = EXCLUDED.token_expires_at,
+        updated_at = CURRENT_TIMESTAMP
+    `, [company_id, access_token, primaryAccount.id, primaryAccount.name, ['r_ads', 'r_ads_leadgen_automation']]);
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>LinkedIn Ads Connected</title>
+        <style>
+          body { font-family: Arial; padding: 50px; background: #f5f5f5; }
+          .container { background: white; padding: 40px; border-radius: 10px; max-width: 800px; margin: 0 auto; }
+          .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+          .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="success">✅ LinkedIn Ads Connected Successfully!</div>
+          <p><strong>Account:</strong> ${primaryAccount.name}</p>
+          <p><strong>Account ID:</strong> ${primaryAccount.id}</p>
+          
+          <p style="margin-top: 30px;">
+            <strong>Next Step:</strong> Configure lead gen forms in your CRM dashboard.
+          </p>
+          
+          <a href="/dashboard?tab=integrations" class="btn">Go to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('LinkedIn OAuth callback error:', error);
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+
+
+
+
+
+// 7. GET LEAD FORMS (Meta)
+app.get('/api/lead-sources/meta/forms/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const creds = await pool.query(
+      'SELECT access_token, account_id FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, 'meta']
+    );
+    
+    if (creds.rows.length === 0) {
+      return res.status(404).json({ error: 'Meta credentials not found' });
+    }
+    
+    const { access_token, account_id } = creds.rows[0];
+    
+    const formsResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${account_id}/leadgen_forms`,
+      {
+        params: {
+          access_token: access_token,
+          fields: 'id,name,status,leads_count,questions'
+        }
+      }
+    );
+    
+    res.json({ success: true, forms: formsResponse.data.data });
+  } catch (error) {
+    console.error('Get Meta forms error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// 8. CONFIGURE LEAD SOURCE MAPPING
+app.post('/api/lead-sources/configure', async (req, res) => {
+  try {
+    const {
+      company_id,
+      platform,
+      form_id,
+      form_name,
+      field_mappings
+    } = req.body;
+    
+    if (!company_id || !platform || !form_id || !field_mappings) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Generate unique webhook URL
+    const webhookToken = `webhook_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const webhookUrl = `${process.env.BASE_URL}/api/webhooks/lead-capture/${webhookToken}`;
+    
+    const result = await pool.query(`
+      INSERT INTO lead_source_configs (
+        company_id, platform, form_id, form_name, 
+        field_mappings, webhook_url
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (company_id, platform, form_id) DO UPDATE
+      SET 
+        form_name = EXCLUDED.form_name,
+        field_mappings = EXCLUDED.field_mappings,
+        webhook_url = EXCLUDED.webhook_url,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `, [company_id, platform, form_id, form_name, JSON.stringify(field_mappings), webhookUrl]);
+    
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Configure lead source error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// -------------------------------
+// 9. UNIFIED WEBHOOK FOR ALL PLATFORMS
+// -------------------------------
+app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const { token } = req.params;
+    const rawData = req.body;
+
+    // 1. Get lead source config
+    const configResult = await client.query(
+      `SELECT * FROM lead_source_configs 
+       WHERE webhook_url LIKE $1 AND is_active = TRUE`,
+      [`%${token}%`]
+    );
+
+    if (configResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Invalid webhook token' });
+    }
+
+    const config = configResult.rows[0];
+    const { company_id, platform, field_mappings } = config;
+
+    // 2. Parse platform-specific data
+    let leadData = {};
+
+    if (platform === 'meta') {
+      const entry = rawData.entry?.[0];
+      const value = entry?.changes?.[0]?.value;
+
+      if (value?.field_data) {
+        value.field_data.forEach(field => {
+          const crmField = field_mappings[field.name];
+          if (crmField) leadData[crmField] = field.values[0];
+        });
+      }
+
+    } else if (platform === 'google_ads') {
+      Object.keys(rawData).forEach(key => {
+        const crmField = field_mappings[key];
+        if (crmField) leadData[crmField] = rawData[key];
+      });
+
+    } else if (platform === 'linkedin') {
+      rawData.answers?.forEach(answer => {
+        const crmField = field_mappings[answer.questionId];
+        if (crmField) {
+          leadData[crmField] =
+            answer.answerDetails?.textQuestionAnswer ||
+            answer.answerDetails?.value;
+        }
+      });
+    }
+
+    // 3. Normalize phone
+    let phone = leadData.phone_number || leadData.phone;
+    if (!phone) throw new Error('Phone number is required');
+
+    phone = phone.replace(/\D/g, '');
+    if (phone.length === 10) phone = `+91${phone}`;
+    else if (!phone.startsWith('+')) phone = `+${phone}`;
+
+    // 4. Check if lead exists
+    const existingLead = await client.query(
+      'SELECT id, tags FROM leads WHERE phone_number = $1',
+      [phone]
+    );
+
+    let leadId;
+
+    if (existingLead.rows.length > 0) {
+      // ------------------------------
+      // ✅ Update existing lead
+      // ------------------------------
+      const lead = existingLead.rows[0];
+      const newTags = Array.from(
+        new Set([...(lead.tags || []), platform, config.form_name])
+      );
+
+      const updateResult = await client.query(
+        `
+        UPDATE leads
+        SET 
+          name = COALESCE($1, name),
+          email = COALESCE($2, email),
+          lead_source = $3,
+          tags = $4,
+          lead_source_config_id = $5,
+          metadata = metadata || $6::jsonb,
+          last_contacted = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE phone_number = $7
+        RETURNING id
+        `,
+        [
+          leadData.name,
+          leadData.email,
+          platform,
+          newTags,
+          config.id,
+          JSON.stringify({ [platform]: rawData }),
+          phone
+        ]
+      );
+
+      leadId = updateResult.rows[0].id;
+
+      await client.query(
+        `
+        INSERT INTO lead_import_logs (
+          company_id, platform, lead_id, form_id,
+          raw_data, mapped_data, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'duplicate')
+        `,
+        [
+          company_id,
+          platform,
+          leadId,
+          config.form_id,
+          JSON.stringify(rawData),
+          JSON.stringify(leadData)
+        ]
+      );
+
+    } else {
+      // ------------------------------
+      // ✅ Create new lead
+      // ------------------------------
+      const insertResult = await client.query(
+        `
+        INSERT INTO leads (
+          company_id, phone_number, name, email,
+          lead_source, lead_status, tags, 
+          lead_source_config_id, metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, 'new', $6, $7, $8)
+        RETURNING id
+        `,
+        [
+          company_id,
+          phone,
+          leadData.name || 'New Lead',
+          leadData.email,
+          platform,
+          [platform, config.form_name],
+          config.id,
+          JSON.stringify({ [platform]: rawData })
+        ]
+      );
+
+      leadId = insertResult.rows[0].id;
+
+      // Log import
+      await client.query(
+        `
+        INSERT INTO lead_import_logs (
+          company_id, platform, lead_id, form_id,
+          raw_data, mapped_data, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'success')
+        `,
+        [
+          company_id,
+          platform,
+          leadId,
+          config.form_id,
+          JSON.stringify(rawData),
+          JSON.stringify(leadData)
+        ]
+      );
+
+      // Create conversation
+      await client.query(
+        `
+        INSERT INTO conversations (lead_id, phone_number, conversation_history)
+        VALUES ($1, $2, '')
+        ON CONFLICT (lead_id) DO NOTHING
+        `,
+        [leadId, phone]
+      );
+
+      // Welcome notification
+      await client.query(
+        `
+        INSERT INTO notifications (
+          lead_id, phone_number, notification_type, title, message,
+          delivery_channel, scheduled_time, status
+        )
+        VALUES ($1, $2, 'welcome', 'Welcome!', $3, 'whatsapp',
+        CURRENT_TIMESTAMP, 'pending')
+        `,
+        [
+          leadId,
+          phone,
+          `Hi ${leadData.name || 'there'}! Thanks for your interest. We'll contact you soon.`
+        ]
+      );
+
+      // Follow-up call (2 hours later)
+      await client.query(
+        `
+        INSERT INTO scheduled_calls (
+          company_id, lead_id, call_type, scheduled_time, status
+        )
+        VALUES ($1, $2, 'qualification', $3, 'pending')
+        `,
+        [
+          company_id,
+          leadId,
+          new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
+        ]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, lead_id: leadId });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Lead capture error:', error);
+
+    // Safe fallback logging
+    try {
+      await pool.query(
+        `
+        INSERT INTO lead_import_logs (
+          company_id, platform, form_id, raw_data,
+          status, error_message
+        )
+        VALUES ($1, 'unknown', 'unknown', $2, 'failed', $3)
+        `,
+        [0, JSON.stringify(req.body), error.message]
+      );
+    } catch (e) {
+      console.error('Failed to log error:', e);
+    }
+
+    res.status(500).json({ error: error.message });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+// -------------------------------
+// 10. GET OAUTH STATUS
+// -------------------------------
+app.get('/api/oauth/status/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT platform, account_id, account_name,
+             token_expires_at, is_active,
+             EXTRACT(DAY FROM (token_expires_at - NOW())) AS days_until_expiry
+      FROM oauth_credentials
+      WHERE company_id = $1
+      ORDER BY platform
+      `,
+      [company_id]
+    );
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error('Get OAuth status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// -------------------------------
+// 11. DISCONNECT PLATFORM
+// -------------------------------
+app.delete('/api/oauth/:company_id/:platform', async (req, res) => {
+  try {
+    const { company_id, platform } = req.params;
+
+    await pool.query(
+      'DELETE FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, platform]
+    );
+
+    await pool.query(
+      'UPDATE lead_source_configs SET is_active = FALSE WHERE company_id = $1 AND platform = $2',
+      [company_id, platform]
+    );
+
+    res.json({ success: true, message: `${platform} disconnected` });
+  } catch (error) {
+    console.error('Disconnect platform error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// -------------------------------
+// 12. GET LEAD IMPORT STATS
+// -------------------------------
+app.get('/api/lead-imports/stats/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { start_date, end_date } = req.query;
+
+    let query = `
+      SELECT platform, status, COUNT(*) AS count,
+             DATE(created_at) AS date
+      FROM lead_import_logs
+      WHERE company_id = $1
+    `;
+
+    const params = [company_id];
+
+    if (start_date) {
+      params.push(start_date);
+      query += ` AND created_at >= $${params.length}`;
+    }
+
+    if (end_date) {
+      params.push(end_date);
+      query += ` AND created_at <= $${params.length}`;
+    }
+
+    query += ` GROUP BY platform, status, DATE(created_at)
+               ORDER BY date DESC`;
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, data: result.rows });
+
+  } catch (error) {
+    console.error('Get import stats error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// -------------------------------
+// 13. RETRY FAILED IMPORT
+// -------------------------------
+app.post('/api/lead-imports/retry/:log_id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const { log_id } = req.params;
+
+    // Get failed log entry
+    const logResult = await client.query(
+      'SELECT * FROM lead_import_logs WHERE id = $1 AND status = $2',
+      [log_id, 'failed']
+    );
+
+    if (logResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Failed import not found' });
+    }
+
+    const log = logResult.rows[0];
+
+    // Get source config
+    const configResult = await client.query(
+      `SELECT * FROM lead_source_configs 
+       WHERE company_id = $1 AND platform = $2 AND form_id = $3`,
+      [log.company_id, log.platform, log.form_id]
+    );
+
+    if (configResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Lead source config not found' });
+    }
+
+    const config = configResult.rows[0];
+    const rawData = log.raw_data;
+    const mappedData = log.mapped_data;
+    const phone = mappedData.phone_number || mappedData.phone;
+
+    // Insert/update lead
+    const insertResult = await client.query(
+      `
+      INSERT INTO leads (
+        company_id, phone_number, name, email, lead_source,
+        lead_status, tags, lead_source_config_id, metadata
+      )
+      VALUES ($1, $2, $3, $4, $5, 'new', $6, $7, $8)
+      ON CONFLICT (phone_number) DO UPDATE
+      SET name = COALESCE(EXCLUDED.name, leads.name),
+          updated_at = CURRENT_TIMESTAMP
+      RETURNING id
+      `,
+      [
+        log.company_id,
+        phone,
+        mappedData.name || 'New Lead',
+        mappedData.email,
+        log.platform,
+        [log.platform, config.form_name],
+        config.id,
+        JSON.stringify({ [log.platform]: rawData })
+      ]
+    );
+
+    const leadId = insertResult.rows[0].id;
+
+    // Update log
+    await client.query(
+      'UPDATE lead_import_logs SET status = $1, lead_id = $2 WHERE id = $3',
+      ['success', leadId, log_id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, lead_id: leadId });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Retry import error:', error);
+    res.status(500).json({ error: error.message });
+
+  } finally {
+    client.release();
+  }
+});
+
+
+// -------------------------------
+// 14. GET LEAD SOURCE CONFIGS
+// -------------------------------
+app.get('/api/lead-sources/configs/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT 
+        lsc.*,
+        oc.account_name,
+        oc.is_active AS platform_connected
+      FROM lead_source_configs lsc
+      LEFT JOIN oauth_credentials oc
+        ON lsc.company_id = oc.company_id
+        AND lsc.platform = oc.platform
+      WHERE lsc.company_id = $1
+      ORDER BY lsc.created_at DESC
+      `,
+      [company_id]
+    );
+
+    res.json({ success: true, data: result.rows });
+
+  } catch (error) {
+    console.error('Get lead source configs error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 
 

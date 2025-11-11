@@ -1245,7 +1245,7 @@
 
 
 
-  
+
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -1293,6 +1293,61 @@ CREATE TABLE leads (
   tags TEXT[],
   metadata JSONB DEFAULT '{}'::jsonb
 );
+
+
+-- OAuth Credentials Storage (Per Client/Company)
+DROP TABLE IF EXISTS oauth_credentials CASCADE;
+CREATE TABLE oauth_credentials (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  platform VARCHAR(50) NOT NULL, -- 'meta', 'google_ads', 'linkedin'
+  access_token TEXT NOT NULL,
+  refresh_token TEXT,
+  token_expires_at TIMESTAMP,
+  account_id VARCHAR(255), -- Meta Ad Account ID, Google Ads Customer ID, etc.
+  account_name VARCHAR(255),
+  scopes TEXT[], -- Granted OAuth scopes
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, platform)
+);
+
+
+-- Lead Source Configurations (Field Mappings)
+DROP TABLE IF EXISTS lead_source_configs CASCADE;
+CREATE TABLE lead_source_configs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  platform VARCHAR(50) NOT NULL, -- 'meta', 'google_ads', 'linkedin'
+  form_id VARCHAR(255), -- Meta Form ID, Google Form ID, etc.
+  form_name VARCHAR(255),
+  field_mappings JSONB NOT NULL, -- {"platform_field": "crm_field"}
+  webhook_url TEXT, -- Generated webhook URL for this form
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
+-- Lead Import Logs (Track All Imports)
+DROP TABLE IF EXISTS lead_import_logs CASCADE;
+CREATE TABLE lead_import_logs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  platform VARCHAR(50) NOT NULL,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  form_id VARCHAR(255),
+  raw_data JSONB, -- Original data from platform
+  mapped_data JSONB, -- After field mapping
+  status VARCHAR(50) DEFAULT 'success', -- 'success', 'failed', 'duplicate'
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
 
 -- 3. CONVERSATIONS TABLE
 DROP TABLE IF EXISTS conversations CASCADE;
@@ -1708,6 +1763,12 @@ ALTER TABLE scheduled_calls ADD COLUMN IF NOT EXISTS campaign_id INTEGER REFEREN
 
 
 
+-- Add lead_source_config_id to leads table
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS lead_source_config_id INTEGER REFERENCES lead_source_configs(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_leads_source_config ON leads(lead_source_config_id);
+
+
+
 
 -- ============================================
 -- DYNAMIC CUSTOM FIELDS SYSTEM
@@ -1779,6 +1840,14 @@ CREATE INDEX IF NOT EXISTS idx_leads_language ON leads(preferred_language); -- N
 -- Missing indexes for frequent searches
 CREATE INDEX idx_leads_last_contacted ON leads(last_contacted DESC);
 CREATE INDEX idx_conversations_phone ON conversations(phone_number);
+
+
+
+CREATE INDEX idx_oauth_credentials_company ON oauth_credentials(company_id, platform);
+CREATE INDEX idx_lead_source_configs_company ON lead_source_configs(company_id, platform);
+CREATE INDEX idx_lead_import_logs_company ON lead_import_logs(company_id, created_at DESC);
+CREATE INDEX idx_lead_import_logs_status ON lead_import_logs(status, created_at DESC);
+
 
 -- Conversations indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_lead_id ON conversations(lead_id);
@@ -1899,6 +1968,18 @@ $$ LANGUAGE plpgsql;
 -- Apply triggers to all tables with updated_at
 DROP TRIGGER IF EXISTS update_leads_timestamp ON leads;
 CREATE TRIGGER update_leads_timestamp BEFORE UPDATE ON leads FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- Trigger for oauth_credentials timestamp
+DROP TRIGGER IF EXISTS update_oauth_credentials_timestamp ON oauth_credentials;
+CREATE TRIGGER update_oauth_credentials_timestamp 
+BEFORE UPDATE ON oauth_credentials 
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- Trigger for lead_source_configs timestamp
+DROP TRIGGER IF EXISTS update_lead_source_configs_timestamp ON lead_source_configs;
+CREATE TRIGGER update_lead_source_configs_timestamp 
+BEFORE UPDATE ON lead_source_configs 
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DROP TRIGGER IF EXISTS update_conversations_timestamp ON conversations;
 CREATE TRIGGER update_conversations_timestamp BEFORE UPDATE ON conversations FOR EACH ROW EXECUTE FUNCTION update_timestamp();
