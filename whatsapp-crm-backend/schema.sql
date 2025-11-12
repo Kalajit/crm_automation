@@ -1320,13 +1320,14 @@ CREATE TABLE lead_source_configs (
   id SERIAL PRIMARY KEY,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   platform VARCHAR(50) NOT NULL, -- 'meta', 'google_ads', 'linkedin'
-  form_id VARCHAR(255), -- Meta Form ID, Google Form ID, etc.
+  form_id VARCHAR(255) NOT NULL, -- Meta Form ID, Google Form ID, etc.
   form_name VARCHAR(255),
   field_mappings JSONB NOT NULL, -- {"platform_field": "crm_field"}
   webhook_url TEXT, -- Generated webhook URL for this form
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, platform, form_id) 
 );
 
 
@@ -1362,7 +1363,8 @@ CREATE TABLE conversations (
   sentiment VARCHAR(50),
   ai_summary TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(lead_id) 
 );
 
 -- 4. WHATSAPP MESSAGES TABLE
@@ -1944,6 +1946,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_instances_whatsapp_number ON agent_instance
 
 
 CREATE INDEX IF NOT EXISTS idx_agent_instances_webhook_token ON agent_instances(webhook_verify_token);
+
+
+
+-- Add index for faster lookups
+CREATE INDEX IF NOT EXISTS idx_lead_source_configs_company ON lead_source_configs(company_id, platform);
+CREATE INDEX IF NOT EXISTS idx_lead_source_configs_webhook ON lead_source_configs(webhook_url);
 
 
 

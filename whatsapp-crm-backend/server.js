@@ -13,6 +13,7 @@ const path = require('path');
 const fs = require('fs');
 
 
+
 require('dotenv').config();
 
 const app = express();
@@ -7454,6 +7455,56 @@ app.post('/api/analytics/event', async (req, res) => {
 });
 
 
+// Add this before your OAuth endpoints
+
+async function checkAndRefreshToken(company_id, platform) {
+  const result = await pool.query(
+    'SELECT * FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+    [company_id, platform]
+  );
+  
+  if (result.rows.length === 0) {
+    throw new Error(`No OAuth credentials for ${platform}`);
+  }
+  
+  const creds = result.rows[0];
+  const now = new Date();
+  const expiresAt = new Date(creds.token_expires_at);
+  
+  // If token expires in less than 7 days, refresh it
+  if (expiresAt - now < 7 * 24 * 60 * 60 * 1000) {
+    console.log(`Token expiring soon for ${platform}, refreshing...`);
+    
+    if (platform === 'google_ads' && creds.refresh_token) {
+      const tokenResponse = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        {
+          refresh_token: creds.refresh_token,
+          client_id: process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          grant_type: 'refresh_token'
+        }
+      );
+      
+      const { access_token, expires_in } = tokenResponse.data;
+      
+      await pool.query(`
+        UPDATE oauth_credentials
+        SET 
+          access_token = $1,
+          token_expires_at = NOW() + INTERVAL '${expires_in} seconds',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE company_id = $2 AND platform = $3
+      `, [access_token, company_id, platform]);
+      
+      return access_token;
+    }
+  }
+  
+  return creds.access_token;
+}
+
+
 
 // ============================================
 // OAUTH & LEAD INTEGRATION ENDPOINTS
@@ -7976,6 +8027,8 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
     const { token } = req.params;
     const rawData = req.body;
 
+    console.log('📥 Webhook received:', { token, platform: 'detecting...', rawData });
+
     // 1. Get lead source config
     const configResult = await client.query(
       `SELECT * FROM lead_source_configs 
@@ -7985,11 +8038,15 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
 
     if (configResult.rows.length === 0) {
       await client.query('ROLLBACK');
+      console.error('❌ Invalid webhook token:', token);
       return res.status(404).json({ error: 'Invalid webhook token' });
     }
 
     const config = configResult.rows[0];
     const { company_id, platform, field_mappings } = config;
+
+    console.log('✅ Config found:', { company_id, platform, form_id: config.form_id });
+    console.log('🗺️ Field mappings:', field_mappings);
 
     // 2. Parse platform-specific data
     let leadData = {};
@@ -8001,15 +8058,33 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
       if (value?.field_data) {
         value.field_data.forEach(field => {
           const crmField = field_mappings[field.name];
-          if (crmField) leadData[crmField] = field.values[0];
+          if (crmField) {
+            leadData[crmField] = field.values[0];
+            console.log(`📌 Mapped: ${field.name} → ${crmField} = ${field.values[0]}`);
+          }
         });
       }
 
     } else if (platform === 'google_ads') {
+      // ✅ FIX: Map all fields from rawData
       Object.keys(rawData).forEach(key => {
         const crmField = field_mappings[key];
-        if (crmField) leadData[crmField] = rawData[key];
+        if (crmField) {
+          leadData[crmField] = rawData[key];
+          console.log(`📌 Mapped: ${key} → ${crmField} = ${rawData[key]}`);
+        }
       });
+      // ✅ FIX: Also check direct fields if mapping fails
+      if (!leadData.phone_number && !leadData.phone) {
+        if (rawData.phone_number) leadData.phone_number = rawData.phone_number;
+        if (rawData.phone) leadData.phone_number = rawData.phone;
+      }
+      if (!leadData.name && rawData.full_name) {
+        leadData.name = rawData.full_name;
+      }
+      if (!leadData.email && rawData.email) {
+        leadData.email = rawData.email;
+      }
 
     } else if (platform === 'linkedin') {
       rawData.answers?.forEach(answer => {
@@ -8018,17 +8093,35 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
           leadData[crmField] =
             answer.answerDetails?.textQuestionAnswer ||
             answer.answerDetails?.value;
+          console.log(`📌 Mapped: ${answer.questionId} → ${crmField} = ${leadData[crmField]}`);
         }
       });
+
+      // ✅ FIX: Also check direct fields if mapping fails
+      if (!leadData.phone_number && !leadData.phone) {
+        rawData.answers?.forEach(answer => {
+          if (answer.questionId.toLowerCase().includes('phone')) {
+            leadData.phone_number = answer.answerDetails?.textQuestionAnswer || answer.answerDetails?.value;
+          }
+        });
+      }
     }
+
+    console.log('📊 Mapped lead data:', leadData);
+
 
     // 3. Normalize phone
     let phone = leadData.phone_number || leadData.phone;
-    if (!phone) throw new Error('Phone number is required');
+    if (!phone) {
+      console.error('❌ Phone number missing in mapped data:', leadData);
+      throw new Error('Phone number is required. Please check field mappings.');
+    }
 
     phone = phone.replace(/\D/g, '');
     if (phone.length === 10) phone = `+91${phone}`;
     else if (!phone.startsWith('+')) phone = `+${phone}`;
+
+    console.log('📞 Normalized phone:', phone);
 
     // 4. Check if lead exists
     const existingLead = await client.query(
@@ -8042,6 +8135,7 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
       // ------------------------------
       // ✅ Update existing lead
       // ------------------------------
+      console.log('🔄 Updating existing lead:', existingLead.rows[0].id);
       const lead = existingLead.rows[0];
       const newTags = Array.from(
         new Set([...(lead.tags || []), platform, config.form_name])
@@ -8091,11 +8185,13 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
           JSON.stringify(leadData)
         ]
       );
+      console.log('✅ Lead updated:', leadId);
 
     } else {
       // ------------------------------
       // ✅ Create new lead
       // ------------------------------
+      console.log('➕ Creating new lead');
       const insertResult = await client.query(
         `
         INSERT INTO leads (
@@ -8119,6 +8215,7 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
       );
 
       leadId = insertResult.rows[0].id;
+      console.log('✅ Lead created:', leadId);
 
       // Log import
       await client.query(
@@ -8138,15 +8235,24 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
         ]
       );
 
-      // Create conversation
-      await client.query(
-        `
-        INSERT INTO conversations (lead_id, phone_number, conversation_history)
-        VALUES ($1, $2, '')
-        ON CONFLICT (lead_id) DO NOTHING
-        `,
-        [leadId, phone]
-      );
+      // ✅ FIX: Create conversation (removed ON CONFLICT - will be handled by UNIQUE constraint)
+      try {
+        await client.query(
+          `
+          INSERT INTO conversations (lead_id, phone_number, conversation_history)
+          VALUES ($1, $2, '')
+          `,
+          [leadId, phone]
+        );
+        console.log('✅ Conversation created');
+      } catch (convError) {
+        // If conversation already exists (shouldn't happen for new lead), log but continue
+        if (convError.code === '23505') { // Unique violation
+          console.log('ℹ️ Conversation already exists');
+        } else {
+          throw convError;
+        }
+      }
 
       // Welcome notification
       await client.query(
@@ -8165,6 +8271,8 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
         ]
       );
 
+      console.log('✅ Welcome notification queued');
+
       // Follow-up call (2 hours later)
       await client.query(
         `
@@ -8179,10 +8287,17 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
           new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
         ]
       );
+      console.log('✅ Follow-up call scheduled');
     }
 
     await client.query('COMMIT');
-    res.json({ success: true, lead_id: leadId });
+    console.log('🎉 Webhook processed successfully:', { lead_id: leadId, phone });
+    res.json({ 
+      success: true, 
+      lead_id: leadId,
+      phone_number: phone,
+      status: existingLead.rows.length > 0 ? 'updated' : 'created'
+    });
 
   } catch (error) {
     await client.query('ROLLBACK');
@@ -8200,6 +8315,7 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
         `,
         [0, JSON.stringify(req.body), error.message]
       );
+      console.log('📝 Error logged to lead_import_logs');
     } catch (e) {
       console.error('Failed to log error:', e);
     }
@@ -8421,6 +8537,355 @@ app.get('/api/lead-sources/configs/:company_id', async (req, res) => {
 
   } catch (error) {
     console.error('Get lead source configs error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// ============================================
+// LEAD WORKFLOW ENDPOINTS (For n8n)
+// ============================================
+
+// 1. CHECK IF LEAD EXISTS
+app.post('/api/workflow/check-lead', async (req, res) => {
+  try {
+    const { phone_number } = req.body;
+    
+    if (!phone_number) {
+      return res.status(400).json({ error: 'phone_number required' });
+    }
+    
+    const result = await pool.query(
+      'SELECT id, tags, metadata FROM leads WHERE phone_number = $1 LIMIT 1',
+      [phone_number]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ 
+        success: true, 
+        exists: false,
+        lead: null 
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      exists: true,
+      lead: result.rows[0] 
+    });
+  } catch (error) {
+    console.error('Check lead error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. CREATE NEW LEAD
+app.post('/api/workflow/create-lead', async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const {
+      company_id,
+      phone_number,
+      name,
+      email,
+      platform,
+      form_id,
+      tags,
+      raw_data,
+      mapped_data
+    } = req.body;
+    
+    if (!company_id || !phone_number || !platform) {
+      throw new Error('company_id, phone_number, and platform are required');
+    }
+    
+    // Insert lead
+    const leadResult = await client.query(`
+      INSERT INTO leads (
+        company_id, phone_number, name, email, lead_source,
+        lead_status, tags, metadata
+      )
+      VALUES ($1, $2, $3, $4, $5, 'new', $6, $7)
+      RETURNING *
+    `, [
+      company_id,
+      phone_number,
+      name || 'New Lead',
+      email,
+      platform,
+      tags || [platform],
+      JSON.stringify({ [platform]: raw_data })
+    ]);
+    
+    const leadId = leadResult.rows[0].id;
+    
+    // Create conversation
+    await client.query(`
+      INSERT INTO conversations (lead_id, phone_number, conversation_history)
+      VALUES ($1, $2, '')
+      ON CONFLICT (lead_id) DO NOTHING
+    `, [leadId, phone_number]);
+    
+    // Log import
+    await client.query(`
+      INSERT INTO lead_import_logs (
+        company_id, platform, lead_id, form_id,
+        raw_data, mapped_data, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'success')
+    `, [
+      company_id,
+      platform,
+      leadId,
+      form_id,
+      JSON.stringify(raw_data),
+      JSON.stringify(mapped_data)
+    ]);
+    
+    await client.query('COMMIT');
+    
+    res.json({ 
+      success: true, 
+      lead: leadResult.rows[0] 
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Create lead error:', error);
+    
+    // Log failed import
+    try {
+      await pool.query(`
+        INSERT INTO lead_import_logs (
+          company_id, platform, form_id, raw_data, status, error_message
+        )
+        VALUES ($1, $2, $3, $4, 'failed', $5)
+      `, [
+        req.body.company_id || 0,
+        req.body.platform || 'unknown',
+        req.body.form_id || 'unknown',
+        JSON.stringify(req.body.raw_data),
+        error.message
+      ]);
+    } catch (logError) {
+      console.error('Failed to log error:', logError);
+    }
+    
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 3. UPDATE EXISTING LEAD
+app.post('/api/workflow/update-lead', async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const {
+      phone_number,
+      name,
+      email,
+      platform,
+      form_id,
+      tags,
+      raw_data,
+      mapped_data,
+      company_id
+    } = req.body;
+    
+    if (!phone_number || !platform) {
+      throw new Error('phone_number and platform are required');
+    }
+    
+    // Get existing lead
+    const existingResult = await client.query(
+      'SELECT id, tags FROM leads WHERE phone_number = $1',
+      [phone_number]
+    );
+    
+    if (existingResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    const existingLead = existingResult.rows[0];
+    const mergedTags = Array.from(new Set([
+      ...(existingLead.tags || []),
+      ...(tags || [platform])
+    ]));
+    
+    // Update lead
+    const updateResult = await client.query(`
+      UPDATE leads
+      SET 
+        name = COALESCE($1, name),
+        email = COALESCE($2, email),
+        lead_source = $3,
+        tags = $4,
+        metadata = metadata || $5::jsonb,
+        last_contacted = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE phone_number = $6
+      RETURNING *
+    `, [
+      name,
+      email,
+      platform,
+      mergedTags,
+      JSON.stringify({ [platform]: raw_data }),
+      phone_number
+    ]);
+    
+    // Log import as duplicate
+    await client.query(`
+      INSERT INTO lead_import_logs (
+        company_id, platform, lead_id, form_id,
+        raw_data, mapped_data, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'duplicate')
+    `, [
+      company_id,
+      platform,
+      existingLead.id,
+      form_id,
+      JSON.stringify(raw_data),
+      JSON.stringify(mapped_data)
+    ]);
+    
+    await client.query('COMMIT');
+    
+    res.json({ 
+      success: true, 
+      lead: updateResult.rows[0] 
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Update lead error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 4. SEND WELCOME NOTIFICATION
+app.post('/api/workflow/send-welcome', async (req, res) => {
+  try {
+    const { lead_id, phone_number, name } = req.body;
+    
+    if (!lead_id || !phone_number) {
+      return res.status(400).json({ error: 'lead_id and phone_number required' });
+    }
+    
+    const firstName = (name || 'there').trim().split(' ')[0];
+    const message = `Hi ${firstName}! Thanks for your interest. We'll contact you within 24 hours.`;
+    
+    await pool.query(`
+      INSERT INTO notifications (
+        lead_id, phone_number, notification_type, title, message,
+        delivery_channel, scheduled_time, status
+      )
+      VALUES ($1, $2, 'welcome', 'Welcome!', $3, 'whatsapp', CURRENT_TIMESTAMP, 'pending')
+    `, [lead_id, phone_number, message]);
+    
+    res.json({ success: true, message: 'Welcome notification queued' });
+  } catch (error) {
+    console.error('Send welcome error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 5. SCHEDULE FOLLOW-UP CALL
+app.post('/api/workflow/schedule-call', async (req, res) => {
+  try {
+    const { company_id, lead_id, hours_delay } = req.body;
+    
+    if (!company_id || !lead_id) {
+      return res.status(400).json({ error: 'company_id and lead_id required' });
+    }
+    
+    const delay = hours_delay || 2;
+    const scheduledTime = new Date(Date.now() + delay * 60 * 60 * 1000);
+    
+    await pool.query(`
+      INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time, status)
+      VALUES ($1, $2, 'qualification', $3, 'pending')
+    `, [company_id, lead_id, scheduledTime.toISOString()]);
+    
+    res.json({ 
+      success: true, 
+      scheduled_time: scheduledTime.toISOString(),
+      message: 'Follow-up call scheduled' 
+    });
+  } catch (error) {
+    console.error('Schedule call error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. LOG IMPORT SUCCESS/FAILURE
+app.post('/api/workflow/log-import', async (req, res) => {
+  try {
+    const {
+      company_id,
+      platform,
+      lead_id,
+      form_id,
+      raw_data,
+      mapped_data,
+      status,
+      error_message
+    } = req.body;
+    
+    await pool.query(`
+      INSERT INTO lead_import_logs (
+        company_id, platform, lead_id, form_id,
+        raw_data, mapped_data, status, error_message
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `, [
+      company_id || 0,
+      platform || 'unknown',
+      lead_id,
+      form_id,
+      JSON.stringify(raw_data),
+      JSON.stringify(mapped_data),
+      status || 'success',
+      error_message
+    ]);
+    
+    res.json({ success: true, message: 'Import logged' });
+  } catch (error) {
+    console.error('Log import error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 7. GET LEAD SOURCE CONFIG BY TOKEN (Helper)
+app.get('/api/lead-sources/config-by-token/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    
+    const result = await pool.query(`
+      SELECT * FROM lead_source_configs 
+      WHERE webhook_url LIKE $1 AND is_active = TRUE
+      LIMIT 1
+    `, [`%${token}%`]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Config not found' });
+    }
+    
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error('Get config by token error:', error);
     res.status(500).json({ error: error.message });
   }
 });
