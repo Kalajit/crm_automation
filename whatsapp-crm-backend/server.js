@@ -7455,53 +7455,65 @@ app.post('/api/analytics/event', async (req, res) => {
 });
 
 
-// Add this before your OAuth endpoints
-
+// Add this helper function BEFORE your webhook endpoint
 async function checkAndRefreshToken(company_id, platform) {
-  const result = await pool.query(
-    'SELECT * FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
-    [company_id, platform]
-  );
-  
-  if (result.rows.length === 0) {
-    throw new Error(`No OAuth credentials for ${platform}`);
-  }
-  
-  const creds = result.rows[0];
-  const now = new Date();
-  const expiresAt = new Date(creds.token_expires_at);
-  
-  // If token expires in less than 7 days, refresh it
-  if (expiresAt - now < 7 * 24 * 60 * 60 * 1000) {
-    console.log(`Token expiring soon for ${platform}, refreshing...`);
+  try {
+    const result = await pool.query(
+      'SELECT * FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, platform]
+    );
     
-    if (platform === 'google_ads' && creds.refresh_token) {
-      const tokenResponse = await axios.post(
-        'https://oauth2.googleapis.com/token',
-        {
-          refresh_token: creds.refresh_token,
-          client_id: process.env.GOOGLE_CLIENT_ID,
-          client_secret: process.env.GOOGLE_CLIENT_SECRET,
-          grant_type: 'refresh_token'
-        }
-      );
-      
-      const { access_token, expires_in } = tokenResponse.data;
-      
-      await pool.query(`
-        UPDATE oauth_credentials
-        SET 
-          access_token = $1,
-          token_expires_at = NOW() + INTERVAL '${expires_in} seconds',
-          updated_at = CURRENT_TIMESTAMP
-        WHERE company_id = $2 AND platform = $3
-      `, [access_token, company_id, platform]);
-      
-      return access_token;
+    if (result.rows.length === 0) {
+      throw new Error(`No OAuth credentials for ${platform}`);
     }
+    
+    const creds = result.rows[0];
+    const now = new Date();
+    const expiresAt = new Date(creds.token_expires_at);
+    
+    // If token expires in less than 7 days, refresh it
+    if (expiresAt - now < 7 * 24 * 60 * 60 * 1000) {
+      console.log(`⚠️ Token expiring soon for ${platform}, refreshing...`);
+      
+      if (platform === 'google_ads' && creds.refresh_token) {
+        const tokenResponse = await axios.post(
+          'https://oauth2.googleapis.com/token',
+          {
+            refresh_token: creds.refresh_token,
+            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            grant_type: 'refresh_token'
+          }
+        );
+        
+        const { access_token, expires_in } = tokenResponse.data;
+        
+        await pool.query(`
+          UPDATE oauth_credentials
+          SET 
+            access_token = $1,
+            token_expires_at = NOW() + INTERVAL '${expires_in} seconds',
+            updated_at = CURRENT_TIMESTAMP
+          WHERE company_id = $2 AND platform = $3
+        `, [access_token, company_id, platform]);
+        
+        console.log(`✅ Token refreshed for ${platform}`);
+        return access_token;
+      }
+      
+      // For Meta and LinkedIn, tokens are long-lived (60 days)
+      // They don't support programmatic refresh, user needs to re-authorize
+      if (platform === 'meta' || platform === 'linkedin') {
+        console.warn(`⚠️ ${platform} token expiring soon. User needs to re-authorize.`);
+      }
+    }
+    
+    return creds.access_token;
+  } catch (error) {
+    console.error(`❌ Token check/refresh failed for ${platform}:`, error.message);
+    // Return null to indicate failure, but don't break the webhook
+    return null;
   }
-  
-  return creds.access_token;
 }
 
 
@@ -8047,6 +8059,19 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
 
     console.log('✅ Config found:', { company_id, platform, form_id: config.form_id });
     console.log('🗺️ Field mappings:', field_mappings);
+
+    // ✅ NEW: Check and refresh OAuth token if needed (non-blocking)
+    try {
+      const refreshedToken = await checkAndRefreshToken(company_id, platform);
+      if (refreshedToken) {
+        console.log(`🔄 Using refreshed token for ${platform}`);
+      } else {
+        console.warn(`⚠️ Token refresh failed for ${platform}, proceeding with existing token`);
+      }
+    } catch (tokenError) {
+      // Log but don't fail the webhook - leads should still be captured
+      console.warn(`⚠️ Token check error for ${platform}:`, tokenError.message);
+    }
 
     // 2. Parse platform-specific data
     let leadData = {};
@@ -8887,6 +8912,509 @@ app.get('/api/lead-sources/config-by-token/:token', async (req, res) => {
   } catch (error) {
     console.error('Get config by token error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+
+
+// ============================================
+// SALES PERFORMANCE DASHBOARD API
+// Add these endpoints to your server.js
+// ============================================
+
+// 1. PIPELINE OVERVIEW
+// ============================================
+
+app.get('/api/dashboard/pipeline', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    const params = [company_id];
+    let dateFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND l.created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Pipeline by stage
+    const pipelineQuery = `
+      SELECT 
+        l.lead_status,
+        COUNT(*) as count,
+        COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () as percentage
+      FROM leads l
+      WHERE l.company_id = $1 ${dateFilter}
+      GROUP BY l.lead_status
+      ORDER BY 
+        CASE l.lead_status
+          WHEN 'new' THEN 1
+          WHEN 'contacted' THEN 2
+          WHEN 'qualified' THEN 3
+          WHEN 'demo_scheduled' THEN 4
+          WHEN 'proposal_sent' THEN 5
+          WHEN 'negotiation' THEN 6
+          WHEN 'closed_won' THEN 7
+          WHEN 'closed_lost' THEN 8
+          ELSE 9
+        END
+    `;
+    
+    const pipeline = await pool.query(pipelineQuery, params);
+    
+    // Conversion rates
+    const conversionQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE lead_status = 'new') as new_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'contacted') as contacted,
+        COUNT(*) FILTER (WHERE lead_status = 'qualified') as qualified,
+        COUNT(*) FILTER (WHERE lead_status IN ('demo_scheduled', 'proposal_sent')) as in_negotiation,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as closed_won,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_lost') as closed_lost
+      FROM leads l
+      WHERE l.company_id = $1 ${dateFilter}
+    `;
+    
+    const conversion = await pool.query(conversionQuery, params);
+    const stats = conversion.rows[0];
+    
+    // Calculate conversion rates
+    const conversionRates = {
+      new_to_contacted: stats.new_leads > 0 ? ((stats.contacted / stats.new_leads) * 100).toFixed(1) : 0,
+      contacted_to_qualified: stats.contacted > 0 ? ((stats.qualified / stats.contacted) * 100).toFixed(1) : 0,
+      qualified_to_negotiation: stats.qualified > 0 ? ((stats.in_negotiation / stats.qualified) * 100).toFixed(1) : 0,
+      negotiation_to_won: stats.in_negotiation > 0 ? ((stats.closed_won / stats.in_negotiation) * 100).toFixed(1) : 0,
+      overall_win_rate: (stats.closed_won + stats.closed_lost) > 0 ? ((stats.closed_won / (stats.closed_won + stats.closed_lost)) * 100).toFixed(1) : 0
+    };
+    
+    logRequest('GET', '/api/dashboard/pipeline', 200);
+    res.json({
+      success: true,
+      data: {
+        pipeline: pipeline.rows,
+        stats: stats,
+        conversion_rates: conversionRates
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/pipeline', 500);
+    handleError(res, error);
+  }
+});
+
+// 2. SALES PERFORMANCE METRICS
+// ============================================
+
+app.get('/api/dashboard/sales-performance', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date, agent_id } = req.query;
+    
+    const params = [company_id];
+    let dateFilter = '';
+    let agentFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    if (agent_id) {
+      agentFilter = ` AND assigned_to_agent = $${params.length + 1}`;
+      params.push(agent_id);
+    }
+    
+    // Overall sales metrics
+    const metricsQuery = `
+      SELECT 
+        COUNT(*) as total_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as won_deals,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_lost') as lost_deals,
+        AVG(interest_level) as avg_interest_level,
+        COUNT(DISTINCT DATE(created_at)) as days_active
+      FROM leads
+      WHERE company_id = $1 ${dateFilter} ${agentFilter}
+    `;
+    
+    const metrics = await pool.query(metricsQuery, params);
+    
+    // Call performance
+    const callQuery = `
+      SELECT 
+        COUNT(*) as total_calls,
+        COUNT(*) FILTER (WHERE call_status = 'completed') as completed_calls,
+        COUNT(*) FILTER (WHERE call_status = 'failed') as failed_calls,
+        AVG(call_duration) as avg_duration,
+        COUNT(*) FILTER (WHERE sentiment->>'sentiment' = 'positive') as positive_calls,
+        COUNT(*) FILTER (WHERE sentiment->>'sentiment' = 'negative') as negative_calls
+      FROM call_logs
+      WHERE company_id = $1 ${dateFilter}
+    `;
+    
+    const callPerf = await pool.query(callQuery, params.slice(0, dateFilter ? 3 : 1));
+    
+    // Message performance
+    const msgQuery = `
+      SELECT 
+        COUNT(*) as total_messages,
+        COUNT(DISTINCT lead_id) as unique_leads_messaged,
+        AVG(CASE WHEN is_from_user THEN 1 ELSE 0 END) as user_message_ratio
+      FROM whatsapp_messages wm
+      JOIN leads l ON wm.lead_id = l.id
+      WHERE l.company_id = $1 ${dateFilter}
+    `;
+    
+    const msgPerf = await pool.query(msgQuery, params.slice(0, dateFilter ? 3 : 1));
+    
+    // Response time analysis
+    const responseQuery = `
+      WITH response_times AS (
+        SELECT 
+          lead_id,
+          timestamp,
+          LAG(timestamp) OVER (PARTITION BY lead_id ORDER BY timestamp) as prev_timestamp,
+          is_from_user
+        FROM whatsapp_messages
+        WHERE lead_id IN (SELECT id FROM leads WHERE company_id = $1)
+      )
+      SELECT 
+        AVG(EXTRACT(EPOCH FROM (timestamp - prev_timestamp))) as avg_response_time_seconds
+      FROM response_times
+      WHERE is_from_user = FALSE AND prev_timestamp IS NOT NULL
+    `;
+    
+    const responseTime = await pool.query(responseQuery, [company_id]);
+    
+    logRequest('GET', '/api/dashboard/sales-performance', 200);
+    res.json({
+      success: true,
+      data: {
+        sales_metrics: metrics.rows[0],
+        call_performance: callPerf.rows[0],
+        message_performance: msgPerf.rows[0],
+        avg_response_time_minutes: responseTime.rows[0].avg_response_time_seconds 
+          ? (responseTime.rows[0].avg_response_time_seconds / 60).toFixed(1) 
+          : 0
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/sales-performance', 500);
+    handleError(res, error);
+  }
+});
+
+// 3. LEAD SOURCE ANALYSIS
+// ============================================
+
+app.get('/api/dashboard/lead-sources', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    const params = [company_id];
+    let dateFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Source breakdown
+    const sourceQuery = `
+      SELECT 
+        lead_source,
+        COUNT(*) as total_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as converted_leads,
+        AVG(interest_level) as avg_interest,
+        (COUNT(*) FILTER (WHERE lead_status = 'closed_won')::float / 
+         NULLIF(COUNT(*), 0) * 100) as conversion_rate
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY lead_source
+      ORDER BY total_leads DESC
+    `;
+    
+    const sources = await pool.query(sourceQuery, params);
+    
+    // Platform-specific breakdown
+    const platformQuery = `
+      SELECT 
+        lsc.platform,
+        lsc.form_name,
+        COUNT(l.id) as total_leads,
+        COUNT(*) FILTER (WHERE l.lead_status = 'closed_won') as converted_leads,
+        lil.status as import_status,
+        COUNT(lil.id) as imports_count
+      FROM lead_source_configs lsc
+      LEFT JOIN leads l ON l.lead_source_config_id = lsc.id
+      LEFT JOIN lead_import_logs lil ON lil.form_id = lsc.form_id
+      WHERE lsc.company_id = $1 AND lsc.is_active = TRUE ${dateFilter}
+      GROUP BY lsc.platform, lsc.form_name, lil.status
+      ORDER BY total_leads DESC
+    `;
+    
+    const platforms = await pool.query(platformQuery, params);
+    
+    logRequest('GET', '/api/dashboard/lead-sources', 200);
+    res.json({
+      success: true,
+      data: {
+        sources: sources.rows,
+        platforms: platforms.rows
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/lead-sources', 500);
+    handleError(res, error);
+  }
+});
+
+// 4. AGENT PERFORMANCE LEADERBOARD
+// ============================================
+
+app.get('/api/dashboard/agent-leaderboard', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    const params = [company_id];
+    let dateFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND l.created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    const leaderboardQuery = `
+      SELECT 
+        l.assigned_to_agent as agent_name,
+        COUNT(*) as total_leads,
+        COUNT(*) FILTER (WHERE l.lead_status = 'closed_won') as won_deals,
+        COUNT(*) FILTER (WHERE l.lead_status = 'closed_lost') as lost_deals,
+        AVG(l.interest_level) as avg_interest,
+        (COUNT(*) FILTER (WHERE l.lead_status = 'closed_won')::float / 
+         NULLIF(COUNT(*), 0) * 100) as win_rate,
+        COUNT(cl.id) as total_calls,
+        AVG(cl.call_duration) as avg_call_duration,
+        COUNT(wm.id) as total_messages
+      FROM leads l
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN whatsapp_messages wm ON l.id = wm.lead_id AND wm.is_from_user = FALSE
+      WHERE l.company_id = $1 
+        AND l.assigned_to_agent IS NOT NULL
+        ${dateFilter}
+      GROUP BY l.assigned_to_agent
+      ORDER BY won_deals DESC, win_rate DESC
+      LIMIT 20
+    `;
+    
+    const leaderboard = await pool.query(leaderboardQuery, params);
+    
+    logRequest('GET', '/api/dashboard/agent-leaderboard', 200);
+    res.json({
+      success: true,
+      data: leaderboard.rows
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/agent-leaderboard', 500);
+    handleError(res, error);
+  }
+});
+
+// 5. TIME-SERIES ANALYTICS
+// ============================================
+
+app.get('/api/dashboard/trends', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date, interval } = req.query;
+    
+    // interval can be 'day', 'week', 'month'
+    const groupBy = interval === 'week' ? 'week' : interval === 'month' ? 'month' : 'day';
+    
+    const params = [company_id];
+    let dateFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Lead trends
+    const leadTrendsQuery = `
+      SELECT 
+        DATE_TRUNC('${groupBy}', created_at) as period,
+        COUNT(*) as new_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as won_deals,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_lost') as lost_deals,
+        AVG(interest_level) as avg_interest
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY DATE_TRUNC('${groupBy}', created_at)
+      ORDER BY period ASC
+    `;
+    
+    const leadTrends = await pool.query(leadTrendsQuery, params);
+    
+    // Call trends
+    const callTrendsQuery = `
+      SELECT 
+        DATE_TRUNC('${groupBy}', created_at) as period,
+        COUNT(*) as total_calls,
+        COUNT(*) FILTER (WHERE call_status = 'completed') as completed_calls,
+        AVG(call_duration) as avg_duration
+      FROM call_logs
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY DATE_TRUNC('${groupBy}', created_at)
+      ORDER BY period ASC
+    `;
+    
+    const callTrends = await pool.query(callTrendsQuery, params);
+    
+    logRequest('GET', '/api/dashboard/trends', 200);
+    res.json({
+      success: true,
+      data: {
+        lead_trends: leadTrends.rows,
+        call_trends: callTrends.rows
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/trends', 500);
+    handleError(res, error);
+  }
+});
+
+// 6. REVENUE ANALYTICS
+// ============================================
+
+app.get('/api/dashboard/revenue', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    const params = [company_id];
+    let dateFilter = '';
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Revenue breakdown
+    const revenueQuery = `
+      SELECT 
+        SUM(amount) FILTER (WHERE status = 'paid') as total_revenue,
+        SUM(amount) FILTER (WHERE status = 'pending') as pending_revenue,
+        SUM(amount) FILTER (WHERE status = 'overdue') as overdue_revenue,
+        COUNT(*) FILTER (WHERE status = 'paid') as paid_invoices,
+        COUNT(*) FILTER (WHERE status = 'pending') as pending_invoices,
+        AVG(amount) as avg_invoice_value,
+        SUM(amount) FILTER (WHERE invoice_type = 'subscription') as recurring_revenue,
+        SUM(amount) FILTER (WHERE invoice_type = 'one_time') as one_time_revenue
+      FROM invoices
+      WHERE lead_id IN (SELECT id FROM leads WHERE company_id = $1)
+      ${dateFilter}
+    `;
+    
+    const revenue = await pool.query(revenueQuery, params);
+    
+    // Monthly recurring revenue trend
+    const mrrQuery = `
+      SELECT 
+        DATE_TRUNC('month', created_at) as month,
+        SUM(amount) FILTER (WHERE invoice_type = 'subscription' AND status = 'paid') as mrr
+      FROM invoices
+      WHERE lead_id IN (SELECT id FROM leads WHERE company_id = $1)
+      GROUP BY DATE_TRUNC('month', created_at)
+      ORDER BY month DESC
+      LIMIT 12
+    `;
+    
+    const mrr = await pool.query(mrrQuery, [company_id]);
+    
+    logRequest('GET', '/api/dashboard/revenue', 200);
+    res.json({
+      success: true,
+      data: {
+        revenue_summary: revenue.rows[0],
+        mrr_trend: mrr.rows
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/revenue', 500);
+    handleError(res, error);
+  }
+});
+
+// 7. REAL-TIME DASHBOARD OVERVIEW
+// ============================================
+
+app.get('/api/dashboard/overview', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    // Today's snapshot
+    const todayQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE DATE(created_at) = CURRENT_DATE) as leads_today,
+        COUNT(*) FILTER (WHERE DATE(created_at) = CURRENT_DATE AND lead_status = 'closed_won') as won_today,
+        COUNT(*) FILTER (WHERE DATE(last_contacted) = CURRENT_DATE) as contacts_today
+      FROM leads
+      WHERE company_id = $1
+    `;
+    
+    const today = await pool.query(todayQuery, [company_id]);
+    
+    // Active engagement
+    const engagementQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE DATE(cl.created_at) = CURRENT_DATE) as calls_today,
+        COUNT(*) FILTER (WHERE DATE(wm.timestamp) = CURRENT_DATE) as messages_today,
+        COUNT(DISTINCT l.id) FILTER (WHERE DATE(l.last_contacted) >= CURRENT_DATE - 7) as active_leads_7d
+      FROM leads l
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN whatsapp_messages wm ON l.id = wm.lead_id
+      WHERE l.company_id = $1
+    `;
+    
+    const engagement = await pool.query(engagementQuery, [company_id]);
+    
+    // Pending actions
+    const pendingQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE status = 'pending' AND scheduled_time <= NOW()) as overdue_calls,
+        COUNT(*) FILTER (WHERE status = 'pending' AND scheduled_date <= NOW()) as overdue_bookings,
+        COUNT(*) FILTER (WHERE status = 'pending' AND due_date <= NOW()) as overdue_invoices
+      FROM (
+        SELECT status, scheduled_time, NULL::timestamp as scheduled_date, NULL::timestamp as due_date FROM scheduled_calls WHERE company_id = $1
+        UNION ALL
+        SELECT status, NULL, scheduled_date, NULL FROM bookings WHERE lead_id IN (SELECT id FROM leads WHERE company_id = $1)
+        UNION ALL
+        SELECT status, NULL, NULL, due_date FROM invoices WHERE lead_id IN (SELECT id FROM leads WHERE company_id = $1)
+      ) pending_items
+    `;
+    
+    const pending = await pool.query(pendingQuery, [company_id]);
+    
+    logRequest('GET', '/api/dashboard/overview', 200);
+    res.json({
+      success: true,
+      data: {
+        today_snapshot: today.rows[0],
+        engagement: engagement.rows[0],
+        pending_actions: pending.rows[0],
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', '/api/dashboard/overview', 500);
+    handleError(res, error);
   }
 });
 
