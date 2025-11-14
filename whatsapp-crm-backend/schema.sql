@@ -20,7 +20,7 @@ DROP TABLE IF EXISTS leads CASCADE;
 CREATE TABLE leads (
   id SERIAL PRIMARY KEY,
   company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
-  phone_number VARCHAR(20) UNIQUE NOT NULL,
+  phone_number VARCHAR(20) UNIQUE,
   name VARCHAR(255),
   email VARCHAR(255),
   lead_source VARCHAR(100) DEFAULT 'whatsapp',

@@ -9493,7 +9493,7 @@ app.post('/api/email-config', async (req, res) => {
     // Encrypt credentials before storing (using crypto)
     const crypto = require('crypto');
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || 'your-32-character-secret-key!!', 'utf8');
+    const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
     const iv = crypto.randomBytes(16);
     
     const encryptPassword = (password) => {
@@ -10033,7 +10033,7 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
     // Encrypt tokens before storing
     const crypto = require('crypto');
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || 'your-32-character-secret-key!!', 'utf8');
+    const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
     const iv = crypto.randomBytes(16);
     
     const encryptToken = (token) => {
@@ -10051,7 +10051,7 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
         oauth_access_token, oauth_refresh_token,
         oauth_token_expires_at, scan_folders, is_active
       )
-      VALUES ($1, $2, 'gmail', $3, $4, NOW() + INTERVAL '${expires_in} seconds', ARRAY['INBOX'], TRUE)
+      VALUES ($1, $2, 'gmail', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['INBOX'], TRUE)
       ON CONFLICT (company_id, email_address) DO UPDATE
       SET 
         oauth_access_token = EXCLUDED.oauth_access_token,
@@ -10188,7 +10188,7 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
     // Encrypt and save
     const crypto = require('crypto');
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || 'your-32-character-secret-key!!', 'utf8');
+    const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
     const iv = crypto.randomBytes(16);
     
     const encryptToken = (token) => {
@@ -10205,7 +10205,7 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
         oauth_access_token, oauth_refresh_token,
         oauth_token_expires_at, scan_folders, is_active
       )
-      VALUES ($1, $2, 'outlook', $3, $4, NOW() + INTERVAL '${expires_in} seconds', ARRAY['Inbox'], TRUE)
+      VALUES ($1, $2, 'outlook', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['Inbox'], TRUE)
       ON CONFLICT (company_id, email_address) DO UPDATE
       SET 
         oauth_access_token = EXCLUDED.oauth_access_token,
@@ -10243,6 +10243,36 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
 // 3. GET EMAIL SCANNING STATUS (Per Company)
 // ============================================
 
+// app.get('/api/email/status/:company_id', async (req, res) => {
+//   try {
+//     const { company_id } = req.params;
+    
+//     const result = await pool.query(`
+//       SELECT 
+//         id, email_address, provider, is_active,
+//         last_scan_at, total_scanned, leads_extracted,
+//         oauth_token_expires_at,
+//         EXTRACT(DAY FROM (oauth_token_expires_at - NOW())) as days_until_expiry
+//       FROM email_configs
+//       WHERE company_id = $1
+//       ORDER BY created_at DESC
+//     `, [company_id]);
+    
+//     res.json({
+//       success: true,
+//       data: result.rows.map(row => ({
+//         ...row,
+//         needs_reauth: row.days_until_expiry < 7
+//       }))
+//     });
+    
+//   } catch (error) {
+//     console.error('Get email status error:', error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
+
+
 app.get('/api/email/status/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -10252,23 +10282,33 @@ app.get('/api/email/status/:company_id', async (req, res) => {
         id, email_address, provider, is_active,
         last_scan_at, total_scanned, leads_extracted,
         oauth_token_expires_at,
-        EXTRACT(DAY FROM (oauth_token_expires_at - NOW())) as days_until_expiry
+        CASE 
+          WHEN oauth_token_expires_at IS NULL THEN NULL
+          WHEN oauth_token_expires_at < NOW() THEN 0
+          ELSE GREATEST(0, EXTRACT(DAY FROM (oauth_token_expires_at - NOW()))::INTEGER)
+        END as days_until_expiry,
+        oauth_token_expires_at < NOW() as token_expired
       FROM email_configs
       WHERE company_id = $1
       ORDER BY created_at DESC
     `, [company_id]);
     
+    logRequest('GET', `/api/email/status/${company_id}`, 200);
     res.json({
       success: true,
       data: result.rows.map(row => ({
         ...row,
-        needs_reauth: row.days_until_expiry < 7
+        needs_reauth: row.token_expired || (row.days_until_expiry !== null && row.days_until_expiry < 7)
       }))
     });
     
   } catch (error) {
     console.error('Get email status error:', error);
-    res.status(500).json({ error: error.message });
+    logRequest('GET', `/api/email/status/${company_id}`, 500);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
   }
 });
 
@@ -10302,6 +10342,82 @@ app.delete('/api/email/disconnect/:email_config_id', async (req, res) => {
 // 5. SCAN EMAILS FOR SPECIFIC COMPANY (Called by n8n or cron)
 // ============================================
 
+// app.post('/api/email/scan/:company_id', async (req, res) => {
+//   try {
+//     const { company_id } = req.params;
+    
+//     // Get active email configs for this company
+//     const configs = await pool.query(`
+//       SELECT * FROM email_configs
+//       WHERE company_id = $1 AND is_active = TRUE
+//     `, [company_id]);
+    
+//     if (configs.rows.length === 0) {
+//       return res.json({
+//         success: true,
+//         message: 'No active email configs found'
+//       });
+//     }
+    
+//     const results = [];
+    
+//     for (const config of configs.rows) {
+//       try {
+//         // Decrypt tokens
+//         const accessToken = decryptToken(config.oauth_access_token);
+        
+//         // Fetch unread emails based on provider
+//         let emails = [];
+        
+//         if (config.provider === 'gmail') {
+//           emails = await fetchGmailEmails(accessToken, config);
+//         } else if (config.provider === 'outlook') {
+//           emails = await fetchOutlookEmails(accessToken, config);
+//         }
+        
+//         // Process each email
+//         for (const email of emails) {
+//           try {
+//             const processed = await processEmailForLead({
+//               email_config_id: config.id,
+//               company_id: config.company_id,
+//               email_from: email.from,
+//               email_subject: email.subject,
+//               email_body: email.body,
+//               email_date: email.date,
+//               message_id: email.id
+//             });
+            
+//             results.push(processed);
+//           } catch (emailError) {
+//             console.error('Email processing error:', emailError);
+//           }
+//         }
+        
+//         // Update last scan time
+//         await pool.query(
+//           'UPDATE email_configs SET last_scan_at = NOW() WHERE id = $1',
+//           [config.id]
+//         );
+        
+//       } catch (configError) {
+//         console.error('Config processing error:', configError);
+//       }
+//     }
+    
+//     res.json({
+//       success: true,
+//       scanned: results.length,
+//       results: results
+//     });
+    
+//   } catch (error) {
+//     console.error('Email scan error:', error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
+
+
 app.post('/api/email/scan/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -10315,16 +10431,21 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
     if (configs.rows.length === 0) {
       return res.json({
         success: true,
-        message: 'No active email configs found'
+        message: 'No active email configs found',
+        scanned: 0,
+        results: []
       });
     }
     
     const results = [];
+    const errors = [];
     
     for (const config of configs.rows) {
       try {
-        // Decrypt tokens
-        const accessToken = decryptToken(config.oauth_access_token);
+        console.log(`Scanning emails for ${config.email_address}...`);
+        
+        // Get valid access token (auto-refreshes if needed)
+        const accessToken = await getValidAccessToken(config);
         
         // Fetch unread emails based on provider
         let emails = [];
@@ -10334,6 +10455,8 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
         } else if (config.provider === 'outlook') {
           emails = await fetchOutlookEmails(accessToken, config);
         }
+        
+        console.log(`Found ${emails.length} unread emails for ${config.email_address}`);
         
         // Process each email
         for (const email of emails) {
@@ -10348,9 +10471,15 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
               message_id: email.id
             });
             
-            results.push(processed);
+            if (!processed.skipped) {
+              results.push(processed);
+            }
           } catch (emailError) {
-            console.error('Email processing error:', emailError);
+            console.error(`Email processing error for ${email.id}:`, emailError.message);
+            errors.push({
+              email_id: email.id,
+              error: emailError.message
+            });
           }
         }
         
@@ -10361,116 +10490,374 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
         );
         
       } catch (configError) {
-        console.error('Config processing error:', configError);
+        console.error(`Config processing error for ${config.email_address}:`, configError.message);
+        errors.push({
+          email_address: config.email_address,
+          error: configError.message
+        });
       }
     }
     
+    logRequest('POST', `/api/email/scan/${company_id}`, 200);
     res.json({
       success: true,
       scanned: results.length,
-      results: results
+      results: results,
+      errors: errors.length > 0 ? errors : undefined
     });
     
   } catch (error) {
     console.error('Email scan error:', error);
-    res.status(500).json({ error: error.message });
+    logRequest('POST', `/api/email/scan/${company_id}`, 500);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
   }
 });
 
 
 
 // Helper: Decrypt token
+// function decryptToken(encryptedToken) {
+//   if (!encryptedToken) return null;
+  
+//   const crypto = require('crypto');
+//   const algorithm = 'aes-256-cbc';
+//   const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
+  
+//   const parts = encryptedToken.split(':');
+//   const iv = Buffer.from(parts[0], 'hex');
+//   const encrypted = parts[1];
+  
+//   const decipher = crypto.createDecipheriv(algorithm, key, iv);
+//   let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+//   decrypted += decipher.final('utf8');
+  
+//   return decrypted;
+// }
+
+
+// AT THE TOP (after requires)
+const crypto = require('crypto');
+const algorithm = 'aes-256-cbc';
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+
+if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length !== 32) {
+  throw new Error('ENCRYPTION_KEY must be 32 bytes (32 chars)');
+}
+const KEY = Buffer.from(ENCRYPTION_KEY, 'utf8');
+
+// FIXED IV — generated once at startup
+const FIXED_IV = crypto.randomBytes(16); // 16 bytes for AES
+
+function encryptToken(token) {
+  if (!token) return null;
+  const cipher = crypto.createCipheriv(algorithm, KEY, FIXED_IV);
+  let encrypted = cipher.update(token, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return FIXED_IV.toString('hex') + ':' + encrypted;
+}
+
 function decryptToken(encryptedToken) {
   if (!encryptedToken) return null;
-  
-  const crypto = require('crypto');
-  const algorithm = 'aes-256-cbc';
-  const key = Buffer.from(process.env.ENCRYPTION_KEY || 'your-32-character-secret-key!!', 'utf8');
-  
   const parts = encryptedToken.split(':');
-  const iv = Buffer.from(parts[0], 'hex');
-  const encrypted = parts[1];
-  
-  const decipher = crypto.createDecipheriv(algorithm, key, iv);
-  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  
-  return decrypted;
+  if (parts.length !== 2) return null;
+  const [ivHex, encrypted] = parts;
+  const iv = Buffer.from(ivHex, 'hex');
+  try {
+    const decipher = crypto.createDecipheriv(algorithm, KEY, iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (err) {
+    console.error('Decryption failed:', err.message);
+    return null;
+  }
 }
 
 // Helper: Fetch Gmail emails
+// async function fetchGmailEmails(accessToken, config) {
+//   const response = await axios.get(
+//     'https://gmail.googleapis.com/gmail/v1/users/me/messages',
+//     {
+//       params: {
+//         q: 'is:unread in:inbox',
+//         maxResults: 10
+//       },
+//       headers: { 'Authorization': `Bearer ${accessToken}` }
+//     }
+//   );
+  
+//   const emails = [];
+  
+//   for (const message of response.data.messages || []) {
+//     const details = await axios.get(
+//       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${message.id}`,
+//       {
+//         headers: { 'Authorization': `Bearer ${accessToken}` }
+//       }
+//     );
+    
+//     const headers = details.data.payload.headers;
+//     const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value;
+    
+//     // Decode body
+//     let body = '';
+//     if (details.data.payload.parts) {
+//       const textPart = details.data.payload.parts.find(p => p.mimeType === 'text/plain');
+//       if (textPart?.body?.data) {
+//         body = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+//       }
+//     } else if (details.data.payload.body?.data) {
+//       body = Buffer.from(details.data.payload.body.data, 'base64').toString('utf-8');
+//     }
+    
+//     emails.push({
+//       id: message.id,
+//       from: getHeader('From'),
+//       subject: getHeader('Subject'),
+//       date: getHeader('Date'),
+//       body: body
+//     });
+//   }
+  
+//   return emails;
+// }
+
+
+
 async function fetchGmailEmails(accessToken, config) {
-  const response = await axios.get(
-    'https://gmail.googleapis.com/gmail/v1/users/me/messages',
-    {
-      params: {
-        q: 'is:unread in:inbox',
-        maxResults: 10
-      },
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    }
-  );
-  
-  const emails = [];
-  
-  for (const message of response.data.messages || []) {
-    const details = await axios.get(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${message.id}`,
+  try {
+    const response = await axios.get(
+      'https://gmail.googleapis.com/gmail/v1/users/me/messages',
       {
-        headers: { 'Authorization': `Bearer ${accessToken}` }
+        params: {
+          q: 'is:unread in:inbox',
+          maxResults: 10
+        },
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+        timeout: 30000 // 30 second timeout
       }
     );
     
-    const headers = details.data.payload.headers;
-    const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value;
-    
-    // Decode body
-    let body = '';
-    if (details.data.payload.parts) {
-      const textPart = details.data.payload.parts.find(p => p.mimeType === 'text/plain');
-      if (textPart?.body?.data) {
-        body = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
-      }
-    } else if (details.data.payload.body?.data) {
-      body = Buffer.from(details.data.payload.body.data, 'base64').toString('utf-8');
+    if (!response.data.messages || response.data.messages.length === 0) {
+      return [];
     }
     
-    emails.push({
-      id: message.id,
-      from: getHeader('From'),
-      subject: getHeader('Subject'),
-      date: getHeader('Date'),
-      body: body
-    });
+    const emails = [];
+    
+    for (const message of response.data.messages) {
+      try {
+        const details = await axios.get(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${message.id}`,
+          {
+            headers: { 'Authorization': `Bearer ${accessToken}` },
+            timeout: 30000
+          }
+        );
+        
+        const headers = details.data.payload.headers;
+        const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value;
+        
+        // Decode body
+        let body = '';
+        if (details.data.payload.parts) {
+          const textPart = details.data.payload.parts.find(p => p.mimeType === 'text/plain');
+          if (textPart?.body?.data) {
+            body = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
+          }
+        } else if (details.data.payload.body?.data) {
+          body = Buffer.from(details.data.payload.body.data, 'base64').toString('utf-8');
+        }
+        
+        emails.push({
+          id: message.id,
+          from: getHeader('From') || 'Unknown',
+          subject: getHeader('Subject') || 'No Subject',
+          date: getHeader('Date') || new Date().toISOString(),
+          body: body
+        });
+      } catch (messageError) {
+        console.error(`Failed to fetch message ${message.id}:`, messageError.message);
+        continue; // Skip this message, continue with others
+      }
+    }
+    
+    return emails;
+    
+  } catch (error) {
+    if (error.response?.status === 401) {
+      throw new Error('Token expired or invalid');
+    }
+    throw error;
   }
-  
-  return emails;
 }
 
 // Helper: Fetch Outlook emails
-async function fetchOutlookEmails(accessToken, config) {
-  const response = await axios.get(
-    'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages',
-    {
-      params: {
-        $filter: 'isRead eq false',
-        $top: 10,
-        $select: 'id,from,subject,receivedDateTime,body'
-      },
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    }
-  );
+// async function fetchOutlookEmails(accessToken, config) {
+//   const response = await axios.get(
+//     'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages',
+//     {
+//       params: {
+//         $filter: 'isRead eq false',
+//         $top: 10,
+//         $select: 'id,from,subject,receivedDateTime,body'
+//       },
+//       headers: { 'Authorization': `Bearer ${accessToken}` }
+//     }
+//   );
   
-  return response.data.value.map(email => ({
-    id: email.id,
-    from: email.from.emailAddress.address,
-    subject: email.subject,
-    date: email.receivedDateTime,
-    body: email.body.content
-  }));
+//   return response.data.value.map(email => ({
+//     id: email.id,
+//     from: email.from.emailAddress.address,
+//     subject: email.subject,
+//     date: email.receivedDateTime,
+//     body: email.body.content
+//   }));
+// }
+
+
+async function fetchOutlookEmails(accessToken, config) {
+  try {
+    const response = await axios.get(
+      'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages',
+      {
+        params: {
+          $filter: 'isRead eq false',
+          $top: 10,
+          $select: 'id,from,subject,receivedDateTime,body'
+        },
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+        timeout: 30000
+      }
+    );
+    
+    return response.data.value.map(email => ({
+      id: email.id,
+      from: email.from?.emailAddress?.address || 'Unknown',
+      subject: email.subject || 'No Subject',
+      date: email.receivedDateTime || new Date().toISOString(),
+      body: email.body?.content || ''
+    }));
+    
+  } catch (error) {
+    if (error.response?.status === 401) {
+      throw new Error('Token expired or invalid');
+    }
+    throw error;
+  }
 }
 
 // Helper: Process email for lead (same as before)
+// async function processEmailForLead(emailData) {
+//   const {
+//     email_config_id,
+//     company_id,
+//     email_from,
+//     email_subject,
+//     email_body,
+//     email_date,
+//     message_id
+//   } = emailData;
+  
+//   // Extract lead using AI (same function as before)
+//   const extractedData = await extractLeadFromEmail({
+//     from: email_from,
+//     subject: email_subject,
+//     body: email_body,
+//     company_id: company_id
+//   });
+  
+//   // if (!extractedData.phone_number && !extractedData.email) {
+//   //   await pool.query(`
+//   //     INSERT INTO email_scan_logs (
+//   //       email_config_id, company_id, message_id,
+//   //       from_email, subject, status, error_message
+//   //     )
+//   //     VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found')
+//   //   `, [email_config_id, company_id, message_id, email_from, email_subject]);
+    
+//   //   return { skipped: true, reason: 'No contact info' };
+//   // }
+
+
+//   if (!extractedData.phone_number && !extractedData.email) {
+//     // Log skipped + return
+//     await pool.query(`
+//       INSERT INTO email_scan_logs (...)
+//       VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact info')
+//       ON CONFLICT (email_config_id, message_id) DO NOTHING
+//     `, [email_config_id, company_id, message_id, email_from, email_subject]);
+
+//     return { skipped: true, reason: 'No contact info' };
+//   }
+  
+//   // Normalize phone
+//   let phone = extractedData.phone_number;
+//   if (phone) {
+//     phone = phone.replace(/\D/g, '');
+//     if (phone.length === 10) phone = '+91' + phone;
+//     else if (!phone.startsWith('+')) phone = '+' + phone;
+//   }
+  
+//   // Check if lead exists
+//   let leadId;
+//   const existingLead = await pool.query(
+//     'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
+//     [phone, extractedData.email, company_id]
+//   );
+  
+//   if (existingLead.rows.length > 0) {
+//     leadId = existingLead.rows[0].id;
+//     await pool.query(`
+//       UPDATE leads
+//       SET 
+//         name = COALESCE($1, name),
+//         email = COALESCE($2, email),
+//         notes = COALESCE(notes || E'\\n', '') || $3,
+//         updated_at = CURRENT_TIMESTAMP
+//       WHERE id = $4
+//     `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
+//   } else {
+//     const newLead = await pool.query(`
+//       INSERT INTO leads (
+//         company_id, phone_number, name, email,
+//         lead_source, notes
+//       )
+//       VALUES ($1, $2, $3, $4, 'email_inbox', $5)
+//       RETURNING id
+//     `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
+//     leadId = newLead.rows[0].id;
+//   }
+  
+//   // Log success
+//   await pool.query(`
+//     INSERT INTO email_scan_logs (
+//       email_config_id, company_id, lead_id, message_id,
+//       from_email, subject, extracted_data, status
+//     )
+//     VALUES ($1, $2, $3, $4, $5, $6, $7, 'success')
+//   `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
+  
+//   // Update stats
+//   await pool.query(`
+//     UPDATE email_configs
+//     SET 
+//       total_scanned = total_scanned + 1,
+//       leads_extracted = leads_extracted + 1
+//     WHERE id = $1
+//   `, [email_config_id]);
+  
+//   return {
+//     success: true,
+//     lead_id: leadId,
+//     is_new: existingLead.rows.length === 0
+//   };
+// }
+
+
+
 async function processEmailForLead(emailData) {
   const {
     email_config_id,
@@ -10482,165 +10869,327 @@ async function processEmailForLead(emailData) {
     message_id
   } = emailData;
   
-  // Extract lead using AI (same function as before)
-  const extractedData = await extractLeadFromEmail({
-    from: email_from,
-    subject: email_subject,
-    body: email_body,
-    company_id: company_id
-  });
-  
-  if (!extractedData.phone_number && !extractedData.email) {
-    await pool.query(`
-      INSERT INTO email_scan_logs (
-        email_config_id, company_id, message_id,
-        from_email, subject, status, error_message
-      )
-      VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found')
-    `, [email_config_id, company_id, message_id, email_from, email_subject]);
-    
-    return { skipped: true, reason: 'No contact info' };
-  }
-  
-  // Normalize phone
-  let phone = extractedData.phone_number;
-  if (phone) {
-    phone = phone.replace(/\D/g, '');
-    if (phone.length === 10) phone = '+91' + phone;
-    else if (!phone.startsWith('+')) phone = '+' + phone;
-  }
-  
-  // Check if lead exists
-  let leadId;
-  const existingLead = await pool.query(
-    'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
-    [phone, extractedData.email, company_id]
-  );
-  
-  if (existingLead.rows.length > 0) {
-    leadId = existingLead.rows[0].id;
-    await pool.query(`
-      UPDATE leads
-      SET 
-        name = COALESCE($1, name),
-        email = COALESCE($2, email),
-        notes = COALESCE(notes || E'\\n', '') || $3,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $4
-    `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
-  } else {
-    const newLead = await pool.query(`
-      INSERT INTO leads (
-        company_id, phone_number, name, email,
-        lead_source, notes
-      )
-      VALUES ($1, $2, $3, $4, 'email_inbox', $5)
-      RETURNING id
-    `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
-    leadId = newLead.rows[0].id;
-  }
-  
-  // Log success
-  await pool.query(`
-    INSERT INTO email_scan_logs (
-      email_config_id, company_id, lead_id, message_id,
-      from_email, subject, extracted_data, status
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, 'success')
-  `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
-  
-  // Update stats
-  await pool.query(`
-    UPDATE email_configs
-    SET 
-      total_scanned = total_scanned + 1,
-      leads_extracted = leads_extracted + 1
-    WHERE id = $1
-  `, [email_config_id]);
-  
-  return {
-    success: true,
-    lead_id: leadId,
-    is_new: existingLead.rows.length === 0
-  };
-}
-
-
-
-
-
-// AI extraction function (same as before)
-async function extractLeadFromEmail(emailData) {
-  const { from, subject, body, company_id } = emailData;
-  
   try {
-    const groq = require('groq-sdk');
-    const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
+    // Check if this message was already processed
+    const existingLog = await pool.query(
+      'SELECT id, status FROM email_scan_logs WHERE email_config_id = $1 AND message_id = $2',
+      [email_config_id, message_id]
+    );
     
-    const prompt = `Extract lead information from this email. Return ONLY valid JSON:
-{
-  "name": "Full name if found",
-  "phone_number": "Phone number in any format",
-  "email": "Email address",
-  "company": "Company name if mentioned",
-  "interest": "What they're interested in",
-  "urgency": "low|medium|high"
-}
-
-From: ${from}
-Subject: ${subject}
-Body: ${body.substring(0, 2000)}
-
-JSON:`;
+    if (existingLog.rows.length > 0) {
+      console.log(`Message ${message_id} already processed, skipping...`);
+      return {
+        skipped: true,
+        reason: 'Already processed',
+        existing_status: existingLog.rows[0].status
+      };
+    }
     
-    const completion = await client.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      max_tokens: 500
+    // Extract lead using AI
+    const extractedData = await extractLeadFromEmail({
+      from: email_from,
+      subject: email_subject,
+      body: email_body,
+      company_id: company_id
     });
     
-    const responseText = completion.choices[0].message.content;
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON found');
-    
-    const extractedData = JSON.parse(jsonMatch[0]);
-    
-    // Fallback regex extraction
-    if (!extractedData.phone_number) {
-      const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
-      const phoneMatches = body.match(phoneRegex);
-      if (phoneMatches) extractedData.phone_number = phoneMatches[0];
+    if (!extractedData.phone_number && !extractedData.email) {
+      // Log skipped with ON CONFLICT handling
+      await pool.query(`
+        INSERT INTO email_scan_logs (
+          email_config_id, company_id, message_id,
+          from_email, subject, status, error_message, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found', NOW())
+        ON CONFLICT (email_config_id, message_id) DO NOTHING
+      `, [email_config_id, company_id, message_id, email_from, email_subject]);
+      
+      return { skipped: true, reason: 'No contact info' };
     }
     
-    if (!extractedData.email) {
-      const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-      const emailMatches = body.match(emailRegex);
-      if (emailMatches) extractedData.email = emailMatches[0];
+    // Normalize phone
+    let phone = extractedData.phone_number;
+    if (phone) {
+      phone = phone.replace(/\D/g, '');
+      if (phone.length === 10) phone = '+91' + phone;
+      else if (!phone.startsWith('+')) phone = '+' + phone;
     }
     
-    if (!extractedData.email) {
-      const senderMatch = from.match(/<(.+?)>/);
-      extractedData.email = senderMatch ? senderMatch[1] : from;
+    // Check if lead exists
+    let leadId;
+    const existingLead = await pool.query(
+      'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
+      [phone, extractedData.email, company_id]
+    );
+    
+    if (existingLead.rows.length > 0) {
+      leadId = existingLead.rows[0].id;
+      await pool.query(`
+        UPDATE leads
+        SET 
+          name = COALESCE($1, name),
+          email = COALESCE($2, email),
+          notes = COALESCE(notes || E'\\n', '') || $3,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $4
+      `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
+    } else {
+      const newLead = await pool.query(`
+        INSERT INTO leads (
+          company_id, phone_number, name, email,
+          lead_source, notes
+        )
+        VALUES ($1, $2, $3, $4, 'email_inbox', $5)
+        RETURNING id
+      `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
+      leadId = newLead.rows[0].id;
     }
     
-    return extractedData;
+    // Log success with ON CONFLICT handling
+    await pool.query(`
+      INSERT INTO email_scan_logs (
+        email_config_id, company_id, lead_id, message_id,
+        from_email, subject, extracted_data, status, created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'success', NOW())
+      ON CONFLICT (email_config_id, message_id) 
+      DO UPDATE SET 
+        lead_id = EXCLUDED.lead_id,
+        extracted_data = EXCLUDED.extracted_data,
+        status = EXCLUDED.status
+    `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
+    
+    // Update stats
+    await pool.query(`
+      UPDATE email_configs
+      SET 
+        total_scanned = total_scanned + 1,
+        leads_extracted = leads_extracted + 1,
+        last_scan_at = NOW()
+      WHERE id = $1
+    `, [email_config_id]);
+    
+    return {
+      success: true,
+      lead_id: leadId,
+      is_new: existingLead.rows.length === 0,
+      extracted_data: extractedData
+    };
     
   } catch (error) {
-    console.error('AI extraction error:', error);
+    console.error('Process email error:', error);
     
-    // Fallback to regex
-    return {
-      name: null,
-      phone_number: body.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/)?.[0] || null,
-      email: body.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0] || from,
-      company: null,
-      interest: subject,
-      urgency: 'medium'
-    };
+    // Log failure with ON CONFLICT handling
+    try {
+      await pool.query(`
+        INSERT INTO email_scan_logs (
+          email_config_id, company_id, message_id,
+          from_email, subject, status, error_message, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'failed', $6, NOW())
+        ON CONFLICT (email_config_id, message_id) 
+        DO UPDATE SET 
+          status = 'failed',
+          error_message = EXCLUDED.error_message
+      `, [email_config_id, company_id, message_id, email_from, email_subject, error.message]);
+    } catch (logError) {
+      console.error('Failed to log error:', logError);
+    }
+    
+    throw error;
   }
 }
 
+
+
+
+
+// // AI extraction function (same as before)
+// async function extractLeadFromEmail(emailData) {
+//   const { from, subject, body, company_id } = emailData;
+  
+//   try {
+//     const groq = require('groq-sdk');
+//     const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
+    
+//     const prompt = `Extract lead information from this email. Return ONLY valid JSON:
+// {
+//   "name": "Full name if found",
+//   "phone_number": "Phone number in any format",
+//   "email": "Email address",
+//   "company": "Company name if mentioned",
+//   "interest": "What they're interested in",
+//   "urgency": "low|medium|high"
+// }
+
+// From: ${from}
+// Subject: ${subject}
+// Body: ${body.substring(0, 2000)}
+
+// JSON:`;
+    
+//     const completion = await client.chat.completions.create({
+//       model: 'llama-3.1-8b-instant',
+//       messages: [{ role: 'user', content: prompt }],
+//       temperature: 0.3,
+//       max_tokens: 500
+//     });
+    
+//     const responseText = completion.choices[0].message.content;
+//     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+//     if (!jsonMatch) throw new Error('No JSON found');
+    
+//     const extractedData = JSON.parse(jsonMatch[0]);
+    
+//     // Fallback regex extraction
+//     if (!extractedData.phone_number) {
+//       const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
+//       const phoneMatches = body.match(phoneRegex);
+//       if (phoneMatches) extractedData.phone_number = phoneMatches[0];
+//     }
+    
+//     if (!extractedData.email) {
+//       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+//       const emailMatches = body.match(emailRegex);
+//       if (emailMatches) extractedData.email = emailMatches[0];
+//     }
+    
+//     if (!extractedData.email) {
+//       const senderMatch = from.match(/<(.+?)>/);
+//       extractedData.email = senderMatch ? senderMatch[1] : from;
+//     }
+    
+//     return extractedData;
+    
+//   } catch (error) {
+//     console.error('AI extraction error:', error);
+    
+//     // Fallback to regex
+//     return {
+//       name: null,
+//       phone_number: body.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/)?.[0] || null,
+//       email: body.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0] || from,
+//       company: null,
+//       interest: subject,
+//       urgency: 'medium'
+//     };
+//   }
+// }
+
+
+
+// Add this function to refresh expired tokens
+async function refreshGmailToken(config) {
+  try {
+    const refreshToken = decryptToken(config.oauth_refresh_token);
+    
+    if (!refreshToken) {
+      throw new Error('No refresh token available');
+    }
+    
+    const response = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        client_id: process.env.GMAIL_CLIENT_ID,
+        client_secret: process.env.GMAIL_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+      }
+    );
+    
+    const { access_token, expires_in } = response.data;
+    
+    // Update database with new token
+    await pool.query(`
+      UPDATE email_configs
+      SET 
+        oauth_access_token = $1,
+        oauth_token_expires_at = NOW() + '${expires_in} seconds'::interval,
+        updated_at = NOW()
+      WHERE id = $2
+    `, [encryptToken(access_token), config.id]);
+    
+    return access_token;
+    
+  } catch (error) {
+    console.error('Gmail token refresh failed:', error);
+    
+    // Mark config as requiring reauth
+    await pool.query(`
+      UPDATE email_configs
+      SET is_active = FALSE, updated_at = NOW()
+      WHERE id = $1
+    `, [config.id]);
+    
+    throw new Error('Token refresh failed. Please reconnect your account.');
+  }
+}
+
+async function refreshOutlookToken(config) {
+  try {
+    const refreshToken = decryptToken(config.oauth_refresh_token);
+    
+    if (!refreshToken) {
+      throw new Error('No refresh token available');
+    }
+    
+    const response = await axios.post(
+      'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+      new URLSearchParams({
+        client_id: process.env.OUTLOOK_CLIENT_ID,
+        client_secret: process.env.OUTLOOK_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+      }),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      }
+    );
+    
+    const { access_token, expires_in } = response.data;
+    
+    await pool.query(`
+      UPDATE email_configs
+      SET 
+        oauth_access_token = $1,
+        oauth_token_expires_at = NOW() + '${expires_in} seconds'::interval,
+        updated_at = NOW()
+      WHERE id = $2
+    `, [encryptToken(access_token), config.id]);
+    
+    return access_token;
+    
+  } catch (error) {
+    console.error('Outlook token refresh failed:', error);
+    
+    await pool.query(`
+      UPDATE email_configs
+      SET is_active = FALSE, updated_at = NOW()
+      WHERE id = $1
+    `, [config.id]);
+    
+    throw new Error('Token refresh failed. Please reconnect your account.');
+  }
+}
+
+// Helper to get valid access token (with auto-refresh)
+async function getValidAccessToken(config) {
+  const now = new Date();
+  const expiresAt = new Date(config.oauth_token_expires_at);
+  
+  // Refresh if expired or expiring in next 5 minutes
+  if (expiresAt <= new Date(now.getTime() + 5 * 60 * 1000)) {
+    console.log(`Token expired for ${config.email_address}, refreshing...`);
+    
+    if (config.provider === 'gmail') {
+      return await refreshGmailToken(config);
+    } else if (config.provider === 'outlook') {
+      return await refreshOutlookToken(config);
+    }
+  }
+  
+  return decryptToken(config.oauth_access_token);
+}
 
 
 
