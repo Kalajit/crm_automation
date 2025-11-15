@@ -316,15 +316,15 @@ async function translateBatch(texts, targetLang, sourceLang = 'en') {
   }
 }
 
-// ============================================
-// ✅ EXPORT FUNCTIONS
-// ============================================
+// // ============================================
+// // ✅ EXPORT FUNCTIONS
+// // ============================================
 
-module.exports = {
-  translateText,
-  detectLanguage,
-  translateBatch
-};
+// module.exports = {
+//   translateText,
+//   detectLanguage,
+//   translateBatch
+// };
 
 // // LibreTranslate Configuration
 // const LIBRETRANSLATE_URL = process.env.LIBRETRANSLATE_URL || 'http://libretranslate:5000';
@@ -529,16 +529,23 @@ const upload = multer({ storage });
 app.post('/api/recordings/upload', upload.single('audio_file'), async (req, res) => {
   try {
     const { call_sid, filename  } = req.body;
-    const localPath = req.file.path;
+    const uploadedFilePath = req.file.path;
 
 
-    let finalPath = tempPath;
+    let finalPath = uploadedFilePath;
     if (filename) {
-      const uploadDir = path.dirname(tempPath);
+      const uploadDir = path.dirname(uploadedFilePath);
       finalPath = path.join(uploadDir, filename);
 
-      // Rename file on disk
-      fs.renameSync(tempPath, finalPath);
+      // Check if source file exists before renaming
+      if (fs.existsSync(uploadedFilePath)) {
+        fs.renameSync(uploadedFilePath, finalPath);
+      } else {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Uploaded file not found' 
+        });
+      }
     }
     
     // Update call log with local path
@@ -950,9 +957,6 @@ app.get('/api/leads/id/:lead_id', async (req, res) => {
 
 
 
-
-
-// Get lead by phone number
 // Get lead by phone number
 app.get('/api/leads/by-phone/:phone', async (req, res) => {
   let  { phone } = req.params;
@@ -1170,7 +1174,7 @@ app.post('/api/conversations', async (req, res) => {
 // Get conversation history
 app.get('/api/conversations/:phone', async (req, res) => {
   try {
-    const { phone } = req.params;
+    let { phone } = req.params;
     // 🔧 FIX: Normalize phone number
     if (!phone.startsWith('+')) {
       phone = '+' + phone;
@@ -1344,57 +1348,394 @@ app.post('/api/faqs', async (req, res) => {
 // ============================================
 
 // Create booking
+// app.post('/api/bookings', async (req, res) => {
+//   try {
+//     const { lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location } = req.body;
+
+//     if (!lead_id || !scheduled_date) {
+//       return res.status(400).json({ error: 'lead_id and scheduled_date are required' });
+//     }
+
+//     const query = `
+//       INSERT INTO bookings (lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location)
+//       VALUES ($1, $2, $3, $4, $5, $6)
+//       RETURNING *;
+//     `;
+
+//     const result = await pool.query(query, [
+//       lead_id,
+//       phone_number,
+//       booking_type,
+//       scheduled_date,
+//       duration_minutes || 30,
+//       location,
+//     ]);
+
+//     logRequest('POST', '/api/bookings', 201);
+//     res.status(201).json({ success: true, data: result.rows[0] });
+//   } catch (error) {
+//     logRequest('POST', '/api/bookings', 500);
+//     handleError(res, error);
+//   }
+// });
+
+
+
+
+// Create new booking
 app.post('/api/bookings', async (req, res) => {
   try {
-    const { lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location } = req.body;
-
-    if (!lead_id || !scheduled_date) {
-      return res.status(400).json({ error: 'lead_id and scheduled_date are required' });
-    }
-
-    const query = `
-      INSERT INTO bookings (lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING *;
-    `;
-
-    const result = await pool.query(query, [
+    const {
       lead_id,
       phone_number,
       booking_type,
       scheduled_date,
-      duration_minutes || 30,
-      location,
+      duration_minutes = 60,
+      status = 'pending',
+      notes,
+      calendar_event_id
+    } = req.body;
+    
+    if (!lead_id || !phone_number || !booking_type || !scheduled_date) {
+      return res.status(400).json({
+        error: 'lead_id, phone_number, booking_type, scheduled_date required'
+      });
+    }
+    
+    const result = await pool.query(`
+      INSERT INTO bookings (
+        lead_id, phone_number, booking_type, scheduled_date,
+        duration_minutes, status, notes, calendar_event_id
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `, [
+      lead_id,
+      phone_number,
+      booking_type,
+      scheduled_date,
+      duration_minutes,
+      status,
+      notes || null,
+      calendar_event_id || null
     ]);
-
+    
     logRequest('POST', '/api/bookings', 201);
-    res.status(201).json({ success: true, data: result.rows[0] });
+    res.status(201).json({
+      success: true,
+      data: result.rows[0]
+    });
+    
   } catch (error) {
+    console.error('Create booking error:', error);
     logRequest('POST', '/api/bookings', 500);
-    handleError(res, error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Get bookings for a lead
+
+
+// Get all bookings (with optional filters)
+app.get('/api/bookings', async (req, res) => {
+  try {
+    const { lead_id, company_id, status, booking_type, limit = 50, offset = 0 } = req.query;
+    
+    let query = `
+      SELECT 
+        b.*,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        c.name as company_name
+      FROM bookings b
+      LEFT JOIN leads l ON b.lead_id = l.id
+      LEFT JOIN companies c ON l.company_id = c.id
+      WHERE 1=1
+    `;
+    
+    const params = [];
+    let paramIndex = 1;
+    
+    if (lead_id) {
+      query += ` AND b.lead_id = $${paramIndex}`;
+      params.push(lead_id);
+      paramIndex++;
+    }
+    
+    if (company_id) {
+      query += ` AND l.company_id = $${paramIndex}`;
+      params.push(company_id);
+      paramIndex++;
+    }
+    
+    if (status) {
+      query += ` AND b.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+    
+    if (booking_type) {
+      query += ` AND b.booking_type = $${paramIndex}`;
+      params.push(booking_type);
+      paramIndex++;
+    }
+    
+    query += ` ORDER BY b.scheduled_date DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(parseInt(limit), parseInt(offset));
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/bookings', 200);
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length
+    });
+    
+  } catch (error) {
+    console.error('Get bookings error:', error);
+    logRequest('GET', '/api/bookings', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// Get single booking by ID
+app.get('/api/bookings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        b.*,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        c.name as company_name,
+        ce.meeting_link,
+        ce.event_id as calendar_event_id
+      FROM bookings b
+      LEFT JOIN leads l ON b.lead_id = l.id
+      LEFT JOIN companies c ON l.company_id = c.id
+      LEFT JOIN calendar_events ce ON b.calendar_event_id = ce.event_id
+      WHERE b.id = $1
+    `, [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    
+    logRequest('GET', `/api/bookings/${id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Get booking error:', error);
+    logRequest('GET', `/api/bookings/${id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// Update booking
+app.patch('/api/bookings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      scheduled_date,
+      duration_minutes,
+      status,
+      notes,
+      calendar_event_id
+    } = req.body;
+    
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+    
+    if (scheduled_date !== undefined) {
+      updates.push(`scheduled_date = $${paramIndex}`);
+      values.push(scheduled_date);
+      paramIndex++;
+    }
+    
+    if (duration_minutes !== undefined) {
+      updates.push(`duration_minutes = $${paramIndex}`);
+      values.push(duration_minutes);
+      paramIndex++;
+    }
+    
+    if (status !== undefined) {
+      updates.push(`status = $${paramIndex}`);
+      values.push(status);
+      paramIndex++;
+    }
+    
+    if (notes !== undefined) {
+      updates.push(`notes = $${paramIndex}`);
+      values.push(notes);
+      paramIndex++;
+    }
+    
+    if (calendar_event_id !== undefined) {
+      updates.push(`calendar_event_id = $${paramIndex}`);
+      values.push(calendar_event_id);
+      paramIndex++;
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push(`updated_at = CURRENT_TIMESTAMP`);
+    values.push(id);
+    
+    const query = `
+      UPDATE bookings 
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, values);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    
+    logRequest('PATCH', `/api/bookings/${id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Update booking error:', error);
+    logRequest('PATCH', `/api/bookings/${id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// Cancel booking
+app.delete('/api/bookings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(`
+      UPDATE bookings 
+      SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    
+    logRequest('DELETE', `/api/bookings/${id}`, 200);
+    res.json({
+      success: true,
+      message: 'Booking cancelled',
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Cancel booking error:', error);
+    logRequest('DELETE', `/api/bookings/${id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// Get upcoming bookings (next 7 days)
+app.get('/api/bookings/upcoming', async (req, res) => {
+  try {
+    const { company_id, days = 7 } = req.query;
+    
+    let query = `
+      SELECT 
+        b.*,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        ce.meeting_link
+      FROM bookings b
+      LEFT JOIN leads l ON b.lead_id = l.id
+      LEFT JOIN calendar_events ce ON b.calendar_event_id = ce.event_id
+      WHERE b.status IN ('pending', 'confirmed')
+        AND b.scheduled_date BETWEEN NOW() AND NOW() + INTERVAL '${days} days'
+    `;
+    
+    const params = [];
+    
+    if (company_id) {
+      query += ` AND l.company_id = $1`;
+      params.push(company_id);
+    }
+    
+    query += ` ORDER BY b.scheduled_date ASC`;
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/bookings/upcoming', 200);
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length
+    });
+    
+  } catch (error) {
+    console.error('Get upcoming bookings error:', error);
+    logRequest('GET', '/api/bookings/upcoming', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// Get bookings by lead
 app.get('/api/bookings/lead/:lead_id', async (req, res) => {
   try {
     const { lead_id } = req.params;
-
-    const query = `
-      SELECT * FROM bookings
-      WHERE lead_id = $1
-      ORDER BY scheduled_date DESC;
-    `;
-
-    const result = await pool.query(query, [lead_id]);
-
+    
+    const result = await pool.query(`
+      SELECT 
+        b.*,
+        ce.meeting_link,
+        ce.event_id as calendar_event_id
+      FROM bookings b
+      LEFT JOIN calendar_events ce ON b.calendar_event_id = ce.event_id
+      WHERE b.lead_id = $1
+      ORDER BY b.scheduled_date DESC
+    `, [lead_id]);
+    
     logRequest('GET', `/api/bookings/lead/${lead_id}`, 200);
-    res.json({ success: true, data: result.rows });
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length
+    });
+    
   } catch (error) {
+    console.error('Get lead bookings error:', error);
     logRequest('GET', `/api/bookings/lead/${lead_id}`, 500);
-    handleError(res, error);
+    res.status(500).json({ error: error.message });
   }
 });
+
+
+
 
 // ============================================
 // 6. INVOICE ENDPOINTS
@@ -1498,8 +1839,6 @@ app.get('/api/active-calls', async (req, res) => {
 // ============================================
 // 7. WEBHOOK ENDPOINT (FROM n8n)
 // ============================================
-
-// Webhook to receive data from n8n workflow
 // Webhook to receive data from n8n workflow with ALL custom fields
 app.post('/api/webhook/n8n', async (req, res) => {
   try {
@@ -2942,7 +3281,13 @@ app.get('/api/call-logs/export/csv', async (req, res) => {
     for (const row of result.rows) {
       const values = headers.map(header => {
         const val = row[header];
-        return typeof val === 'string' ? `"${val.replace(/"/g, '""')}"` : val;
+        if (val === null || val === undefined) return '';
+        // Escape double quotes and wrap in quotes if contains comma, newline, or quote
+        const stringVal = String(val);
+        if (stringVal.includes(',') || stringVal.includes('\n') || stringVal.includes('"')) {
+          return `"${stringVal.replace(/"/g, '""')}"`;
+        }
+        return stringVal;
       });
       csvRows.push(values.join(','));
     }
@@ -4321,15 +4666,12 @@ app.get('/api/leads/search-by-custom-field', async (req, res) => {
 
 
 
-// ADD THESE ENDPOINTS TO YOUR EXISTING server.js
-
 // ============================================
 // GOOGLE CALENDAR VERIFICATION ENDPOINT
 // ============================================
 app.get('/api/calendar/verify', async (req, res) => {
   try {
-    // Test Google Calendar API connection
-    // This endpoint should be called from n8n to verify calendar works
+
     const testDate = new Date();
     testDate.setDate(testDate.getDate() + 1); // Tomorrow
     
@@ -4531,7 +4873,9 @@ app.get('/api/system/status', async (req, res) => {
     metrics.pending_takeovers = parseInt(takeoverCount.rows[0].count);
     
     // Active calls
-    metrics.active_calls = len(ACTIVE_CALLS);
+    // metrics.active_calls = len(ACTIVE_CALLS);
+    // FIX: Use proper activeConnections.size
+    metrics.active_websocket_connections = activeConnections.size;
     
     res.json({
       success: true,
@@ -4621,10 +4965,6 @@ setInterval(() => {
 
 
 
-
-// ==================== OAUTH ENDPOINTS (FIXED) ====================
-// Add these BEFORE your existing webhook endpoints
-
 // 1. INITIATE OAUTH FLOW (FIXED)
 app.get('/api/whatsapp/oauth/start', async (req, res) => {
   try {
@@ -4663,13 +5003,7 @@ app.get('/api/whatsapp/oauth/start', async (req, res) => {
     
     console.log('✅ OAuth flow initiated:', { company_id, agent_instance_id });
     logRequest('GET', '/api/whatsapp/oauth/start', 200);
-    
-    // res.json({ 
-    //   success: true, 
-    //   auth_url: authUrl,
-    //   message: 'Redirect user to auth_url',
-    //   expires_in: 3600 // 1 hour
-    // });
+
 
 
     res.json({ 
@@ -5683,7 +6017,6 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
   try {
     const { agent_instance_id } = req.params;
     
-    // Get current credentials before deleting
     const currentResult = await pool.query(
       'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
       [agent_instance_id]
@@ -5691,8 +6024,7 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
     
     if (currentResult.rows.length > 0) {
       const creds = currentResult.rows[0].whatsapp_credentials;
-      // TODO: Optionally revoke token with Meta API here
-      // This would require calling Meta's revoke endpoint
+
     }
     
     // Clear credentials
@@ -5724,7 +6056,7 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
   }
 });
 
-// ==================== END OAUTH ENDPOINTS ====================
+
 
 
 
@@ -6067,10 +6399,6 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       } catch (err) {
         console.error('⚠️ DB insert error for user message:', err);
       }
-
-      // ============================================
-      // ✅ FIXED: Forward to n8n with proper error handling
-      // ============================================
       
       // 🔧 FIX 1: Use correct n8n webhook URL (from workflow)
       const n8nWebhookUrl = process.env.N8N_WHATSAPP_WEBHOOK_URL || 
@@ -6162,20 +6490,6 @@ app.get('/api/webhooks/whatsapp-universal', async (req, res) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  // if (mode && token) {
-  //   // Look for matching verify token in DB
-  //   const result = await pool.query(
-  //     'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
-  //     [token]
-  //   );
-
-  //   if (result.rows.length > 0) {
-  //     console.log('✅ Webhook verified successfully!');
-  //     return res.status(200).send(challenge);
-  //   } else {
-  //     console.log('❌ Invalid verify token:', token);
-  //     return res.sendStatus(403);
-  //   }
 
   if (mode && token) {
     // 🆕 CHANGED: Use hardcoded token instead of database lookup
@@ -8922,7 +9236,6 @@ app.get('/api/lead-sources/config-by-token/:token', async (req, res) => {
 
 // ============================================
 // SALES PERFORMANCE DASHBOARD API
-// Add these endpoints to your server.js
 // ============================================
 
 // 1. PIPELINE OVERVIEW
@@ -9466,7 +9779,6 @@ app.get('/api/dashboard/pipeline-overview', async (req, res) => {
 
 // ============================================
 // AI-POWERED EMAIL INBOX SCANNING
-// Add these endpoints to your server.js
 // ============================================
 
 // 1. EMAIL CONFIGURATION MANAGEMENT
@@ -9727,11 +10039,108 @@ app.post('/api/email/process', async (req, res) => {
 // 4. AI LEAD EXTRACTION FUNCTION
 // ============================================
 
+// async function extractLeadFromEmail(emailData) {
+//   const { from, subject, body, company_id } = emailData;
+
+//   try {
+//     // Get company's AI extraction rules
+//     const rulesResult = await pool.query(
+//       'SELECT ai_rules FROM email_configs WHERE company_id = $1 AND is_active = TRUE LIMIT 1',
+//       [company_id]
+//     );
+
+//     const aiRules = rulesResult.rows[0]?.ai_rules || {};
+
+//     // Use Groq/LLM to extract lead data
+//     const groq = require('groq-sdk');
+//     const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
+
+//     const prompt = `
+// Extract lead information from this email. Return ONLY valid JSON with these fields:
+// {
+//   "name": "Full name if found",
+//   "phone_number": "Phone number in any format",
+//   "email": "Email address",
+//   "company": "Company name if mentioned",
+//   "interest": "What they're interested in",
+//   "urgency": "low|medium|high",
+//   "next_action": "Recommended next step"
+// }
+
+// Email From: ${from}
+// Subject: ${subject}
+// Body:
+// ${body.substring(0, 2000)}
+
+// Rules: ${JSON.stringify(aiRules)}
+
+// JSON:`;
+
+//     const completion = await client.chat.completions.create({
+//       model: 'llama-3.1-8b-instant',
+//       messages: [{ role: 'user', content: prompt }],
+//       temperature: 0.3,
+//       max_tokens: 500
+//     });
+
+//     const responseText = completion.choices[0].message.content;
+    
+//     // Extract JSON from response
+//     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+//     if (!jsonMatch) {
+//       throw new Error('No JSON found in AI response');
+//     }
+
+//     const extractedData = JSON.parse(jsonMatch[0]);
+
+//     // Fallback: Extract phone from email body using regex
+//     if (!extractedData.phone_number) {
+//       const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
+//       const phoneMatches = body.match(phoneRegex);
+//       if (phoneMatches && phoneMatches.length > 0) {
+//         extractedData.phone_number = phoneMatches[0];
+//       }
+//     }
+
+//     // Fallback: Extract email from body
+//     if (!extractedData.email) {
+//       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+//       const emailMatches = body.match(emailRegex);
+//       if (emailMatches && emailMatches.length > 0) {
+//         extractedData.email = emailMatches[0];
+//       }
+//     }
+
+//     // If still no email, use sender's email
+//     if (!extractedData.email) {
+//       const senderEmailMatch = from.match(/<(.+?)>/);
+//       extractedData.email = senderEmailMatch ? senderEmailMatch[1] : from;
+//     }
+
+//     return extractedData;
+
+//   } catch (error) {
+//     console.error('AI extraction error:', error);
+    
+//     // Fallback to regex-based extraction
+//     return {
+//       name: null,
+//       phone_number: extractPhoneFromText(body),
+//       email: extractEmailFromText(from + ' ' + body),
+//       company: null,
+//       interest: subject,
+//       urgency: 'medium',
+//       next_action: 'Manual review needed'
+//     };
+//   }
+// }
+
+
+
 async function extractLeadFromEmail(emailData) {
   const { from, subject, body, company_id } = emailData;
 
   try {
-    // Get company's AI extraction rules
     const rulesResult = await pool.query(
       'SELECT ai_rules FROM email_configs WHERE company_id = $1 AND is_active = TRUE LIMIT 1',
       [company_id]
@@ -9739,41 +10148,66 @@ async function extractLeadFromEmail(emailData) {
 
     const aiRules = rulesResult.rows[0]?.ai_rules || {};
 
-    // Use Groq/LLM to extract lead data
     const groq = require('groq-sdk');
     const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
 
     const prompt = `
-Extract lead information from this email. Return ONLY valid JSON with these fields:
-{
-  "name": "Full name if found",
-  "phone_number": "Phone number in any format",
-  "email": "Email address",
-  "company": "Company name if mentioned",
-  "interest": "What they're interested in",
-  "urgency": "low|medium|high",
-  "next_action": "Recommended next step"
-}
+You are an intelligent email lead filter for a CRM system. Analyze this email and determine if it contains a potential business lead or inquiry.
 
-Email From: ${from}
+STRICT FILTERING RULES:
+- ONLY extract leads from emails that are BUSINESS INQUIRIES, SALES INQUIRIES, or CUSTOMER REQUESTS
+- IGNORE: newsletters, notifications, marketing emails, automated reports, account updates, social media notifications, promotional emails
+- IGNORE: "no-reply" addresses, automated system emails, digests, updates
+- A valid lead MUST show clear intent to: inquire about services, request information, ask for quotes, express interest in products/services, or seek business engagement
+
+Email Details:
+From: ${from}
 Subject: ${subject}
-Body:
+Body (first 2000 chars):
 ${body.substring(0, 2000)}
 
-Rules: ${JSON.stringify(aiRules)}
+Additional Rules: ${JSON.stringify(aiRules)}
+
+RESPOND WITH ONLY THIS JSON FORMAT:
+{
+  "is_lead": true/false,
+  "reason": "Brief explanation why this is or isn't a lead",
+  "confidence": "high|medium|low",
+  "name": "Full name if found (or null)",
+  "phone_number": "Phone number in any format (or null)",
+  "email": "Email address (or null)",
+  "company": "Company name if mentioned (or null)",
+  "interest": "What they're interested in (or null)",
+  "urgency": "low|medium|high",
+  "lead_type": "inquiry|quote_request|support|sales|general|null",
+  "next_action": "Recommended next step (or null)"
+}
+
+EXAMPLES OF VALID LEADS:
+- "Hi, I'm interested in your web development services..."
+- "Can you provide a quote for..."
+- "I'd like to schedule a demo..."
+- "We're looking for a solution that..."
+
+EXAMPLES OF NON-LEADS (IGNORE THESE):
+- "Your Medium Daily Digest"
+- "Weekly newsletter from..."
+- "Password reset request"
+- "Your order has been shipped"
+- "New follower on..."
+- "Team update: Project status"
 
 JSON:`;
 
     const completion = await client.chat.completions.create({
       model: 'llama-3.1-8b-instant',
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      max_tokens: 500
+      temperature: 0.2,
+      max_tokens: 600
     });
 
     const responseText = completion.choices[0].message.content;
     
-    // Extract JSON from response
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       throw new Error('No JSON found in AI response');
@@ -9781,7 +10215,17 @@ JSON:`;
 
     const extractedData = JSON.parse(jsonMatch[0]);
 
-    // Fallback: Extract phone from email body using regex
+    // CRITICAL: If AI says it's not a lead, return null immediately
+    if (extractedData.is_lead === false || extractedData.confidence === 'low') {
+      console.log(`Email filtered out: ${extractedData.reason}`);
+      return {
+        is_lead: false,
+        reason: extractedData.reason,
+        confidence: extractedData.confidence
+      };
+    }
+
+    // Fallback regex extraction for contact info
     if (!extractedData.phone_number) {
       const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
       const phoneMatches = body.match(phoneRegex);
@@ -9790,7 +10234,6 @@ JSON:`;
       }
     }
 
-    // Fallback: Extract email from body
     if (!extractedData.email) {
       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
       const emailMatches = body.match(emailRegex);
@@ -9799,10 +10242,10 @@ JSON:`;
       }
     }
 
-    // If still no email, use sender's email
+    // Extract email from sender if not found
     if (!extractedData.email) {
-      const senderEmailMatch = from.match(/<(.+?)>/);
-      extractedData.email = senderEmailMatch ? senderEmailMatch[1] : from;
+      const senderEmailMatch = from.match(/<(.+?)>/) || from.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+      extractedData.email = senderEmailMatch ? (senderEmailMatch[1] || senderEmailMatch[0]) : from;
     }
 
     return extractedData;
@@ -9810,18 +10253,37 @@ JSON:`;
   } catch (error) {
     console.error('AI extraction error:', error);
     
-    // Fallback to regex-based extraction
+    // Fallback: Basic heuristic filtering
+    const isLikelyLead = !from.toLowerCase().includes('noreply') && 
+                         !from.toLowerCase().includes('no-reply') &&
+                         !subject.toLowerCase().includes('newsletter') &&
+                         !subject.toLowerCase().includes('digest') &&
+                         !subject.toLowerCase().includes('notification');
+    
+    if (!isLikelyLead) {
+      return {
+        is_lead: false,
+        reason: 'Automated or newsletter email detected',
+        confidence: 'medium'
+      };
+    }
+    
     return {
+      is_lead: true,
       name: null,
       phone_number: extractPhoneFromText(body),
       email: extractEmailFromText(from + ' ' + body),
       company: null,
       interest: subject,
       urgency: 'medium',
-      next_action: 'Manual review needed'
+      lead_type: 'general',
+      next_action: 'Manual review needed',
+      confidence: 'low'
     };
   }
 }
+
+
 
 function extractPhoneFromText(text) {
   const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/;
@@ -9993,6 +10455,114 @@ app.get('/api/email/oauth/gmail/start', async (req, res) => {
 
 
 
+// app.get('/api/email/oauth/gmail/callback', async (req, res) => {
+//   try {
+//     const { code, state, error: oauth_error } = req.query;
+    
+//     if (oauth_error) {
+//       return res.status(400).send(`OAuth Error: ${oauth_error}`);
+//     }
+    
+//     const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+//     const { company_id } = stateData;
+    
+//     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/gmail/callback`;
+    
+//     // Exchange code for tokens
+//     const tokenResponse = await axios.post(
+//       'https://oauth2.googleapis.com/token',
+//       {
+//         code: code,
+//         client_id: process.env.GMAIL_CLIENT_ID,
+//         client_secret: process.env.GMAIL_CLIENT_SECRET,
+//         redirect_uri: redirectUri,
+//         grant_type: 'authorization_code'
+//       }
+//     );
+    
+//     const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+//     // Get user's email address
+//     const profileResponse = await axios.get(
+//       'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+//       {
+//         headers: { 'Authorization': `Bearer ${access_token}` }
+//       }
+//     );
+    
+//     const emailAddress = profileResponse.data.emailAddress;
+    
+//     // Encrypt tokens before storing
+//     const crypto = require('crypto');
+//     const algorithm = 'aes-256-cbc';
+//     const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
+//     const iv = crypto.randomBytes(16);
+    
+//     const encryptToken = (token) => {
+//       if (!token) return null;
+//       const cipher = crypto.createCipheriv(algorithm, key, iv);
+//       let encrypted = cipher.update(token, 'utf8', 'hex');
+//       encrypted += cipher.final('hex');
+//       return iv.toString('hex') + ':' + encrypted;
+//     };
+    
+//     // Save credentials to database
+//     await pool.query(`
+//       INSERT INTO email_configs (
+//         company_id, email_address, provider,
+//         oauth_access_token, oauth_refresh_token,
+//         oauth_token_expires_at, scan_folders, is_active
+//       )
+//       VALUES ($1, $2, 'gmail', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['INBOX'], TRUE)
+//       ON CONFLICT (company_id, email_address) DO UPDATE
+//       SET 
+//         oauth_access_token = EXCLUDED.oauth_access_token,
+//         oauth_refresh_token = EXCLUDED.oauth_refresh_token,
+//         oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
+//         is_active = TRUE,
+//         updated_at = CURRENT_TIMESTAMP
+//       RETURNING id
+//     `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
+    
+//     res.send(`
+//       <!DOCTYPE html>
+//       <html>
+//       <head>
+//         <title>Gmail Connected</title>
+//         <style>
+//           body { font-family: Arial; padding: 50px; background: #f5f5f5; text-align: center; }
+//           .container { background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+//           .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+//           .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin-top: 20px; }
+//         </style>
+//       </head>
+//       <body>
+//         <div class="container">
+//           <div class="success">✅ Gmail Connected Successfully!</div>
+//           <p><strong>Email:</strong> ${emailAddress}</p>
+//           <p>Your inbox will be automatically scanned for leads every 15 minutes.</p>
+//           <p style="margin-top: 30px;">
+//             <strong>What happens next:</strong><br>
+//             • Emails will be scanned for contact information<br>
+//             • Leads will be automatically extracted using AI<br>
+//             • New leads will receive welcome messages<br>
+//             • Follow-up calls will be scheduled automatically
+//           </p>
+//           <a href="/dashboard?tab=email-scanning" class="btn">Go to Dashboard</a>
+//         </div>
+//       </body>
+//       </html>
+//     `);
+    
+//   } catch (error) {
+//     console.error('Gmail OAuth callback error:', error);
+//     res.status(500).send(`Error: ${error.message}`);
+//   }
+// });
+
+
+
+
 app.get('/api/email/oauth/gmail/callback', async (req, res) => {
   try {
     const { code, state, error: oauth_error } = req.query;
@@ -10006,7 +10576,6 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
     
     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/gmail/callback`;
     
-    // Exchange code for tokens
     const tokenResponse = await axios.post(
       'https://oauth2.googleapis.com/token',
       {
@@ -10020,7 +10589,34 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
     
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     
-    // Get user's email address
+    // CRITICAL: Check if refresh_token is present
+    if (!refresh_token) {
+      console.error('No refresh token received from Google. User may have already authorized.');
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>OAuth Error</title></head>
+        <body style="font-family: Arial; padding: 50px; text-align: center;">
+          <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
+            <div style="color: #dc3545; font-size: 24px; margin-bottom: 20px;">⚠️ Authorization Issue</div>
+            <p>No refresh token received. This usually happens when:</p>
+            <ul style="text-align: left; display: inline-block;">
+              <li>You've already authorized this app before</li>
+              <li>The app needs to be re-authorized with fresh consent</li>
+            </ul>
+            <p style="margin-top: 20px;"><strong>Solution:</strong></p>
+            <ol style="text-align: left; display: inline-block;">
+              <li>Go to <a href="https://myaccount.google.com/permissions" target="_blank">Google Account Permissions</a></li>
+              <li>Remove access for your app</li>
+              <li>Try connecting again from the dashboard</li>
+            </ol>
+            <a href="/dashboard?tab=email-scanning" style="background: #007bff; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px;">Go to Dashboard</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+    
     const profileResponse = await axios.get(
       'https://gmail.googleapis.com/gmail/v1/users/me/profile',
       {
@@ -10030,28 +10626,22 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
     
     const emailAddress = profileResponse.data.emailAddress;
     
-    // Encrypt tokens before storing
-    const crypto = require('crypto');
-    const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
-    const iv = crypto.randomBytes(16);
+    // Encrypt tokens
+    const encryptedAccessToken = encryptToken(access_token);
+    const encryptedRefreshToken = encryptToken(refresh_token);
     
-    const encryptToken = (token) => {
-      if (!token) return null;
-      const cipher = crypto.createCipheriv(algorithm, key, iv);
-      let encrypted = cipher.update(token, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      return iv.toString('hex') + ':' + encrypted;
-    };
+    // Verify encryption worked
+    if (!encryptedAccessToken || !encryptedRefreshToken) {
+      throw new Error('Token encryption failed');
+    }
     
-    // Save credentials to database
     await pool.query(`
       INSERT INTO email_configs (
         company_id, email_address, provider,
         oauth_access_token, oauth_refresh_token,
         oauth_token_expires_at, scan_folders, is_active
       )
-      VALUES ($1, $2, 'gmail', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['INBOX'], TRUE)
+      VALUES ($1, $2, 'gmail', $3, $4, NOW() + $5 * INTERVAL '1 second', ARRAY['INBOX'], TRUE)
       ON CONFLICT (company_id, email_address) DO UPDATE
       SET 
         oauth_access_token = EXCLUDED.oauth_access_token,
@@ -10060,7 +10650,7 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
         is_active = TRUE,
         updated_at = CURRENT_TIMESTAMP
       RETURNING id
-    `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
+    `, [company_id, emailAddress, encryptedAccessToken, encryptedRefreshToken, expires_in]);
     
     res.send(`
       <!DOCTYPE html>
@@ -10094,7 +10684,19 @@ app.get('/api/email/oauth/gmail/callback', async (req, res) => {
     
   } catch (error) {
     console.error('Gmail OAuth callback error:', error);
-    res.status(500).send(`Error: ${error.message}`);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Error</title></head>
+      <body style="font-family: Arial; padding: 50px; text-align: center;">
+        <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
+          <div style="color: #dc3545; font-size: 24px; margin-bottom: 20px;">❌ Connection Failed</div>
+          <p>${error.message}</p>
+          <a href="/dashboard?tab=email-scanning" style="background: #007bff; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px;">Try Again</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
 });
 
@@ -10145,6 +10747,100 @@ app.get('/api/email/oauth/outlook/start', async (req, res) => {
 
 
 
+// app.get('/api/email/oauth/outlook/callback', async (req, res) => {
+//   try {
+//     const { code, state, error: oauth_error } = req.query;
+    
+//     if (oauth_error) {
+//       return res.status(400).send(`OAuth Error: ${oauth_error}`);
+//     }
+    
+//     const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+//     const { company_id } = stateData;
+    
+//     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/outlook/callback`;
+    
+//     // Exchange code for tokens
+//     const tokenResponse = await axios.post(
+//       'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+//       new URLSearchParams({
+//         client_id: process.env.OUTLOOK_CLIENT_ID,
+//         client_secret: process.env.OUTLOOK_CLIENT_SECRET,
+//         code: code,
+//         redirect_uri: redirectUri,
+//         grant_type: 'authorization_code'
+//       }),
+//       {
+//         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+//       }
+//     );
+    
+//     const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+//     // Get user's email
+//     const profileResponse = await axios.get(
+//       'https://graph.microsoft.com/v1.0/me',
+//       {
+//         headers: { 'Authorization': `Bearer ${access_token}` }
+//       }
+//     );
+    
+//     const emailAddress = profileResponse.data.userPrincipalName;
+    
+//     // Encrypt and save
+//     const crypto = require('crypto');
+//     const algorithm = 'aes-256-cbc';
+//     const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
+//     const iv = crypto.randomBytes(16);
+    
+//     const encryptToken = (token) => {
+//       if (!token) return null;
+//       const cipher = crypto.createCipheriv(algorithm, key, iv);
+//       let encrypted = cipher.update(token, 'utf8', 'hex');
+//       encrypted += cipher.final('hex');
+//       return iv.toString('hex') + ':' + encrypted;
+//     };
+    
+//     await pool.query(`
+//       INSERT INTO email_configs (
+//         company_id, email_address, provider,
+//         oauth_access_token, oauth_refresh_token,
+//         oauth_token_expires_at, scan_folders, is_active
+//       )
+//       VALUES ($1, $2, 'outlook', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['Inbox'], TRUE)
+//       ON CONFLICT (company_id, email_address) DO UPDATE
+//       SET 
+//         oauth_access_token = EXCLUDED.oauth_access_token,
+//         oauth_refresh_token = EXCLUDED.oauth_refresh_token,
+//         oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
+//         is_active = TRUE,
+//         updated_at = CURRENT_TIMESTAMP
+//     `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
+    
+//     res.send(`
+//       <!DOCTYPE html>
+//       <html>
+//       <head><title>Outlook Connected</title></head>
+//       <body style="font-family: Arial; padding: 50px; text-align: center;">
+//         <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
+//           <div style="color: #28a745; font-size: 24px; margin-bottom: 20px;">✅ Outlook Connected!</div>
+//           <p><strong>Email:</strong> ${emailAddress}</p>
+//           <p>Your inbox will be automatically scanned for leads.</p>
+//           <a href="/dashboard?tab=email-scanning" style="background: #007bff; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px;">Go to Dashboard</a>
+//         </div>
+//       </body>
+//       </html>
+//     `);
+    
+//   } catch (error) {
+//     console.error('Outlook OAuth callback error:', error);
+//     res.status(500).send(`Error: ${error.message}`);
+//   }
+// });
+
+
+
+
 app.get('/api/email/oauth/outlook/callback', async (req, res) => {
   try {
     const { code, state, error: oauth_error } = req.query;
@@ -10158,7 +10854,6 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
     
     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/outlook/callback`;
     
-    // Exchange code for tokens
     const tokenResponse = await axios.post(
       'https://login.microsoftonline.com/common/oauth2/v2.0/token',
       new URLSearchParams({
@@ -10175,7 +10870,10 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
     
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     
-    // Get user's email
+    if (!refresh_token) {
+      throw new Error('No refresh token received from Microsoft. Please revoke and reconnect.');
+    }
+    
     const profileResponse = await axios.get(
       'https://graph.microsoft.com/v1.0/me',
       {
@@ -10185,19 +10883,12 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
     
     const emailAddress = profileResponse.data.userPrincipalName;
     
-    // Encrypt and save
-    const crypto = require('crypto');
-    const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
-    const iv = crypto.randomBytes(16);
+    const encryptedAccessToken = encryptToken(access_token);
+    const encryptedRefreshToken = encryptToken(refresh_token);
     
-    const encryptToken = (token) => {
-      if (!token) return null;
-      const cipher = crypto.createCipheriv(algorithm, key, iv);
-      let encrypted = cipher.update(token, 'utf8', 'hex');
-      encrypted += cipher.final('hex');
-      return iv.toString('hex') + ':' + encrypted;
-    };
+    if (!encryptedAccessToken || !encryptedRefreshToken) {
+      throw new Error('Token encryption failed');
+    }
     
     await pool.query(`
       INSERT INTO email_configs (
@@ -10205,7 +10896,7 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
         oauth_access_token, oauth_refresh_token,
         oauth_token_expires_at, scan_folders, is_active
       )
-      VALUES ($1, $2, 'outlook', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['Inbox'], TRUE)
+      VALUES ($1, $2, 'outlook', $3, $4, NOW() + $5 * INTERVAL '1 second', ARRAY['Inbox'], TRUE)
       ON CONFLICT (company_id, email_address) DO UPDATE
       SET 
         oauth_access_token = EXCLUDED.oauth_access_token,
@@ -10213,7 +10904,7 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
         oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
         is_active = TRUE,
         updated_at = CURRENT_TIMESTAMP
-    `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
+    `, [company_id, emailAddress, encryptedAccessToken, encryptedRefreshToken, expires_in]);
     
     res.send(`
       <!DOCTYPE html>
@@ -10858,6 +11549,151 @@ async function fetchOutlookEmails(accessToken, config) {
 
 
 
+// async function processEmailForLead(emailData) {
+//   const {
+//     email_config_id,
+//     company_id,
+//     email_from,
+//     email_subject,
+//     email_body,
+//     email_date,
+//     message_id
+//   } = emailData;
+  
+//   try {
+//     // Check if this message was already processed
+//     const existingLog = await pool.query(
+//       'SELECT id, status FROM email_scan_logs WHERE email_config_id = $1 AND message_id = $2',
+//       [email_config_id, message_id]
+//     );
+    
+//     if (existingLog.rows.length > 0) {
+//       console.log(`Message ${message_id} already processed, skipping...`);
+//       return {
+//         skipped: true,
+//         reason: 'Already processed',
+//         existing_status: existingLog.rows[0].status
+//       };
+//     }
+    
+//     // Extract lead using AI
+//     const extractedData = await extractLeadFromEmail({
+//       from: email_from,
+//       subject: email_subject,
+//       body: email_body,
+//       company_id: company_id
+//     });
+    
+//     if (!extractedData.phone_number && !extractedData.email) {
+//       // Log skipped with ON CONFLICT handling
+//       await pool.query(`
+//         INSERT INTO email_scan_logs (
+//           email_config_id, company_id, message_id,
+//           from_email, subject, status, error_message, created_at
+//         )
+//         VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found', NOW())
+//         ON CONFLICT (email_config_id, message_id) DO NOTHING
+//       `, [email_config_id, company_id, message_id, email_from, email_subject]);
+      
+//       return { skipped: true, reason: 'No contact info' };
+//     }
+    
+//     // Normalize phone
+//     let phone = extractedData.phone_number;
+//     if (phone) {
+//       phone = phone.replace(/\D/g, '');
+//       if (phone.length === 10) phone = '+91' + phone;
+//       else if (!phone.startsWith('+')) phone = '+' + phone;
+//     }
+    
+//     // Check if lead exists
+//     let leadId;
+//     const existingLead = await pool.query(
+//       'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
+//       [phone, extractedData.email, company_id]
+//     );
+    
+//     if (existingLead.rows.length > 0) {
+//       leadId = existingLead.rows[0].id;
+//       await pool.query(`
+//         UPDATE leads
+//         SET 
+//           name = COALESCE($1, name),
+//           email = COALESCE($2, email),
+//           notes = COALESCE(notes || E'\\n', '') || $3,
+//           updated_at = CURRENT_TIMESTAMP
+//         WHERE id = $4
+//       `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
+//     } else {
+//       const newLead = await pool.query(`
+//         INSERT INTO leads (
+//           company_id, phone_number, name, email,
+//           lead_source, notes
+//         )
+//         VALUES ($1, $2, $3, $4, 'email_inbox', $5)
+//         RETURNING id
+//       `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
+//       leadId = newLead.rows[0].id;
+//     }
+    
+//     // Log success with ON CONFLICT handling
+//     await pool.query(`
+//       INSERT INTO email_scan_logs (
+//         email_config_id, company_id, lead_id, message_id,
+//         from_email, subject, extracted_data, status, created_at
+//       )
+//       VALUES ($1, $2, $3, $4, $5, $6, $7, 'success', NOW())
+//       ON CONFLICT (email_config_id, message_id) 
+//       DO UPDATE SET 
+//         lead_id = EXCLUDED.lead_id,
+//         extracted_data = EXCLUDED.extracted_data,
+//         status = EXCLUDED.status
+//     `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
+    
+//     // Update stats
+//     await pool.query(`
+//       UPDATE email_configs
+//       SET 
+//         total_scanned = total_scanned + 1,
+//         leads_extracted = leads_extracted + 1,
+//         last_scan_at = NOW()
+//       WHERE id = $1
+//     `, [email_config_id]);
+    
+//     return {
+//       success: true,
+//       lead_id: leadId,
+//       is_new: existingLead.rows.length === 0,
+//       extracted_data: extractedData
+//     };
+    
+//   } catch (error) {
+//     console.error('Process email error:', error);
+    
+//     // Log failure with ON CONFLICT handling
+//     try {
+//       await pool.query(`
+//         INSERT INTO email_scan_logs (
+//           email_config_id, company_id, message_id,
+//           from_email, subject, status, error_message, created_at
+//         )
+//         VALUES ($1, $2, $3, $4, $5, 'failed', $6, NOW())
+//         ON CONFLICT (email_config_id, message_id) 
+//         DO UPDATE SET 
+//           status = 'failed',
+//           error_message = EXCLUDED.error_message
+//       `, [email_config_id, company_id, message_id, email_from, email_subject, error.message]);
+//     } catch (logError) {
+//       console.error('Failed to log error:', logError);
+//     }
+    
+//     throw error;
+//   }
+// }
+
+
+
+
 async function processEmailForLead(emailData) {
   const {
     email_config_id,
@@ -10870,7 +11706,7 @@ async function processEmailForLead(emailData) {
   } = emailData;
   
   try {
-    // Check if this message was already processed
+    // Check if already processed
     const existingLog = await pool.query(
       'SELECT id, status FROM email_scan_logs WHERE email_config_id = $1 AND message_id = $2',
       [email_config_id, message_id]
@@ -10885,7 +11721,7 @@ async function processEmailForLead(emailData) {
       };
     }
     
-    // Extract lead using AI
+    // Extract and filter with AI
     const extractedData = await extractLeadFromEmail({
       from: email_from,
       subject: email_subject,
@@ -10893,8 +11729,34 @@ async function processEmailForLead(emailData) {
       company_id: company_id
     });
     
+    // AI determined this is NOT a lead - skip it
+    if (extractedData.is_lead === false) {
+      await pool.query(`
+        INSERT INTO email_scan_logs (
+          email_config_id, company_id, message_id,
+          from_email, subject, status, error_message, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'skipped', $6, NOW())
+        ON CONFLICT (email_config_id, message_id) DO NOTHING
+      `, [
+        email_config_id, 
+        company_id, 
+        message_id, 
+        email_from, 
+        email_subject,
+        `Not a lead: ${extractedData.reason}`
+      ]);
+      
+      console.log(`Skipped non-lead email: ${email_subject} - ${extractedData.reason}`);
+      return { 
+        skipped: true, 
+        reason: extractedData.reason,
+        is_lead: false
+      };
+    }
+    
+    // Must have at least phone OR email to be a valid lead
     if (!extractedData.phone_number && !extractedData.email) {
-      // Log skipped with ON CONFLICT handling
       await pool.query(`
         INSERT INTO email_scan_logs (
           email_config_id, company_id, message_id,
@@ -10923,17 +11785,24 @@ async function processEmailForLead(emailData) {
     );
     
     if (existingLead.rows.length > 0) {
+      // Update existing lead
       leadId = existingLead.rows[0].id;
       await pool.query(`
         UPDATE leads
         SET 
           name = COALESCE($1, name),
           email = COALESCE($2, email),
-          notes = COALESCE(notes || E'\\n', '') || $3,
+          notes = COALESCE(notes || E'\\n\\n', '') || $3,
           updated_at = CURRENT_TIMESTAMP
         WHERE id = $4
-      `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
+      `, [
+        extractedData.name, 
+        extractedData.email, 
+        `📧 Email (${new Date().toISOString().split('T')[0]}): ${email_subject}\n${extractedData.interest || ''}\nUrgency: ${extractedData.urgency || 'medium'}`,
+        leadId
+      ]);
     } else {
+      // Create new lead
       const newLead = await pool.query(`
         INSERT INTO leads (
           company_id, phone_number, name, email,
@@ -10941,11 +11810,17 @@ async function processEmailForLead(emailData) {
         )
         VALUES ($1, $2, $3, $4, 'email_inbox', $5)
         RETURNING id
-      `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
+      `, [
+        company_id, 
+        phone, 
+        extractedData.name || 'Email Lead', 
+        extractedData.email, 
+        `📧 ${email_subject}\n\nType: ${extractedData.lead_type || 'inquiry'}\nInterest: ${extractedData.interest || 'N/A'}\nUrgency: ${extractedData.urgency || 'medium'}\nNext Action: ${extractedData.next_action || 'Follow up'}`
+      ]);
       leadId = newLead.rows[0].id;
     }
     
-    // Log success with ON CONFLICT handling
+    // Log success
     await pool.query(`
       INSERT INTO email_scan_logs (
         email_config_id, company_id, lead_id, message_id,
@@ -10957,7 +11832,15 @@ async function processEmailForLead(emailData) {
         lead_id = EXCLUDED.lead_id,
         extracted_data = EXCLUDED.extracted_data,
         status = EXCLUDED.status
-    `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
+    `, [
+      email_config_id, 
+      company_id, 
+      leadId, 
+      message_id, 
+      email_from, 
+      email_subject, 
+      JSON.stringify(extractedData)
+    ]);
     
     // Update stats
     await pool.query(`
@@ -10969,17 +11852,20 @@ async function processEmailForLead(emailData) {
       WHERE id = $1
     `, [email_config_id]);
     
+    console.log(`✅ Lead created: ${extractedData.name || extractedData.email} (${extractedData.lead_type})`);
+    
     return {
       success: true,
       lead_id: leadId,
       is_new: existingLead.rows.length === 0,
-      extracted_data: extractedData
+      extracted_data: extractedData,
+      lead_type: extractedData.lead_type,
+      confidence: extractedData.confidence
     };
     
   } catch (error) {
     console.error('Process email error:', error);
     
-    // Log failure with ON CONFLICT handling
     try {
       await pool.query(`
         INSERT INTO email_scan_logs (
@@ -11190,6 +12076,708 @@ async function getValidAccessToken(config) {
   
   return decryptToken(config.oauth_access_token);
 }
+
+
+
+
+// ============================================
+// GOOGLE CALENDAR OAUTH & INTEGRATION
+// ============================================
+
+app.get('/api/calendar/oauth/google/start', async (req, res) => {
+  try {
+    const { company_id, user_email } = req.query;
+    
+    if (!company_id || !user_email) {
+      return res.status(400).json({ error: 'company_id and user_email required' });
+    }
+    
+    const state = Buffer.from(JSON.stringify({
+      company_id,
+      user_email,
+      provider: 'google',
+      timestamp: Date.now(),
+      nonce: Math.random().toString(36).substr(2, 9)
+    })).toString('base64');
+    
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+    
+    const scopes = [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events'
+    ].join(' ');
+    
+    const authUrl = 
+      `https://accounts.google.com/o/oauth2/v2/auth?` +
+      `client_id=${process.env.GOOGLE_CLIENT_ID}&` +
+      `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+      `response_type=code&` +
+      `scope=${encodeURIComponent(scopes)}&` +
+      `access_type=offline&` +
+      `state=${encodeURIComponent(state)}&` +
+      `prompt=consent`;
+    
+    logRequest('GET', '/api/calendar/oauth/google/start', 200);
+    res.json({ success: true, auth_url: authUrl });
+    
+  } catch (error) {
+    console.error('Google Calendar OAuth start error:', error);
+    logRequest('GET', '/api/calendar/oauth/google/start', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/calendar/oauth/google/callback', async (req, res) => {
+  try {
+    const { code, state, error: oauth_error } = req.query;
+    
+    if (oauth_error) {
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>OAuth Error</title></head>
+        <body style="font-family: Arial; padding: 50px; text-align: center;">
+          <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
+            <div style="color: #dc3545; font-size: 24px; margin-bottom: 20px;">❌ OAuth Error</div>
+            <p>${oauth_error}</p>
+            <a href="/dashboard?tab=calendar" style="color: #667eea;">← Back to Dashboard</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+    
+    const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
+    const { company_id, user_email } = stateData;
+    
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+    
+    // Exchange code for tokens
+    const tokenResponse = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code'
+      }
+    );
+    
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+    if (!refresh_token) {
+      return res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Setup Required</title></head>
+        <body style="font-family: Arial; padding: 50px; text-align: center;">
+          <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
+            <div style="color: #ff9800; font-size: 24px; margin-bottom: 20px;">⚠️ Re-authorization Required</div>
+            <p>Please revoke access in Google Account settings and try again.</p>
+            <a href="https://myaccount.google.com/permissions" target="_blank" style="color: #667eea;">Google Permissions</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+    
+    // Get calendar info
+    const calendarResponse = await axios.get(
+      'https://www.googleapis.com/calendar/v3/users/me/calendarList/primary',
+      {
+        headers: { 'Authorization': `Bearer ${access_token}` }
+      }
+    );
+    
+    const calendarTimezone = calendarResponse.data.timeZone || 'Asia/Kolkata';
+    
+    // Encrypt tokens (reuse email encryption functions)
+    const encryptedAccessToken = encryptToken(access_token);
+    const encryptedRefreshToken = encryptToken(refresh_token);
+    
+    if (!encryptedAccessToken || !encryptedRefreshToken) {
+      throw new Error('Token encryption failed');
+    }
+    
+    // Save to database
+    await pool.query(`
+      INSERT INTO calendar_configs (
+        company_id, user_email, provider,
+        oauth_access_token, oauth_refresh_token,
+        oauth_token_expires_at, calendar_timezone, is_active
+      )
+      VALUES ($1, $2, 'google', $3, $4, NOW() + $5 * INTERVAL '1 second', $6, TRUE)
+      ON CONFLICT (company_id, user_email, provider) DO UPDATE
+      SET 
+        oauth_access_token = EXCLUDED.oauth_access_token,
+        oauth_refresh_token = EXCLUDED.oauth_refresh_token,
+        oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
+        calendar_timezone = EXCLUDED.calendar_timezone,
+        is_active = TRUE,
+        updated_at = CURRENT_TIMESTAMP
+    `, [company_id, user_email, encryptedAccessToken, encryptedRefreshToken, expires_in, calendarTimezone]);
+    
+    logRequest('GET', '/api/calendar/oauth/google/callback', 200);
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Google Calendar Connected</title>
+        <style>
+          body { font-family: Arial; padding: 50px; background: #f5f5f5; text-align: center; }
+          .container { background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; }
+          .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+          .btn { background: #667eea; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="success">✅ Google Calendar Connected!</div>
+          <p><strong>Email:</strong> ${user_email}</p>
+          <p><strong>Timezone:</strong> ${calendarTimezone}</p>
+          <p>Your calendar is now integrated. Bookings will be automatically synced.</p>
+          <a href="/dashboard?tab=calendar" class="btn">Go to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+    
+  } catch (error) {
+    console.error('Google Calendar OAuth callback error:', error);
+    logRequest('GET', '/api/calendar/oauth/google/callback', 500);
+    res.status(500).send(`Error: ${error.message}`);
+  }
+});
+
+
+
+
+
+// ============================================
+// CALENDAR HELPER FUNCTIONS
+// ============================================
+
+async function getValidCalendarToken(calendar_config) {
+  /**
+   * Refresh Google Calendar token if expired
+   */
+  const now = new Date();
+  const expiresAt = new Date(calendar_config.oauth_token_expires_at);
+  
+  if (expiresAt <= new Date(now.getTime() + 5 * 60 * 1000)) {
+    console.log(`Calendar token expired for ${calendar_config.user_email}, refreshing...`);
+    return await refreshCalendarToken(calendar_config);
+  }
+  
+  return decryptToken(calendar_config.oauth_access_token);
+}
+
+async function refreshCalendarToken(calendar_config) {
+  /**
+   * Refresh expired Google Calendar token
+   */
+  try {
+    const refreshToken = decryptToken(calendar_config.oauth_refresh_token);
+    
+    if (!refreshToken) {
+      throw new Error('No refresh token available');
+    }
+    
+    const response = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+      }
+    );
+    
+    const { access_token, expires_in } = response.data;
+    
+    // Update in database
+    await pool.query(`
+      UPDATE calendar_configs
+      SET 
+        oauth_access_token = $1,
+        oauth_token_expires_at = NOW() + $2 * INTERVAL '1 second',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [encryptToken(access_token), expires_in, calendar_config.id]);
+    
+    console.log(`✅ Calendar token refreshed for ${calendar_config.user_email}`);
+    return access_token;
+    
+  } catch (error) {
+    console.error('Calendar token refresh failed:', error);
+    
+    // Deactivate config
+    await pool.query(`
+      UPDATE calendar_configs
+      SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+    `, [calendar_config.id]);
+    
+    throw new Error('Calendar token refresh failed. Please reconnect your account.');
+  }
+}
+
+
+async function createGoogleCalendarEvent(calendar_config_id, eventData) {
+  /**
+   * Create event in Google Calendar
+   * eventData: { title, description, start_time, end_time, attendees, lead_id, booking_id }
+   */
+  try {
+    const config = await pool.query(
+      'SELECT * FROM calendar_configs WHERE id = $1 AND is_active = TRUE',
+      [calendar_config_id]
+    );
+    
+    if (config.rows.length === 0) {
+      throw new Error('Calendar config not found or inactive');
+    }
+    
+    const calendarConfig = config.rows[0];
+    const accessToken = await getValidCalendarToken(calendarConfig);
+    
+    // Format attendees
+    const attendees = eventData.attendees?.map(email => ({ email })) || [];
+    
+    // Create event payload
+    const event = {
+      summary: eventData.title,
+      description: eventData.description || '',
+      start: {
+        dateTime: new Date(eventData.start_time).toISOString(),
+        timeZone: calendarConfig.calendar_timezone
+      },
+      end: {
+        dateTime: new Date(eventData.end_time).toISOString(),
+        timeZone: calendarConfig.calendar_timezone
+      },
+      attendees: attendees,
+      conferenceData: {
+        createRequest: {
+          requestId: `meet_${Date.now()}`,
+          conferenceSolutionKey: { type: 'hangoutsMeet' }
+        }
+      },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 },
+          { method: 'popup', minutes: 30 }
+        ]
+      }
+    };
+    
+    // Create event in Google Calendar
+    const response = await axios.post(
+      `https://www.googleapis.com/calendar/v3/calendars/${calendarConfig.calendar_id}/events`,
+      event,
+      {
+        params: { conferenceDataVersion: 1 },
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+      }
+    );
+    
+    const createdEvent = response.data;
+    const meetingLink = createdEvent.hangoutLink || createdEvent.conferenceData?.entryPoints?.[0]?.uri;
+    
+    // Save to database - FIXED: Only insert lead_id if it exists and is valid
+    const insertQuery = eventData.lead_id 
+      ? `INSERT INTO calendar_events (
+           calendar_config_id, lead_id, booking_id,
+           event_id, title, description, start_time, end_time,
+           attendees, meeting_link, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'confirmed')`
+      : `INSERT INTO calendar_events (
+           calendar_config_id, booking_id,
+           event_id, title, description, start_time, end_time,
+           attendees, meeting_link, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'confirmed')`;
+    
+    const insertParams = eventData.lead_id
+      ? [
+          calendar_config_id,
+          eventData.lead_id,
+          eventData.booking_id || null,
+          createdEvent.id,
+          eventData.title,
+          eventData.description || null,
+          eventData.start_time,
+          eventData.end_time,
+          JSON.stringify(attendees),
+          meetingLink
+        ]
+      : [
+          calendar_config_id,
+          eventData.booking_id || null,
+          createdEvent.id,
+          eventData.title,
+          eventData.description || null,
+          eventData.start_time,
+          eventData.end_time,
+          JSON.stringify(attendees),
+          meetingLink
+        ];
+    
+    await pool.query(insertQuery, insertParams);
+    
+    console.log(`✅ Calendar event created: ${createdEvent.id}`);
+    
+    return {
+      event_id: createdEvent.id,
+      meeting_link: meetingLink,
+      calendar_link: createdEvent.htmlLink
+    };
+    
+  } catch (error) {
+    console.error('Create calendar event error:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+async function checkCalendarAvailability(calendar_config_id, start_time, end_time) {
+  /**
+   * Check if time slot is available in calendar
+   */
+  try {
+    const config = await pool.query(
+      'SELECT * FROM calendar_configs WHERE id = $1 AND is_active = TRUE',
+      [calendar_config_id]
+    );
+    
+    if (config.rows.length === 0) {
+      throw new Error('Calendar config not found');
+    }
+    
+    const calendarConfig = config.rows[0];
+    const accessToken = await getValidCalendarToken(calendarConfig);
+    
+    // Check free/busy
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/freeBusy',
+      {
+        timeMin: new Date(start_time).toISOString(),
+        timeMax: new Date(end_time).toISOString(),
+        items: [{ id: calendarConfig.calendar_id }]
+      },
+      {
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+      }
+    );
+    
+    const busySlots = response.data.calendars[calendarConfig.calendar_id]?.busy || [];
+    const isAvailable = busySlots.length === 0;
+    
+    return {
+      available: isAvailable,
+      busy_slots: busySlots
+    };
+    
+  } catch (error) {
+    console.error('Check availability error:', error);
+    throw error;
+  }
+}
+
+
+
+
+
+// ============================================
+// CALENDAR API ROUTES
+// ============================================
+
+app.get('/api/calendar/status/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        id, user_email, provider, calendar_id, calendar_timezone,
+        is_active, oauth_token_expires_at,
+        EXTRACT(DAY FROM (oauth_token_expires_at - NOW())) as days_until_expiry
+      FROM calendar_configs
+      WHERE company_id = $1
+      ORDER BY created_at DESC
+    `, [company_id]);
+    
+    logRequest('GET', `/api/calendar/status/${company_id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows.map(row => ({
+        ...row,
+        needs_reauth: row.days_until_expiry < 7
+      }))
+    });
+    
+  } catch (error) {
+    console.error('Get calendar status error:', error);
+    logRequest('GET', `/api/calendar/status/${company_id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/calendar/create-event', async (req, res) => {
+  try {
+    const {
+      calendar_config_id,
+      lead_id,
+      booking_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      attendees
+    } = req.body;
+    
+    if (!calendar_config_id || !title || !start_time || !end_time) {
+      return res.status(400).json({
+        error: 'calendar_config_id, title, start_time, end_time required'
+      });
+    }
+
+    // Validate lead_id exists if provided
+    if (lead_id) {
+      const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1', [lead_id]);
+      if (leadCheck.rows.length === 0) {
+        return res.status(400).json({
+          error: 'Invalid lead_id: Lead does not exist'
+        });
+      }
+    }
+    
+    const result = await createGoogleCalendarEvent(calendar_config_id, {
+      lead_id: lead_id || null,
+      booking_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      attendees: attendees || []
+    });
+
+    
+    logRequest('POST', '/api/calendar/create-event', 201);
+    res.status(201).json({ success: true, data: result });
+    
+  } catch (error) {
+    console.error('Create event error:', error);
+    logRequest('POST', '/api/calendar/create-event', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/calendar/check-availability', async (req, res) => {
+  try {
+    const { calendar_config_id, start_time, end_time } = req.body;
+    
+    if (!calendar_config_id || !start_time || !end_time) {
+      return res.status(400).json({
+        error: 'calendar_config_id, start_time, end_time required'
+      });
+    }
+    
+    const result = await checkCalendarAvailability(
+      calendar_config_id,
+      start_time,
+      end_time
+    );
+    
+    logRequest('POST', '/api/calendar/check-availability', 200);
+    res.json({ success: true, data: result });
+    
+  } catch (error) {
+    console.error('Check availability error:', error);
+    logRequest('POST', '/api/calendar/check-availability', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/calendar/disconnect/:calendar_config_id', async (req, res) => {
+  try {
+    const { calendar_config_id } = req.params;
+    
+    await pool.query(
+      'DELETE FROM calendar_configs WHERE id = $1',
+      [calendar_config_id]
+    );
+    
+    logRequest('DELETE', `/api/calendar/disconnect/${calendar_config_id}`, 200);
+    res.json({ success: true, message: 'Calendar disconnected' });
+    
+  } catch (error) {
+    console.error('Disconnect calendar error:', error);
+    logRequest('DELETE', `/api/calendar/disconnect/${calendar_config_id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// Get active calendar config for a company (for n8n workflows)
+app.get('/api/calendar/active/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    // Get default calendar config, or first active one
+    const result = await pool.query(`
+      SELECT 
+        id as calendar_config_id,
+        user_email,
+        calendar_id,
+        calendar_timezone,
+        is_active
+      FROM calendar_configs
+      WHERE company_id = $1 AND is_active = TRUE
+      ORDER BY is_default DESC NULLS LAST, created_at ASC
+      LIMIT 1
+    `, [company_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        error: 'No active calendar configuration found',
+        message: 'Please connect a Google Calendar account first'
+      });
+    }
+    
+    logRequest('GET', `/api/calendar/active/${company_id}`, 200);
+    res.json({ 
+      success: true, 
+      data: result.rows[0] 
+    });
+    
+  } catch (error) {
+    console.error('Get active calendar error:', error);
+    logRequest('GET', `/api/calendar/active/${company_id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// Get available time slots for a date range
+app.post('/api/calendar/available-slots', async (req, res) => {
+  try {
+    const { 
+      calendar_config_id, 
+      start_date, 
+      end_date,
+      duration_minutes = 60,
+      buffer_minutes = 15
+    } = req.body;
+    
+    if (!calendar_config_id || !start_date || !end_date) {
+      return res.status(400).json({
+        error: 'calendar_config_id, start_date, end_date required'
+      });
+    }
+    
+    const config = await pool.query(
+      'SELECT * FROM calendar_configs WHERE id = $1 AND is_active = TRUE',
+      [calendar_config_id]
+    );
+    
+    if (config.rows.length === 0) {
+      return res.status(404).json({ error: 'Calendar config not found' });
+    }
+    
+    const calendarConfig = config.rows[0];
+    const accessToken = await getValidCalendarToken(calendarConfig);
+    
+    // Get busy times from Google Calendar
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/freeBusy',
+      {
+        timeMin: new Date(start_date).toISOString(),
+        timeMax: new Date(end_date).toISOString(),
+        items: [{ id: calendarConfig.calendar_id }]
+      },
+      {
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+      }
+    );
+    
+    const busySlots = response.data.calendars[calendarConfig.calendar_id]?.busy || [];
+    
+    // Parse working hours from config
+    const workingHours = calendarConfig.working_hours || {
+      start: "09:00",
+      end: "18:00",
+      days: [1, 2, 3, 4, 5] // Mon-Fri
+    };
+    
+    // Generate available slots
+    const availableSlots = [];
+    let currentDate = new Date(start_date);
+    const endDateTime = new Date(end_date);
+    
+    while (currentDate <= endDateTime) {
+      const dayOfWeek = currentDate.getDay();
+      
+      // Check if this day is a working day
+      if (workingHours.days.includes(dayOfWeek)) {
+        const [startHour, startMin] = workingHours.start.split(':').map(Number);
+        const [endHour, endMin] = workingHours.end.split(':').map(Number);
+        
+        let slotStart = new Date(currentDate);
+        slotStart.setHours(startHour, startMin, 0, 0);
+        
+        const dayEnd = new Date(currentDate);
+        dayEnd.setHours(endHour, endMin, 0, 0);
+        
+        // Generate slots for this day
+        while (slotStart < dayEnd) {
+          const slotEnd = new Date(slotStart.getTime() + duration_minutes * 60000);
+          
+          // Check if slot overlaps with busy times
+          const isAvailable = !busySlots.some(busy => {
+            const busyStart = new Date(busy.start);
+            const busyEnd = new Date(busy.end);
+            return (slotStart < busyEnd && slotEnd > busyStart);
+          });
+          
+          if (isAvailable && slotEnd <= dayEnd) {
+            availableSlots.push({
+              start: slotStart.toISOString(),
+              end: slotEnd.toISOString(),
+              duration_minutes: duration_minutes
+            });
+          }
+          
+          // Move to next slot (including buffer)
+          slotStart = new Date(slotStart.getTime() + (duration_minutes + buffer_minutes) * 60000);
+        }
+      }
+      
+      // Move to next day
+      currentDate.setDate(currentDate.getDate() + 1);
+      currentDate.setHours(0, 0, 0, 0);
+    }
+    
+    logRequest('POST', '/api/calendar/available-slots', 200);
+    res.json({ 
+      success: true, 
+      data: {
+        available_slots: availableSlots,
+        timezone: calendarConfig.calendar_timezone,
+        total_slots: availableSlots.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get available slots error:', error);
+    logRequest('POST', '/api/calendar/available-slots', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 
 

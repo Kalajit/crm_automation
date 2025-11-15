@@ -527,7 +527,6 @@ CREATE INDEX IF NOT EXISTS idx_leads_source_config ON leads(lead_source_config_i
 
 
 
-
 -- ============================================
 -- DYNAMIC CUSTOM FIELDS SYSTEM
 -- ============================================
@@ -736,6 +735,77 @@ CREATE TABLE email_scan_logs (
 
 
 
+
+-- ============================================
+-- CALENDAR INTEGRATION TABLES
+-- ============================================
+
+DROP TABLE IF EXISTS calendar_configs CASCADE;
+CREATE TABLE calendar_configs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  user_email VARCHAR(255) NOT NULL,
+  provider VARCHAR(50) NOT NULL, -- 'google', 'outlook'
+  
+  -- OAuth credentials (encrypted)
+  oauth_access_token TEXT,
+  oauth_refresh_token TEXT,
+  oauth_token_expires_at TIMESTAMP,
+  
+  -- Google Calendar specific
+  calendar_id VARCHAR(255) DEFAULT 'primary', -- Which calendar to use
+  calendar_timezone VARCHAR(100) DEFAULT 'Asia/Kolkata',
+  
+  -- Settings
+  default_event_duration INTEGER DEFAULT 60, -- minutes
+  buffer_time INTEGER DEFAULT 15, -- minutes between meetings
+  working_hours JSONB DEFAULT '{"start": "09:00", "end": "18:00", "days": [1,2,3,4,5]}'::jsonb,
+
+  is_default BOOLEAN DEFAULT FALSE,
+  
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  
+  UNIQUE(company_id, user_email, provider)
+);
+
+
+
+DROP TABLE IF EXISTS calendar_events CASCADE;
+CREATE TABLE calendar_events (
+  id SERIAL PRIMARY KEY,
+  calendar_config_id INTEGER NOT NULL REFERENCES calendar_configs(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL,
+  
+  -- Event details
+  event_id VARCHAR(255) NOT NULL, -- Google/Outlook event ID
+  title VARCHAR(500) NOT NULL,
+  description TEXT,
+  start_time TIMESTAMP NOT NULL,
+  end_time TIMESTAMP NOT NULL,
+  
+  -- Attendees
+  attendees JSONB, -- [{"email": "user@example.com", "status": "accepted"}]
+  
+  -- Meeting links
+  meeting_link TEXT, -- Google Meet link
+  
+  -- Status
+  status VARCHAR(50) DEFAULT 'confirmed', -- confirmed, cancelled, rescheduled
+  reminder_sent BOOLEAN DEFAULT FALSE,
+  
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  
+  UNIQUE(calendar_config_id, event_id)
+);
+
+
+
+
+
 -- ============================================
 -- INDEXES FOR PERFORMANCE
 -- ============================================
@@ -880,6 +950,21 @@ CREATE INDEX IF NOT EXISTS idx_email_scan_logs_lead ON email_scan_logs(lead_id);
 
 
 
+
+-- Indexes
+CREATE INDEX idx_calendar_configs_company ON calendar_configs(company_id, is_active);
+CREATE INDEX idx_calendar_events_lead ON calendar_events(lead_id);
+CREATE INDEX idx_calendar_events_booking ON calendar_events(booking_id);
+CREATE INDEX idx_calendar_events_time ON calendar_events(start_time, end_time);
+
+
+-- Add indexes for faster lookups
+CREATE INDEX IF NOT EXISTS idx_calendar_configs_company_active ON calendar_configs(company_id, is_active) WHERE is_active = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_calendar_events_start_time ON calendar_events(start_time) WHERE status = 'confirmed';
+
+
+
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
 -- ============================================
@@ -979,6 +1064,16 @@ CREATE TRIGGER update_email_configs_timestamp BEFORE UPDATE ON email_configs FOR
 
 DROP TRIGGER IF EXISTS update_email_configs_timestamp ON email_configs;
 CREATE TRIGGER update_email_configs_timestamp BEFORE UPDATE ON email_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+
+
+-- Triggers
+DROP TRIGGER IF EXISTS update_calendar_configs_timestamp ON calendar_configs;
+CREATE TRIGGER update_calendar_configs_timestamp BEFORE UPDATE ON calendar_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_calendar_events_timestamp ON calendar_events;
+CREATE TRIGGER update_calendar_events_timestamp BEFORE UPDATE ON calendar_events FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
 
@@ -1224,6 +1319,13 @@ Your primary purpose is to qualify leads who have shown interest in medical supp
 - Language capabilities (English/Kannada/Hindi)
 - Delivery location and logistics preferences
 
+
+## BOOKING CAPABILITIES:
+- When the customer wants to book/schedule a session, ask for their preferred date and time
+- Extract the date/time from their response (e.g., "tomorrow at 3pm", "Monday at 10am")
+- Confirm the booking and let them know they''ll receive an email confirmation
+- If their preferred time is not available, offer alternative time slots
+
 ## Response Refinement
 - When discussing needs: "Your setup sounds interesting. Could you share more about [specific need]?"
 - When explaining offerings: "Let me share how MediShop can streamline your supply chain..."
@@ -1380,6 +1482,13 @@ Your primary purpose is to assist callers with scheduling appointments, answerin
 - Contact details and availability
 - Language capabilities (English/Kannada/Hindi)
 - Accessibility to Bangalore facility
+
+
+## BOOKING CAPABILITIES:
+- When the customer wants to book/schedule a session, ask for their preferred date and time
+- Extract the date/time from their response (e.g., "tomorrow at 3pm", "Monday at 10am")
+- Confirm the booking and let them know they''ll receive an email confirmation
+- If their preferred time is not available, offer alternative time slots
 
 ## Response Refinement
 - When discussing needs: "I understand your concern. Could you share more about [specific need]?"
@@ -1778,6 +1887,14 @@ RETURNS BOOLEAN AS $$
   FROM email_configs
   WHERE id = config_id;
 $$ LANGUAGE SQL;
+
+
+
+
+-- Ensure only one default per company
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_configs_default 
+ON calendar_configs(company_id, is_default) 
+WHERE is_default = TRUE;
 
 
 
