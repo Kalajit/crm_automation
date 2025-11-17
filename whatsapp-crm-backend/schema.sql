@@ -857,6 +857,7 @@ CREATE INDEX IF NOT EXISTS idx_faq_active ON faq_templates(is_active);
 CREATE INDEX IF NOT EXISTS idx_call_logs_company ON call_logs(company_id);
 CREATE INDEX IF NOT EXISTS idx_call_logs_lead ON call_logs(lead_id);
 CREATE INDEX IF NOT EXISTS idx_call_logs_call_sid ON call_logs(call_sid);
+CREATE INDEX IF NOT EXISTS idx_call_logs_status ON call_logs(call_status);
 
 -- Scheduled calls indexes
 CREATE INDEX IF NOT EXISTS idx_scheduled_calls_company ON scheduled_calls(company_id);

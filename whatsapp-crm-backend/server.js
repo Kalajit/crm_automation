@@ -10,6 +10,7 @@ const http = require('http');
 const session = require('express-session');
 const multer = require('multer');
 const path = require('path');
+const nodemailer = require('nodemailer');
 const fs = require('fs');
 
 
@@ -10430,10 +10431,14 @@ app.get('/api/email/oauth/gmail/start', async (req, res) => {
     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/gmail/callback`;
     
     // Gmail OAuth scopes needed for reading emails
-    const scopes = [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.modify' // For marking as read
-    ].join(' ');
+    // const scopes = [
+    //   'https://www.googleapis.com/auth/gmail.readonly',
+    //   'https://www.googleapis.com/auth/gmail.modify',
+    //   'https://www.googleapis.com/auth/gmail.send' 
+    // ].join(' ');
+
+
+    const scopes = 'https://mail.google.com/';
     
     const authUrl = 
       `https://accounts.google.com/o/oauth2/v2/auth?` +
@@ -10725,6 +10730,7 @@ app.get('/api/email/oauth/outlook/start', async (req, res) => {
     const scopes = [
       'https://graph.microsoft.com/Mail.Read',
       'https://graph.microsoft.com/Mail.ReadWrite',
+      'https://graph.microsoft.com/Mail.Send',
       'offline_access'
     ].join(' ');
     
@@ -12534,45 +12540,106 @@ app.post('/api/calendar/create-event', async (req, res) => {
       description,
       start_time,
       end_time,
-      attendees
+      attendees,
+      send_confirmation = true // New parameter, default true
     } = req.body;
     
+    // Validation
     if (!calendar_config_id || !title || !start_time || !end_time) {
       return res.status(400).json({
         error: 'calendar_config_id, title, start_time, end_time required'
       });
     }
 
-    // Validate lead_id exists if provided
+    // Validate lead_id if provided
+    let lead = null;
     if (lead_id) {
-      const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1', [lead_id]);
+      const leadCheck = await pool.query(
+        'SELECT id, email, name FROM leads WHERE id = $1',
+        [lead_id]
+      );
+      
       if (leadCheck.rows.length === 0) {
         return res.status(400).json({
           error: 'Invalid lead_id: Lead does not exist'
         });
       }
+      lead = leadCheck.rows[0];
     }
     
-    const result = await createGoogleCalendarEvent(calendar_config_id, {
+    // Get company_id from calendar config
+    const configResult = await pool.query(
+      'SELECT company_id FROM calendar_configs WHERE id = $1',
+      [calendar_config_id]
+    );
+    
+    if (configResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Calendar config not found' });
+    }
+    
+    const company_id = configResult.rows[0].company_id;
+    
+    // Prepare attendees list
+    const attendeesList = attendees || (lead?.email ? [lead.email] : []);
+    
+    // Create calendar event (using your existing function)
+    const calendarResult = await createGoogleCalendarEvent(calendar_config_id, {
       lead_id: lead_id || null,
       booking_id,
       title,
       description,
       start_time,
       end_time,
-      attendees: attendees || []
+      attendees: attendeesList
     });
-
+    
+    // Get the created calendar event ID from database
+    const eventResult = await pool.query(
+      'SELECT id FROM calendar_events WHERE event_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [calendarResult.event_id]
+    );
+    
+    if (eventResult.rows.length === 0) {
+      throw new Error('Calendar event created but not found in database');
+    }
+    
+    const calendar_event_id = eventResult.rows[0].id;
+    
+    // Send confirmation email if requested and email is available
+    let emailResult = null;
+    if (send_confirmation) {
+      emailResult = await sendCalendarConfirmationEmail(
+        calendar_event_id,
+        company_id,
+        lead_id
+      );
+    }
     
     logRequest('POST', '/api/calendar/create-event', 201);
-    res.status(201).json({ success: true, data: result });
+    res.status(201).json({
+      success: true,
+      data: {
+        ...calendarResult,
+        calendar_event_id,
+        confirmation_email: emailResult
+      },
+      message: emailResult?.success 
+        ? `Event created and confirmation email sent to ${emailResult.email_sent_to}` 
+        : 'Event created successfully'
+    });
     
   } catch (error) {
     console.error('Create event error:', error);
     logRequest('POST', '/api/calendar/create-event', 500);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
+
+
+
 
 app.post('/api/calendar/check-availability', async (req, res) => {
   try {
@@ -12778,6 +12845,637 @@ app.post('/api/calendar/available-slots', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
+
+
+
+// ============================================
+// CALENDAR CONFIRMATION EMAIL API
+// ============================================
+
+
+// Helper function to get company's email configuration
+async function getCompanyEmailConfig(company_id) {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        id,
+        email_address,
+        provider,
+        oauth_access_token,
+        oauth_refresh_token,
+        oauth_token_expires_at
+      FROM email_configs
+      WHERE company_id = $1 AND is_active = TRUE
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [company_id]);
+    
+    if (result.rows.length === 0) {
+      throw new Error('No active email configuration found for this company. Please connect an email account first.');
+    }
+    
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error fetching email config:', error);
+    throw error;
+  }
+}
+
+
+
+
+// Helper function to create email transporter
+async function createEmailTransporter(emailConfig) {
+  try {
+    // Get a fresh valid access token
+    const accessToken = await getValidAccessToken(emailConfig);
+    const refreshToken = decryptToken(emailConfig.oauth_refresh_token);
+    
+    if (emailConfig.provider === 'gmail') {
+      // Gmail OAuth2 configuration for sending emails
+      return nodemailer.createTransport({
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        auth: {
+          type: 'OAuth2',
+          user: emailConfig.email_address,
+          clientId: process.env.GMAIL_CLIENT_ID,
+          clientSecret: process.env.GMAIL_CLIENT_SECRET,
+          refreshToken: refreshToken,
+          accessToken: accessToken
+        }
+      });
+    } else if (emailConfig.provider === 'outlook') {
+      return nodemailer.createTransporter({
+        host: 'smtp.office365.com',
+        port: 587,
+        secure: false,
+        auth: {
+          type: 'OAuth2',
+          user: emailConfig.email_address,
+          clientId: process.env.OUTLOOK_CLIENT_ID,
+          clientSecret: process.env.OUTLOOK_CLIENT_SECRET,
+          refreshToken: refreshToken,
+          accessToken: accessToken
+        }
+      });
+    } else {
+      throw new Error(`Unsupported email provider: ${emailConfig.provider}`);
+    }
+  } catch (error) {
+    console.error('Error creating email transporter:', error);
+    throw error;
+  }
+}
+
+
+
+
+
+// Generate email HTML template
+function generateConfirmationEmailHTML(data) {
+  const {
+    lead_name,
+    company_name,
+    event_title,
+    event_description,
+    start_time,
+    end_time,
+    meeting_link,
+    calendar_link,
+    timezone
+  } = data;
+  
+  const startDate = new Date(start_time);
+  const endDate = new Date(end_time);
+  
+  const dateStr = startDate.toLocaleDateString('en-IN', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  });
+  
+  const timeStr = `${startDate.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit'
+  })} - ${endDate.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit'
+  })} ${timezone || 'IST'}`;
+  
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Appointment Confirmation</title>
+      <style>
+        body {
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          line-height: 1.6;
+          color: #333;
+          max-width: 600px;
+          margin: 0 auto;
+          padding: 20px;
+          background-color: #f5f5f5;
+        }
+        .container {
+          background: white;
+          border-radius: 10px;
+          padding: 40px;
+          box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+          text-align: center;
+          margin-bottom: 30px;
+          padding-bottom: 20px;
+          border-bottom: 3px solid #667eea;
+        }
+        .header h1 {
+          color: #667eea;
+          margin: 0;
+          font-size: 28px;
+        }
+        .check-icon {
+          font-size: 48px;
+          color: #28a745;
+          margin-bottom: 10px;
+        }
+        .details {
+          background: #f8f9fa;
+          padding: 25px;
+          border-radius: 8px;
+          margin: 25px 0;
+        }
+        .detail-row {
+          margin: 15px 0;
+          padding: 10px 0;
+          border-bottom: 1px solid #e9ecef;
+        }
+        .detail-row:last-child {
+          border-bottom: none;
+        }
+        .detail-label {
+          font-weight: bold;
+          color: #495057;
+          display: block;
+          margin-bottom: 5px;
+        }
+        .detail-value {
+          color: #212529;
+          font-size: 16px;
+        }
+        .meeting-link {
+          background: #667eea;
+          color: white;
+          padding: 15px 30px;
+          text-decoration: none;
+          border-radius: 5px;
+          display: inline-block;
+          margin: 20px 0;
+          font-weight: bold;
+        }
+        .meeting-link:hover {
+          background: #5568d3;
+        }
+        .calendar-link {
+          background: #28a745;
+          color: white;
+          padding: 12px 25px;
+          text-decoration: none;
+          border-radius: 5px;
+          display: inline-block;
+          margin: 10px 5px;
+          font-size: 14px;
+        }
+        .calendar-link:hover {
+          background: #218838;
+        }
+        .footer {
+          margin-top: 30px;
+          padding-top: 20px;
+          border-top: 1px solid #e9ecef;
+          text-align: center;
+          color: #6c757d;
+          font-size: 14px;
+        }
+        .note {
+          background: #fff3cd;
+          border-left: 4px solid #ffc107;
+          padding: 15px;
+          margin: 20px 0;
+          border-radius: 4px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <div class="check-icon">✓</div>
+          <h1>Appointment Confirmed!</h1>
+          <p style="color: #6c757d; margin: 10px 0 0 0;">Your appointment has been successfully scheduled</p>
+        </div>
+        
+        <p>Dear ${lead_name || 'Valued Customer'},</p>
+        
+        <p>This email confirms your upcoming appointment with <strong>${company_name}</strong>.</p>
+        
+        <div class="details">
+          <div class="detail-row">
+            <span class="detail-label">📅 Appointment Title</span>
+            <span class="detail-value">${event_title}</span>
+          </div>
+          
+          ${event_description ? `
+          <div class="detail-row">
+            <span class="detail-label">📝 Description</span>
+            <span class="detail-value">${event_description}</span>
+          </div>
+          ` : ''}
+          
+          <div class="detail-row">
+            <span class="detail-label">📆 Date</span>
+            <span class="detail-value">${dateStr}</span>
+          </div>
+          
+          <div class="detail-row">
+            <span class="detail-label">🕐 Time</span>
+            <span class="detail-value">${timeStr}</span>
+          </div>
+        </div>
+        
+        ${meeting_link ? `
+        <div style="text-align: center; margin: 30px 0;">
+          <a href="${meeting_link}" class="meeting-link">Join Meeting</a>
+          <p style="color: #6c757d; font-size: 14px; margin-top: 10px;">
+            Click the button above to join the meeting at the scheduled time
+          </p>
+        </div>
+        ` : ''}
+        
+        ${calendar_link ? `
+        <div style="text-align: center; margin: 20px 0;">
+          <a href="${calendar_link}" class="calendar-link">View in Calendar</a>
+        </div>
+        ` : ''}
+        
+        <div class="note">
+          <strong>⏰ Reminder:</strong> We'll send you a reminder 24 hours and 30 minutes before your appointment.
+        </div>
+        
+        <p style="margin-top: 30px;">
+          If you need to reschedule or cancel this appointment, please contact us as soon as possible.
+        </p>
+        
+        <div class="footer">
+          <p><strong>${company_name}</strong></p>
+          <p>This is an automated confirmation email.</p>
+          <p style="color: #adb5bd; font-size: 12px; margin-top: 15px;">
+            Please do not reply to this email. For questions, contact our support team.
+          </p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+
+
+/**
+ * Send confirmation email after calendar event creation
+ */
+async function sendCalendarConfirmationEmail(calendar_event_id, company_id, lead_id = null) {
+  try {
+    console.log(`📧 Attempting to send confirmation email for event ${calendar_event_id}...`);
+    
+    // Get calendar event details
+    const eventResult = await pool.query(`
+      SELECT 
+        ce.*,
+        cc.user_email as organizer_email,
+        cc.calendar_timezone
+      FROM calendar_events ce
+      JOIN calendar_configs cc ON ce.calendar_config_id = cc.id
+      WHERE ce.id = $1
+    `, [calendar_event_id]);
+    
+    if (eventResult.rows.length === 0) {
+      throw new Error('Calendar event not found');
+    }
+    
+    const event = eventResult.rows[0];
+    
+    // Get lead details
+    let lead = null;
+    if (lead_id || event.lead_id) {
+      const leadResult = await pool.query(`
+        SELECT name, email, phone_number
+        FROM leads
+        WHERE id = $1
+      `, [lead_id || event.lead_id]);
+      
+      if (leadResult.rows.length > 0) {
+        lead = leadResult.rows[0];
+      }
+    }
+    
+    // Get attendees from event or use lead email
+    const attendees = event.attendees ? (typeof event.attendees === 'string' ? JSON.parse(event.attendees) : event.attendees) : [];
+    const recipientEmail = lead?.email || (attendees.length > 0 ? (attendees[0].email || attendees[0]) : null);
+    
+    if (!recipientEmail) {
+      console.warn(`⚠️ No recipient email found for event ${calendar_event_id}. Skipping confirmation email.`);
+      return {
+        success: false,
+        reason: 'No recipient email available'
+      };
+    }
+    
+    // Get company details
+    const companyResult = await pool.query(
+      'SELECT name FROM companies WHERE id = $1',
+      [company_id]
+    );
+    
+    if (companyResult.rows.length === 0) {
+      throw new Error('Company not found');
+    }
+    
+    const company = companyResult.rows[0];
+    
+    // Get company's email configuration
+    const emailConfig = await getCompanyEmailConfig(company_id);
+    
+    // Create email transporter
+    const transporter = await createEmailTransporter(emailConfig);
+    
+    // Prepare email data
+    const emailData = {
+      lead_name: lead?.name || 'Valued Customer',
+      company_name: company.name,
+      event_title: event.title,
+      event_description: event.description,
+      start_time: event.start_time,
+      end_time: event.end_time,
+      meeting_link: event.meeting_link,
+      calendar_link: event.calendar_link || `https://calendar.google.com/calendar/event?eid=${event.event_id}`,
+      timezone: event.calendar_timezone
+    };
+    
+    // Generate email HTML
+    const emailHTML = generateConfirmationEmailHTML(emailData);
+    
+    // Send email
+    const mailOptions = {
+      from: `${company.name} <${emailConfig.email_address}>`,
+      to: recipientEmail,
+      subject: `Appointment Confirmation - ${event.title}`,
+      html: emailHTML
+    };
+    
+    const info = await transporter.sendMail(mailOptions);
+    
+    // Log email sent
+    await pool.query(`
+      INSERT INTO email_queue (
+        to_email,
+        subject,
+        body,
+        lead_id,
+        status,
+        sent_at
+      )
+      VALUES ($1, $2, $3, $4, 'sent', NOW())
+    `, [
+      recipientEmail,
+      mailOptions.subject,
+      'Appointment confirmation email',
+      lead_id || event.lead_id
+    ]);
+    
+    // Update calendar event to mark confirmation sent
+    await pool.query(`
+      UPDATE calendar_events
+      SET reminder_sent = TRUE
+      WHERE id = $1
+    `, [calendar_event_id]);
+    
+    console.log(`✅ Confirmation email sent successfully to ${recipientEmail}`);
+    
+    return {
+      success: true,
+      email_sent_to: recipientEmail,
+      message_id: info.messageId
+    };
+    
+  } catch (error) {
+    console.error('❌ Send confirmation email error:', error);
+    
+    // Log the error but don't fail the entire calendar creation
+    try {
+      await pool.query(`
+        INSERT INTO email_queue (
+          to_email,
+          subject,
+          body,
+          lead_id,
+          status,
+          error_message
+        )
+        VALUES ($1, $2, $3, $4, 'failed', $5)
+      `, [
+        'unknown',
+        'Calendar Confirmation',
+        'Failed to send',
+        lead_id,
+        error.message
+      ]);
+    } catch (logError) {
+      console.error('Failed to log email error:', logError);
+    }
+    
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+
+
+/**
+ * Send confirmation email for an existing calendar event
+ */
+app.post('/api/calendar/send-confirmation', async (req, res) => {
+  try {
+    const {
+      calendar_event_id,
+      company_id,
+      lead_id
+    } = req.body;
+    
+    if (!calendar_event_id || !company_id) {
+      return res.status(400).json({
+        error: 'calendar_event_id and company_id are required'
+      });
+    }
+    
+    const result = await sendCalendarConfirmationEmail(
+      calendar_event_id,
+      company_id,
+      lead_id
+    );
+    
+    if (result.success) {
+      logRequest('POST', '/api/calendar/send-confirmation', 200);
+      res.json({
+        success: true,
+        message: 'Confirmation email sent successfully',
+        email_sent_to: result.email_sent_to,
+        message_id: result.message_id
+      });
+    } else {
+      logRequest('POST', '/api/calendar/send-confirmation', 400);
+      res.status(400).json({
+        success: false,
+        error: result.error || result.reason
+      });
+    }
+    
+  } catch (error) {
+    console.error('Send confirmation email error:', error);
+    logRequest('POST', '/api/calendar/send-confirmation', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+/**
+ * Resend confirmation email for existing event
+ */
+app.post('/api/calendar/resend-confirmation/:event_id', async (req, res) => {
+  try {
+    const { event_id } = req.params;
+    
+    // Get event and company details
+    const eventResult = await pool.query(`
+      SELECT 
+        ce.id,
+        ce.lead_id,
+        cc.company_id
+      FROM calendar_events ce
+      JOIN calendar_configs cc ON ce.calendar_config_id = cc.id
+      WHERE ce.id = $1
+    `, [event_id]);
+    
+    if (eventResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Calendar event not found' });
+    }
+    
+    const event = eventResult.rows[0];
+    
+    const result = await sendCalendarConfirmationEmail(
+      event.id,
+      event.company_id,
+      event.lead_id
+    );
+    
+    if (result.success) {
+      logRequest('POST', `/api/calendar/resend-confirmation/${event_id}`, 200);
+      res.json({
+        success: true,
+        message: 'Confirmation email resent successfully',
+        email_sent_to: result.email_sent_to
+      });
+    } else {
+      logRequest('POST', `/api/calendar/resend-confirmation/${event_id}`, 400);
+      res.status(400).json({
+        success: false,
+        error: result.error || result.reason
+      });
+    }
+    
+  } catch (error) {
+    console.error('Resend confirmation error:', error);
+    logRequest('POST', `/api/calendar/resend-confirmation/${event_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+
+/**
+ * Get email sending status for a calendar event
+ */
+app.get('/api/calendar/email-status/:event_id', async (req, res) => {
+  try {
+    const { event_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        ce.id,
+        ce.reminder_sent,
+        ce.title,
+        ce.start_time,
+        eq.to_email,
+        eq.status as email_status,
+        eq.sent_at,
+        eq.error_message
+      FROM calendar_events ce
+      LEFT JOIN email_queue eq ON eq.lead_id = ce.lead_id 
+        AND eq.subject LIKE '%' || ce.title || '%'
+        AND eq.created_at >= ce.created_at
+      WHERE ce.id = $1
+      ORDER BY eq.created_at DESC
+      LIMIT 1
+    `, [event_id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Calendar event not found' });
+    }
+    
+    logRequest('GET', `/api/calendar/email-status/${event_id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Get email status error:', error);
+    logRequest('GET', `/api/calendar/email-status/${event_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+// module.exports = {
+//   sendCalendarConfirmationEmail,
+//   generateConfirmationEmailHTML,
+//   getCompanyEmailConfig,
+//   createEmailTransporter
+// };
 
 
 
