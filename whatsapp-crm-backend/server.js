@@ -901,9 +901,10 @@ app.patch('/api/leads/:lead_id', async (req, res) => {
 
 
 // GET SINGLE LEAD BY ID
-app.get('/api/leads/:lead_id', async (req, res) => {
+app.get('/api/leads/:lead_id(\\d+)', async (req, res) => {
+  
+  const { lead_id } = req.params;
   try {
-    const { lead_id } = req.params;
     
     const query = `
       SELECT l.*, c.name as company_name
@@ -922,7 +923,7 @@ app.get('/api/leads/:lead_id', async (req, res) => {
     logRequest('GET', `/api/leads/${lead_id}`, 200);
     res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    logRequest('GET', `/api/leads/${lead_id}`, 500);
+    logRequest('GET', `/api/leads/${lead_id}`, 500); 
     handleError(res, error);
   }
 });
@@ -6062,90 +6063,6 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
 
 
 
-// ============================================
-// WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
-// ============================================
-
-// app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
-//   try {
-//     const { entry } = req.body;
-    
-//     // Verify webhook (Meta requires this)
-//     if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
-//       const verifyToken = req.query['hub.verify_token'];
-      
-//       // Check if verify token matches any agent instance
-//       const agent = await pool.query(
-//         'SELECT id FROM agent_instances WHERE webhook_verify_token = $1',
-//         [verifyToken]
-//       );
-      
-//       if (agent.rows.length > 0) {
-//         return res.send(req.query['hub.challenge']);
-//       }
-//       return res.status(403).send('Invalid verify token');
-//     }
-
-//     // Process incoming message
-//     for (const change of entry[0].changes) {
-//       if (change.field !== 'messages') continue;
-
-//       const message = change.value.messages[0];
-//       const fromPhone = message.from; // Lead's phone number
-//       const toPhone = change.value.metadata.display_phone_number; // Client's WhatsApp number
-//       // Always prefix with '+' for consistent matching
-//       const normalizedToPhone = toPhone.startsWith('+') ? toPhone : `+${toPhone}`;
-
-
-//       // 1. Identify which client owns this WhatsApp number
-//       const agentResult = await pool.query(`
-//         SELECT 
-//           ai.*, 
-//           ai.whatsapp_credentials,
-//           ac.prompt_preamble,
-//           ac.initial_message,
-//           c.name as company_name
-//         FROM agent_instances ai
-//         LEFT JOIN agent_configs ac ON ai.agent_config_id = ac.id
-//         LEFT JOIN companies c ON ai.company_id = c.id
-//         WHERE ai.whatsapp_number = $1 AND ai.agent_type = 'whatsapp' AND ai.is_active = TRUE
-//       `, [normalizedToPhone]);
-
-//       if (agentResult.rows.length === 0) {
-//         console.log('⚠️ Unknown WhatsApp number:', toPhone);
-//         return res.sendStatus(404);
-//       }
-
-//       const agentInstance = agentResult.rows[0];
-      
-//       // 2. Forward to n8n webhook with agent instance data
-//       await axios.post(process.env.N8N_WHATSAPP_WEBHOOK_URL || 'http://n8n:5678/webhook/whatsapp-trigger', {
-//         message: {
-//           from: fromPhone,
-//           text: { body: message.text?.body || '' },
-//           type: message.type
-//         },
-//         contacts: [{ profile: { name: message.profile?.name || 'Unknown' } }],
-//         agent_instance: {
-//           id: agentInstance.id,
-//           company_id: agentInstance.company_id,
-//           phone_number: agentInstance.whatsapp_number,
-//           prompt: agentInstance.custom_prompt || agentInstance.prompt_preamble,
-//           credentials: agentInstance.whatsapp_credentials
-//         }
-//       });
-//     }
-
-//     res.sendStatus(200);
-//   } catch (error) {
-//     console.error('❌ WhatsApp webhook error:', error);
-//     res.sendStatus(500);
-//   }
-// });
-
-
-
-
 
 // ============================================
 // WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
@@ -6289,8 +6206,10 @@ app.delete('/api/whatsapp/oauth/disconnect/:agent_instance_id', async (req, res)
 
 
 
+// ============================================
+// WHATSAPP WEBHOOK RECEIVER (SINGLE ENDPOINT FOR ALL CLIENTS)
+// ============================================
 
-// ✅ FIXED: WhatsApp Universal Webhook Handler
 app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
   try {
     const { entry } = req.body;
@@ -6319,9 +6238,11 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
       if (change.field !== 'messages') continue;
 
       const message = change.value.messages[0];
+      if (!message) continue;
       const fromPhone = message.from;
       const toPhone = change.value.metadata.display_phone_number;
       const normalizedToPhone = toPhone.startsWith('+') ? toPhone : `+${toPhone}`;
+      const normalizedFromPhone = fromPhone.startsWith('+') ? fromPhone : `+${fromPhone}`;
 
       // 1️⃣ Identify which client owns this WhatsApp number
       const agentResult = await pool.query(`
@@ -6346,6 +6267,14 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
 
       const agentInstance = agentResult.rows[0];
       const text = message.text?.body || '';
+
+
+      // Handle multi-language
+      const languageData = await handleMultilingualWhatsAppMessage(
+        text, 
+        agentInstance, 
+        normalizedFromPhone
+      );
 
       // ============================================
       // ✅ Store incoming user message in database
@@ -10040,104 +9969,6 @@ app.post('/api/email/process', async (req, res) => {
 // 4. AI LEAD EXTRACTION FUNCTION
 // ============================================
 
-// async function extractLeadFromEmail(emailData) {
-//   const { from, subject, body, company_id } = emailData;
-
-//   try {
-//     // Get company's AI extraction rules
-//     const rulesResult = await pool.query(
-//       'SELECT ai_rules FROM email_configs WHERE company_id = $1 AND is_active = TRUE LIMIT 1',
-//       [company_id]
-//     );
-
-//     const aiRules = rulesResult.rows[0]?.ai_rules || {};
-
-//     // Use Groq/LLM to extract lead data
-//     const groq = require('groq-sdk');
-//     const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
-
-//     const prompt = `
-// Extract lead information from this email. Return ONLY valid JSON with these fields:
-// {
-//   "name": "Full name if found",
-//   "phone_number": "Phone number in any format",
-//   "email": "Email address",
-//   "company": "Company name if mentioned",
-//   "interest": "What they're interested in",
-//   "urgency": "low|medium|high",
-//   "next_action": "Recommended next step"
-// }
-
-// Email From: ${from}
-// Subject: ${subject}
-// Body:
-// ${body.substring(0, 2000)}
-
-// Rules: ${JSON.stringify(aiRules)}
-
-// JSON:`;
-
-//     const completion = await client.chat.completions.create({
-//       model: 'llama-3.1-8b-instant',
-//       messages: [{ role: 'user', content: prompt }],
-//       temperature: 0.3,
-//       max_tokens: 500
-//     });
-
-//     const responseText = completion.choices[0].message.content;
-    
-//     // Extract JSON from response
-//     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-//     if (!jsonMatch) {
-//       throw new Error('No JSON found in AI response');
-//     }
-
-//     const extractedData = JSON.parse(jsonMatch[0]);
-
-//     // Fallback: Extract phone from email body using regex
-//     if (!extractedData.phone_number) {
-//       const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
-//       const phoneMatches = body.match(phoneRegex);
-//       if (phoneMatches && phoneMatches.length > 0) {
-//         extractedData.phone_number = phoneMatches[0];
-//       }
-//     }
-
-//     // Fallback: Extract email from body
-//     if (!extractedData.email) {
-//       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-//       const emailMatches = body.match(emailRegex);
-//       if (emailMatches && emailMatches.length > 0) {
-//         extractedData.email = emailMatches[0];
-//       }
-//     }
-
-//     // If still no email, use sender's email
-//     if (!extractedData.email) {
-//       const senderEmailMatch = from.match(/<(.+?)>/);
-//       extractedData.email = senderEmailMatch ? senderEmailMatch[1] : from;
-//     }
-
-//     return extractedData;
-
-//   } catch (error) {
-//     console.error('AI extraction error:', error);
-    
-//     // Fallback to regex-based extraction
-//     return {
-//       name: null,
-//       phone_number: extractPhoneFromText(body),
-//       email: extractEmailFromText(from + ' ' + body),
-//       company: null,
-//       interest: subject,
-//       urgency: 'medium',
-//       next_action: 'Manual review needed'
-//     };
-//   }
-// }
-
-
-
 async function extractLeadFromEmail(emailData) {
   const { from, subject, body, company_id } = emailData;
 
@@ -10430,12 +10261,6 @@ app.get('/api/email/oauth/gmail/start', async (req, res) => {
     
     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/gmail/callback`;
     
-    // Gmail OAuth scopes needed for reading emails
-    // const scopes = [
-    //   'https://www.googleapis.com/auth/gmail.readonly',
-    //   'https://www.googleapis.com/auth/gmail.modify',
-    //   'https://www.googleapis.com/auth/gmail.send' 
-    // ].join(' ');
 
 
     const scopes = 'https://mail.google.com/';
@@ -10457,113 +10282,6 @@ app.get('/api/email/oauth/gmail/start', async (req, res) => {
   }
 });
 
-
-
-
-// app.get('/api/email/oauth/gmail/callback', async (req, res) => {
-//   try {
-//     const { code, state, error: oauth_error } = req.query;
-    
-//     if (oauth_error) {
-//       return res.status(400).send(`OAuth Error: ${oauth_error}`);
-//     }
-    
-//     const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
-//     const { company_id } = stateData;
-    
-//     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/gmail/callback`;
-    
-//     // Exchange code for tokens
-//     const tokenResponse = await axios.post(
-//       'https://oauth2.googleapis.com/token',
-//       {
-//         code: code,
-//         client_id: process.env.GMAIL_CLIENT_ID,
-//         client_secret: process.env.GMAIL_CLIENT_SECRET,
-//         redirect_uri: redirectUri,
-//         grant_type: 'authorization_code'
-//       }
-//     );
-    
-//     const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    
-//     // Get user's email address
-//     const profileResponse = await axios.get(
-//       'https://gmail.googleapis.com/gmail/v1/users/me/profile',
-//       {
-//         headers: { 'Authorization': `Bearer ${access_token}` }
-//       }
-//     );
-    
-//     const emailAddress = profileResponse.data.emailAddress;
-    
-//     // Encrypt tokens before storing
-//     const crypto = require('crypto');
-//     const algorithm = 'aes-256-cbc';
-//     const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
-//     const iv = crypto.randomBytes(16);
-    
-//     const encryptToken = (token) => {
-//       if (!token) return null;
-//       const cipher = crypto.createCipheriv(algorithm, key, iv);
-//       let encrypted = cipher.update(token, 'utf8', 'hex');
-//       encrypted += cipher.final('hex');
-//       return iv.toString('hex') + ':' + encrypted;
-//     };
-    
-//     // Save credentials to database
-//     await pool.query(`
-//       INSERT INTO email_configs (
-//         company_id, email_address, provider,
-//         oauth_access_token, oauth_refresh_token,
-//         oauth_token_expires_at, scan_folders, is_active
-//       )
-//       VALUES ($1, $2, 'gmail', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['INBOX'], TRUE)
-//       ON CONFLICT (company_id, email_address) DO UPDATE
-//       SET 
-//         oauth_access_token = EXCLUDED.oauth_access_token,
-//         oauth_refresh_token = EXCLUDED.oauth_refresh_token,
-//         oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
-//         is_active = TRUE,
-//         updated_at = CURRENT_TIMESTAMP
-//       RETURNING id
-//     `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
-    
-//     res.send(`
-//       <!DOCTYPE html>
-//       <html>
-//       <head>
-//         <title>Gmail Connected</title>
-//         <style>
-//           body { font-family: Arial; padding: 50px; background: #f5f5f5; text-align: center; }
-//           .container { background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-//           .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
-//           .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; margin-top: 20px; }
-//         </style>
-//       </head>
-//       <body>
-//         <div class="container">
-//           <div class="success">✅ Gmail Connected Successfully!</div>
-//           <p><strong>Email:</strong> ${emailAddress}</p>
-//           <p>Your inbox will be automatically scanned for leads every 15 minutes.</p>
-//           <p style="margin-top: 30px;">
-//             <strong>What happens next:</strong><br>
-//             • Emails will be scanned for contact information<br>
-//             • Leads will be automatically extracted using AI<br>
-//             • New leads will receive welcome messages<br>
-//             • Follow-up calls will be scheduled automatically
-//           </p>
-//           <a href="/dashboard?tab=email-scanning" class="btn">Go to Dashboard</a>
-//         </div>
-//       </body>
-//       </html>
-//     `);
-    
-//   } catch (error) {
-//     console.error('Gmail OAuth callback error:', error);
-//     res.status(500).send(`Error: ${error.message}`);
-//   }
-// });
 
 
 
@@ -10753,100 +10471,6 @@ app.get('/api/email/oauth/outlook/start', async (req, res) => {
 
 
 
-// app.get('/api/email/oauth/outlook/callback', async (req, res) => {
-//   try {
-//     const { code, state, error: oauth_error } = req.query;
-    
-//     if (oauth_error) {
-//       return res.status(400).send(`OAuth Error: ${oauth_error}`);
-//     }
-    
-//     const stateData = JSON.parse(Buffer.from(state, 'base64').toString());
-//     const { company_id } = stateData;
-    
-//     const redirectUri = `${process.env.BASE_URL}/api/email/oauth/outlook/callback`;
-    
-//     // Exchange code for tokens
-//     const tokenResponse = await axios.post(
-//       'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-//       new URLSearchParams({
-//         client_id: process.env.OUTLOOK_CLIENT_ID,
-//         client_secret: process.env.OUTLOOK_CLIENT_SECRET,
-//         code: code,
-//         redirect_uri: redirectUri,
-//         grant_type: 'authorization_code'
-//       }),
-//       {
-//         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-//       }
-//     );
-    
-//     const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    
-//     // Get user's email
-//     const profileResponse = await axios.get(
-//       'https://graph.microsoft.com/v1.0/me',
-//       {
-//         headers: { 'Authorization': `Bearer ${access_token}` }
-//       }
-//     );
-    
-//     const emailAddress = profileResponse.data.userPrincipalName;
-    
-//     // Encrypt and save
-//     const crypto = require('crypto');
-//     const algorithm = 'aes-256-cbc';
-//     const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
-//     const iv = crypto.randomBytes(16);
-    
-//     const encryptToken = (token) => {
-//       if (!token) return null;
-//       const cipher = crypto.createCipheriv(algorithm, key, iv);
-//       let encrypted = cipher.update(token, 'utf8', 'hex');
-//       encrypted += cipher.final('hex');
-//       return iv.toString('hex') + ':' + encrypted;
-//     };
-    
-//     await pool.query(`
-//       INSERT INTO email_configs (
-//         company_id, email_address, provider,
-//         oauth_access_token, oauth_refresh_token,
-//         oauth_token_expires_at, scan_folders, is_active
-//       )
-//       VALUES ($1, $2, 'outlook', $3, $4, NOW() + '${expires_in} seconds'::interval, ARRAY['Inbox'], TRUE)
-//       ON CONFLICT (company_id, email_address) DO UPDATE
-//       SET 
-//         oauth_access_token = EXCLUDED.oauth_access_token,
-//         oauth_refresh_token = EXCLUDED.oauth_refresh_token,
-//         oauth_token_expires_at = EXCLUDED.oauth_token_expires_at,
-//         is_active = TRUE,
-//         updated_at = CURRENT_TIMESTAMP
-//     `, [company_id, emailAddress, encryptToken(access_token), encryptToken(refresh_token)]);
-    
-//     res.send(`
-//       <!DOCTYPE html>
-//       <html>
-//       <head><title>Outlook Connected</title></head>
-//       <body style="font-family: Arial; padding: 50px; text-align: center;">
-//         <div style="background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto;">
-//           <div style="color: #28a745; font-size: 24px; margin-bottom: 20px;">✅ Outlook Connected!</div>
-//           <p><strong>Email:</strong> ${emailAddress}</p>
-//           <p>Your inbox will be automatically scanned for leads.</p>
-//           <a href="/dashboard?tab=email-scanning" style="background: #007bff; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px;">Go to Dashboard</a>
-//         </div>
-//       </body>
-//       </html>
-//     `);
-    
-//   } catch (error) {
-//     console.error('Outlook OAuth callback error:', error);
-//     res.status(500).send(`Error: ${error.message}`);
-//   }
-// });
-
-
-
-
 app.get('/api/email/oauth/outlook/callback', async (req, res) => {
   try {
     const { code, state, error: oauth_error } = req.query;
@@ -10940,36 +10564,6 @@ app.get('/api/email/oauth/outlook/callback', async (req, res) => {
 // 3. GET EMAIL SCANNING STATUS (Per Company)
 // ============================================
 
-// app.get('/api/email/status/:company_id', async (req, res) => {
-//   try {
-//     const { company_id } = req.params;
-    
-//     const result = await pool.query(`
-//       SELECT 
-//         id, email_address, provider, is_active,
-//         last_scan_at, total_scanned, leads_extracted,
-//         oauth_token_expires_at,
-//         EXTRACT(DAY FROM (oauth_token_expires_at - NOW())) as days_until_expiry
-//       FROM email_configs
-//       WHERE company_id = $1
-//       ORDER BY created_at DESC
-//     `, [company_id]);
-    
-//     res.json({
-//       success: true,
-//       data: result.rows.map(row => ({
-//         ...row,
-//         needs_reauth: row.days_until_expiry < 7
-//       }))
-//     });
-    
-//   } catch (error) {
-//     console.error('Get email status error:', error);
-//     res.status(500).json({ error: error.message });
-//   }
-// });
-
-
 app.get('/api/email/status/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -11038,82 +10632,6 @@ app.delete('/api/email/disconnect/:email_config_id', async (req, res) => {
 
 // 5. SCAN EMAILS FOR SPECIFIC COMPANY (Called by n8n or cron)
 // ============================================
-
-// app.post('/api/email/scan/:company_id', async (req, res) => {
-//   try {
-//     const { company_id } = req.params;
-    
-//     // Get active email configs for this company
-//     const configs = await pool.query(`
-//       SELECT * FROM email_configs
-//       WHERE company_id = $1 AND is_active = TRUE
-//     `, [company_id]);
-    
-//     if (configs.rows.length === 0) {
-//       return res.json({
-//         success: true,
-//         message: 'No active email configs found'
-//       });
-//     }
-    
-//     const results = [];
-    
-//     for (const config of configs.rows) {
-//       try {
-//         // Decrypt tokens
-//         const accessToken = decryptToken(config.oauth_access_token);
-        
-//         // Fetch unread emails based on provider
-//         let emails = [];
-        
-//         if (config.provider === 'gmail') {
-//           emails = await fetchGmailEmails(accessToken, config);
-//         } else if (config.provider === 'outlook') {
-//           emails = await fetchOutlookEmails(accessToken, config);
-//         }
-        
-//         // Process each email
-//         for (const email of emails) {
-//           try {
-//             const processed = await processEmailForLead({
-//               email_config_id: config.id,
-//               company_id: config.company_id,
-//               email_from: email.from,
-//               email_subject: email.subject,
-//               email_body: email.body,
-//               email_date: email.date,
-//               message_id: email.id
-//             });
-            
-//             results.push(processed);
-//           } catch (emailError) {
-//             console.error('Email processing error:', emailError);
-//           }
-//         }
-        
-//         // Update last scan time
-//         await pool.query(
-//           'UPDATE email_configs SET last_scan_at = NOW() WHERE id = $1',
-//           [config.id]
-//         );
-        
-//       } catch (configError) {
-//         console.error('Config processing error:', configError);
-//       }
-//     }
-    
-//     res.json({
-//       success: true,
-//       scanned: results.length,
-//       results: results
-//     });
-    
-//   } catch (error) {
-//     console.error('Email scan error:', error);
-//     res.status(500).json({ error: error.message });
-//   }
-// });
-
 
 app.post('/api/email/scan/:company_id', async (req, res) => {
   try {
@@ -11215,24 +10733,7 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
 
 
 
-// Helper: Decrypt token
-// function decryptToken(encryptedToken) {
-//   if (!encryptedToken) return null;
-  
-//   const crypto = require('crypto');
-//   const algorithm = 'aes-256-cbc';
-//   const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
-  
-//   const parts = encryptedToken.split(':');
-//   const iv = Buffer.from(parts[0], 'hex');
-//   const encrypted = parts[1];
-  
-//   const decipher = crypto.createDecipheriv(algorithm, key, iv);
-//   let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-//   decrypted += decipher.final('utf8');
-  
-//   return decrypted;
-// }
+
 
 
 // AT THE TOP (after requires)
@@ -11273,54 +10774,7 @@ function decryptToken(encryptedToken) {
   }
 }
 
-// Helper: Fetch Gmail emails
-// async function fetchGmailEmails(accessToken, config) {
-//   const response = await axios.get(
-//     'https://gmail.googleapis.com/gmail/v1/users/me/messages',
-//     {
-//       params: {
-//         q: 'is:unread in:inbox',
-//         maxResults: 10
-//       },
-//       headers: { 'Authorization': `Bearer ${accessToken}` }
-//     }
-//   );
-  
-//   const emails = [];
-  
-//   for (const message of response.data.messages || []) {
-//     const details = await axios.get(
-//       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${message.id}`,
-//       {
-//         headers: { 'Authorization': `Bearer ${accessToken}` }
-//       }
-//     );
-    
-//     const headers = details.data.payload.headers;
-//     const getHeader = (name) => headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value;
-    
-//     // Decode body
-//     let body = '';
-//     if (details.data.payload.parts) {
-//       const textPart = details.data.payload.parts.find(p => p.mimeType === 'text/plain');
-//       if (textPart?.body?.data) {
-//         body = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
-//       }
-//     } else if (details.data.payload.body?.data) {
-//       body = Buffer.from(details.data.payload.body.data, 'base64').toString('utf-8');
-//     }
-    
-//     emails.push({
-//       id: message.id,
-//       from: getHeader('From'),
-//       subject: getHeader('Subject'),
-//       date: getHeader('Date'),
-//       body: body
-//     });
-//   }
-  
-//   return emails;
-// }
+
 
 
 
@@ -11391,29 +10845,6 @@ async function fetchGmailEmails(accessToken, config) {
   }
 }
 
-// Helper: Fetch Outlook emails
-// async function fetchOutlookEmails(accessToken, config) {
-//   const response = await axios.get(
-//     'https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages',
-//     {
-//       params: {
-//         $filter: 'isRead eq false',
-//         $top: 10,
-//         $select: 'id,from,subject,receivedDateTime,body'
-//       },
-//       headers: { 'Authorization': `Bearer ${accessToken}` }
-//     }
-//   );
-  
-//   return response.data.value.map(email => ({
-//     id: email.id,
-//     from: email.from.emailAddress.address,
-//     subject: email.subject,
-//     date: email.receivedDateTime,
-//     body: email.body.content
-//   }));
-// }
-
 
 async function fetchOutlookEmails(accessToken, config) {
   try {
@@ -11445,257 +10876,6 @@ async function fetchOutlookEmails(accessToken, config) {
     throw error;
   }
 }
-
-// Helper: Process email for lead (same as before)
-// async function processEmailForLead(emailData) {
-//   const {
-//     email_config_id,
-//     company_id,
-//     email_from,
-//     email_subject,
-//     email_body,
-//     email_date,
-//     message_id
-//   } = emailData;
-  
-//   // Extract lead using AI (same function as before)
-//   const extractedData = await extractLeadFromEmail({
-//     from: email_from,
-//     subject: email_subject,
-//     body: email_body,
-//     company_id: company_id
-//   });
-  
-//   // if (!extractedData.phone_number && !extractedData.email) {
-//   //   await pool.query(`
-//   //     INSERT INTO email_scan_logs (
-//   //       email_config_id, company_id, message_id,
-//   //       from_email, subject, status, error_message
-//   //     )
-//   //     VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found')
-//   //   `, [email_config_id, company_id, message_id, email_from, email_subject]);
-    
-//   //   return { skipped: true, reason: 'No contact info' };
-//   // }
-
-
-//   if (!extractedData.phone_number && !extractedData.email) {
-//     // Log skipped + return
-//     await pool.query(`
-//       INSERT INTO email_scan_logs (...)
-//       VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact info')
-//       ON CONFLICT (email_config_id, message_id) DO NOTHING
-//     `, [email_config_id, company_id, message_id, email_from, email_subject]);
-
-//     return { skipped: true, reason: 'No contact info' };
-//   }
-  
-//   // Normalize phone
-//   let phone = extractedData.phone_number;
-//   if (phone) {
-//     phone = phone.replace(/\D/g, '');
-//     if (phone.length === 10) phone = '+91' + phone;
-//     else if (!phone.startsWith('+')) phone = '+' + phone;
-//   }
-  
-//   // Check if lead exists
-//   let leadId;
-//   const existingLead = await pool.query(
-//     'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
-//     [phone, extractedData.email, company_id]
-//   );
-  
-//   if (existingLead.rows.length > 0) {
-//     leadId = existingLead.rows[0].id;
-//     await pool.query(`
-//       UPDATE leads
-//       SET 
-//         name = COALESCE($1, name),
-//         email = COALESCE($2, email),
-//         notes = COALESCE(notes || E'\\n', '') || $3,
-//         updated_at = CURRENT_TIMESTAMP
-//       WHERE id = $4
-//     `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
-//   } else {
-//     const newLead = await pool.query(`
-//       INSERT INTO leads (
-//         company_id, phone_number, name, email,
-//         lead_source, notes
-//       )
-//       VALUES ($1, $2, $3, $4, 'email_inbox', $5)
-//       RETURNING id
-//     `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
-//     leadId = newLead.rows[0].id;
-//   }
-  
-//   // Log success
-//   await pool.query(`
-//     INSERT INTO email_scan_logs (
-//       email_config_id, company_id, lead_id, message_id,
-//       from_email, subject, extracted_data, status
-//     )
-//     VALUES ($1, $2, $3, $4, $5, $6, $7, 'success')
-//   `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
-  
-//   // Update stats
-//   await pool.query(`
-//     UPDATE email_configs
-//     SET 
-//       total_scanned = total_scanned + 1,
-//       leads_extracted = leads_extracted + 1
-//     WHERE id = $1
-//   `, [email_config_id]);
-  
-//   return {
-//     success: true,
-//     lead_id: leadId,
-//     is_new: existingLead.rows.length === 0
-//   };
-// }
-
-
-
-// async function processEmailForLead(emailData) {
-//   const {
-//     email_config_id,
-//     company_id,
-//     email_from,
-//     email_subject,
-//     email_body,
-//     email_date,
-//     message_id
-//   } = emailData;
-  
-//   try {
-//     // Check if this message was already processed
-//     const existingLog = await pool.query(
-//       'SELECT id, status FROM email_scan_logs WHERE email_config_id = $1 AND message_id = $2',
-//       [email_config_id, message_id]
-//     );
-    
-//     if (existingLog.rows.length > 0) {
-//       console.log(`Message ${message_id} already processed, skipping...`);
-//       return {
-//         skipped: true,
-//         reason: 'Already processed',
-//         existing_status: existingLog.rows[0].status
-//       };
-//     }
-    
-//     // Extract lead using AI
-//     const extractedData = await extractLeadFromEmail({
-//       from: email_from,
-//       subject: email_subject,
-//       body: email_body,
-//       company_id: company_id
-//     });
-    
-//     if (!extractedData.phone_number && !extractedData.email) {
-//       // Log skipped with ON CONFLICT handling
-//       await pool.query(`
-//         INSERT INTO email_scan_logs (
-//           email_config_id, company_id, message_id,
-//           from_email, subject, status, error_message, created_at
-//         )
-//         VALUES ($1, $2, $3, $4, $5, 'skipped', 'No contact information found', NOW())
-//         ON CONFLICT (email_config_id, message_id) DO NOTHING
-//       `, [email_config_id, company_id, message_id, email_from, email_subject]);
-      
-//       return { skipped: true, reason: 'No contact info' };
-//     }
-    
-//     // Normalize phone
-//     let phone = extractedData.phone_number;
-//     if (phone) {
-//       phone = phone.replace(/\D/g, '');
-//       if (phone.length === 10) phone = '+91' + phone;
-//       else if (!phone.startsWith('+')) phone = '+' + phone;
-//     }
-    
-//     // Check if lead exists
-//     let leadId;
-//     const existingLead = await pool.query(
-//       'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
-//       [phone, extractedData.email, company_id]
-//     );
-    
-//     if (existingLead.rows.length > 0) {
-//       leadId = existingLead.rows[0].id;
-//       await pool.query(`
-//         UPDATE leads
-//         SET 
-//           name = COALESCE($1, name),
-//           email = COALESCE($2, email),
-//           notes = COALESCE(notes || E'\\n', '') || $3,
-//           updated_at = CURRENT_TIMESTAMP
-//         WHERE id = $4
-//       `, [extractedData.name, extractedData.email, `Email: ${email_subject}`, leadId]);
-//     } else {
-//       const newLead = await pool.query(`
-//         INSERT INTO leads (
-//           company_id, phone_number, name, email,
-//           lead_source, notes
-//         )
-//         VALUES ($1, $2, $3, $4, 'email_inbox', $5)
-//         RETURNING id
-//       `, [company_id, phone, extractedData.name || 'Email Lead', extractedData.email, `Email: ${email_subject}`]);
-//       leadId = newLead.rows[0].id;
-//     }
-    
-//     // Log success with ON CONFLICT handling
-//     await pool.query(`
-//       INSERT INTO email_scan_logs (
-//         email_config_id, company_id, lead_id, message_id,
-//         from_email, subject, extracted_data, status, created_at
-//       )
-//       VALUES ($1, $2, $3, $4, $5, $6, $7, 'success', NOW())
-//       ON CONFLICT (email_config_id, message_id) 
-//       DO UPDATE SET 
-//         lead_id = EXCLUDED.lead_id,
-//         extracted_data = EXCLUDED.extracted_data,
-//         status = EXCLUDED.status
-//     `, [email_config_id, company_id, leadId, message_id, email_from, email_subject, JSON.stringify(extractedData)]);
-    
-//     // Update stats
-//     await pool.query(`
-//       UPDATE email_configs
-//       SET 
-//         total_scanned = total_scanned + 1,
-//         leads_extracted = leads_extracted + 1,
-//         last_scan_at = NOW()
-//       WHERE id = $1
-//     `, [email_config_id]);
-    
-//     return {
-//       success: true,
-//       lead_id: leadId,
-//       is_new: existingLead.rows.length === 0,
-//       extracted_data: extractedData
-//     };
-    
-//   } catch (error) {
-//     console.error('Process email error:', error);
-    
-//     // Log failure with ON CONFLICT handling
-//     try {
-//       await pool.query(`
-//         INSERT INTO email_scan_logs (
-//           email_config_id, company_id, message_id,
-//           from_email, subject, status, error_message, created_at
-//         )
-//         VALUES ($1, $2, $3, $4, $5, 'failed', $6, NOW())
-//         ON CONFLICT (email_config_id, message_id) 
-//         DO UPDATE SET 
-//           status = 'failed',
-//           error_message = EXCLUDED.error_message
-//       `, [email_config_id, company_id, message_id, email_from, email_subject, error.message]);
-//     } catch (logError) {
-//       console.error('Failed to log error:', logError);
-//     }
-    
-//     throw error;
-//   }
-// }
 
 
 
@@ -13476,6 +12656,2030 @@ app.get('/api/calendar/email-status/:event_id', async (req, res) => {
 //   getCompanyEmailConfig,
 //   createEmailTransporter
 // };
+
+
+
+
+// Enhanced multi-language WhatsApp message handler
+async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPhone) {
+  try {
+    const leadResult = await pool.query(
+      'SELECT preferred_language FROM leads WHERE phone_number = $1',
+      [fromPhone]
+    );
+    
+    const preferredLang = leadResult.rows[0]?.preferred_language || 'en';
+    const detectedLang = detectLanguage(message);
+    
+    // If user switched language, update their preference
+    if (detectedLang !== preferredLang && detectedLang !== 'en') {
+      await pool.query(
+        'UPDATE leads SET preferred_language = $1 WHERE phone_number = $2',
+        [detectedLang, fromPhone]
+      );
+      console.log(`🔄 Language updated: ${preferredLang} → ${detectedLang} for ${fromPhone}`);
+    }
+    
+    const activeLang = detectedLang !== 'en' ? detectedLang : preferredLang;
+    
+    // Translate message to English for AI processing
+    let messageForAI = message;
+    if (activeLang !== 'en') {
+      messageForAI = await translateText(message, 'en', activeLang);
+    }
+    
+    return {
+      originalMessage: message,
+      translatedMessage: messageForAI,
+      detectedLanguage: detectedLang,
+      preferredLanguage: activeLang,
+      needsTranslation: activeLang !== 'en'
+    };
+  } catch (error) {
+    console.error('Multi-lingual handling error:', error);
+    return {
+      originalMessage: message,
+      translatedMessage: message,
+      detectedLanguage: 'en',
+      preferredLanguage: 'en',
+      needsTranslation: false
+    };
+  }
+}
+
+// Enhanced WhatsApp response sender with translation
+async function sendWhatsAppResponse(agentInstance, toPhone, message, leadLanguage = 'en') {
+  try {
+    const credentials = agentInstance.whatsapp_credentials;
+    
+    // Translate response to user's language if needed
+    let finalMessage = message;
+    if (leadLanguage !== 'en') {
+      finalMessage = await translateText(message, leadLanguage, 'en');
+    }
+    
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: toPhone,
+        type: 'text',
+        text: { body: finalMessage }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${credentials.access_token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    // Log message to database
+    await pool.query(`
+      INSERT INTO whatsapp_messages 
+      (lead_id, phone_number, message_type, message_body, sender, is_from_user, message_id)
+      SELECT id, $1, 'text', $2, 'bot', FALSE, $3
+      FROM leads WHERE phone_number = $1
+    `, [toPhone, finalMessage, response.data.messages[0].id]);
+    
+    return response.data;
+  } catch (error) {
+    console.error('WhatsApp send error:', error);
+    throw error;
+  }
+}
+
+
+
+// WhatsApp Appointment Scheduling
+app.post('/api/whatsapp/schedule-appointment', async (req, res) => {
+  try {
+    const {
+      agent_instance_id,
+      lead_phone,
+      appointment_type,
+      preferred_date,
+      preferred_time,
+      duration_minutes = 60
+    } = req.body;
+    
+    if (!agent_instance_id || !lead_phone || !preferred_date) {
+      return res.status(400).json({
+        error: 'agent_instance_id, lead_phone, and preferred_date required'
+      });
+    }
+    
+    // Get lead info
+    const leadResult = await pool.query(
+      'SELECT id, name, email, preferred_language FROM leads WHERE phone_number = $1',
+      [lead_phone]
+    );
+    
+    if (leadResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+    
+    const lead = leadResult.rows[0];
+    
+    // Get agent and company info
+    const agentResult = await pool.query(`
+      SELECT ai.*, ai.company_id, c.name as company_name
+      FROM agent_instances ai
+      JOIN companies c ON ai.company_id = c.id
+      WHERE ai.id = $1
+    `, [agent_instance_id]);
+    
+    if (agentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent instance not found' });
+    }
+    
+    const agent = agentResult.rows[0];
+    
+    // Get active calendar config
+    const calendarResult = await pool.query(
+      'SELECT id FROM calendar_configs WHERE company_id = $1 AND is_active = TRUE LIMIT 1',
+      [agent.company_id]
+    );
+    
+    if (calendarResult.rows.length === 0) {
+      return res.status(400).json({
+        error: 'No active calendar configuration found for this company'
+      });
+    }
+    
+    const calendar_config_id = calendarResult.rows[0].id;
+    
+    // Parse date and time
+    const appointmentDate = new Date(preferred_date);
+    if (preferred_time) {
+      const [hours, minutes] = preferred_time.split(':');
+      appointmentDate.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+    } else {
+      appointmentDate.setHours(14, 0, 0, 0); // Default 2 PM
+    }
+    
+    const endTime = new Date(appointmentDate.getTime() + duration_minutes * 60000);
+    
+    // Check availability
+    const availability = await checkCalendarAvailability(
+      calendar_config_id,
+      appointmentDate.toISOString(),
+      endTime.toISOString()
+    );
+    
+    if (!availability.available) {
+      // Send alternative slots via WhatsApp
+      const alternativeMessage = await generateAlternativeSlotsMessage(
+        calendar_config_id,
+        appointmentDate,
+        lead.preferred_language
+      );
+      
+      await sendWhatsAppResponse(
+        agent,
+        lead_phone,
+        alternativeMessage,
+        lead.preferred_language
+      );
+      
+      return res.json({
+        success: false,
+        available: false,
+        message: 'Slot not available, alternatives sent via WhatsApp'
+      });
+    }
+    
+    // Create booking
+    const bookingResult = await pool.query(`
+      INSERT INTO bookings (
+        lead_id, phone_number, booking_type,
+        scheduled_date, duration_minutes, status
+      )
+      VALUES ($1, $2, $3, $4, $5, 'pending')
+      RETURNING id
+    `, [
+      lead.id,
+      lead_phone,
+      appointment_type || 'consultation',
+      appointmentDate.toISOString(),
+      duration_minutes
+    ]);
+    
+    const booking_id = bookingResult.rows[0].id;
+    
+    // Create calendar event
+    const eventTitle = `${appointment_type || 'Consultation'} - ${lead.name || 'Customer'}`;
+    const eventDescription = `WhatsApp booking for ${lead.name}\nPhone: ${lead_phone}\nEmail: ${lead.email || 'N/A'}`;
+    
+    const calendarEvent = await createGoogleCalendarEvent(calendar_config_id, {
+      lead_id: lead.id,
+      booking_id: booking_id,
+      title: eventTitle,
+      description: eventDescription,
+      start_time: appointmentDate.toISOString(),
+      end_time: endTime.toISOString(),
+      attendees: lead.email ? [lead.email] : []
+    });
+    
+    // Update booking with calendar event
+    await pool.query(`
+      UPDATE bookings
+      SET calendar_event_id = $1, status = 'confirmed'
+      WHERE id = $2
+    `, [calendarEvent.event_id, booking_id]);
+    
+    // Send confirmation via WhatsApp
+    const confirmationMessage = await generateWhatsAppConfirmation(
+      lead,
+      appointmentDate,
+      calendarEvent.meeting_link,
+      agent.company_name
+    );
+    
+    await sendWhatsAppResponse(
+      agent,
+      lead_phone,
+      confirmationMessage,
+      lead.preferred_language
+    );
+    
+    // Send confirmation email if email exists
+    if (lead.email) {
+      await sendCalendarConfirmationEmail(
+        calendarEvent.calendar_event_id,
+        agent.company_id,
+        lead.id
+      );
+    }
+    
+    logRequest('POST', '/api/whatsapp/schedule-appointment', 201);
+    res.status(201).json({
+      success: true,
+      booking_id: booking_id,
+      calendar_event_id: calendarEvent.event_id,
+      meeting_link: calendarEvent.meeting_link,
+      scheduled_time: appointmentDate.toISOString(),
+      message: 'Appointment scheduled and confirmation sent via WhatsApp'
+    });
+    
+  } catch (error) {
+    console.error('WhatsApp scheduling error:', error);
+    logRequest('POST', '/api/whatsapp/schedule-appointment', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Helper: Generate alternative slots message
+async function generateAlternativeSlotsMessage(calendar_config_id, requestedDate, language = 'en') {
+  const startDate = new Date(requestedDate);
+  startDate.setHours(0, 0, 0, 0);
+  const endDate = new Date(startDate);
+  endDate.setDate(endDate.getDate() + 7); // Next 7 days
+  
+  const response = await axios.post(
+    `${process.env.BASE_URL}/api/calendar/available-slots`,
+    {
+      calendar_config_id,
+      start_date: startDate.toISOString(),
+      end_date: endDate.toISOString(),
+      duration_minutes: 60
+    }
+  );
+  
+  const slots = response.data.data.available_slots.slice(0, 5); // First 5 slots
+  
+  let message = '⚠️ The requested time is not available.\n\n';
+  message += '📅 Available slots:\n\n';
+  
+  slots.forEach((slot, index) => {
+    const slotDate = new Date(slot.start);
+    const dateStr = slotDate.toLocaleDateString('en-IN', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short'
+    });
+    const timeStr = slotDate.toLocaleTimeString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    });
+    message += `${index + 1}. ${dateStr} at ${timeStr}\n`;
+  });
+  
+  message += '\nReply with the slot number to book!';
+  
+  if (language !== 'en') {
+    message = await translateText(message, language, 'en');
+  }
+  
+  return message;
+}
+
+// Helper: Generate WhatsApp confirmation
+async function generateWhatsAppConfirmation(lead, appointmentDate, meetingLink, companyName) {
+  const dateStr = appointmentDate.toLocaleDateString('en-IN', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  });
+  
+  const timeStr = appointmentDate.toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+  
+  let message = `✅ *Appointment Confirmed!*\n\n`;
+  message += `Dear ${lead.name || 'Customer'},\n\n`;
+  message += `Your appointment with ${companyName} is confirmed:\n\n`;
+  message += `📅 *Date:* ${dateStr}\n`;
+  message += `🕐 *Time:* ${timeStr}\n\n`;
+  
+  if (meetingLink) {
+    message += `🔗 *Meeting Link:*\n${meetingLink}\n\n`;
+  }
+  
+  message += `We'll send you a reminder 30 minutes before.\n\n`;
+  message += `To reschedule, reply with "reschedule".`;
+  
+  if (lead.preferred_language !== 'en') {
+    message = await translateText(message, lead.preferred_language, 'en');
+  }
+  
+  return message;
+}
+
+
+
+
+// WhatsApp Invoice Sharing
+app.post('/api/whatsapp/send-invoice', async (req, res) => {
+  try {
+    const {
+      agent_instance_id,
+      lead_phone,
+      invoice_id,
+      include_payment_link = true
+    } = req.body;
+    
+    if (!agent_instance_id || !lead_phone || !invoice_id) {
+      return res.status(400).json({
+        error: 'agent_instance_id, lead_phone, and invoice_id required'
+      });
+    }
+    
+    // Get invoice details
+    const invoiceResult = await pool.query(`
+      SELECT i.*, l.name as lead_name, l.email, l.preferred_language
+      FROM invoices i
+      JOIN leads l ON i.lead_id = l.id
+      WHERE i.id = $1 AND i.phone_number = $2
+    `, [invoice_id, lead_phone]);
+    
+    if (invoiceResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    
+    const invoice = invoiceResult.rows[0];
+    
+    // Get agent instance
+    const agentResult = await pool.query(`
+      SELECT ai.*, c.name as company_name
+      FROM agent_instances ai
+      JOIN companies c ON ai.company_id = c.id
+      WHERE ai.id = $1
+    `, [agent_instance_id]);
+    
+    if (agentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent instance not found' });
+    }
+    
+    const agent = agentResult.rows[0];
+    const credentials = agent.whatsapp_credentials;
+    
+    // Generate invoice message
+    const dueDate = new Date(invoice.due_date);
+    const dueDateStr = dueDate.toLocaleDateString('en-IN', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric'
+    });
+    
+    let message = `🧾 *Invoice from ${agent.company_name}*\n\n`;
+    message += `Invoice No: *${invoice.invoice_number}*\n`;
+    message += `Amount: *${invoice.currency} ${invoice.amount.toLocaleString('en-IN')}*\n`;
+    message += `Due Date: *${dueDateStr}*\n`;
+    message += `Status: *${invoice.status.toUpperCase()}*\n\n`;
+    
+    if (invoice.status === 'pending') {
+      message += `⚠️ Payment pending. Please complete before due date.\n\n`;
+    }
+    
+    if (include_payment_link && invoice.pdf_url) {
+      message += `📄 View Invoice: ${invoice.pdf_url}\n\n`;
+    }
+    
+    message += `For questions, reply to this message.`;
+    
+    // Translate if needed
+    if (invoice.preferred_language !== 'en') {
+      message = await translateText(message, invoice.preferred_language, 'en');
+    }
+    
+    // Send via WhatsApp
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: lead_phone,
+        type: 'text',
+        text: { body: message }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${credentials.access_token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    // Update invoice reminder tracking
+    await pool.query(`
+      UPDATE invoices
+      SET 
+        reminder_count = reminder_count + 1,
+        last_reminder_sent = NOW()
+      WHERE id = $1
+    `, [invoice_id]);
+    
+    // Log the message
+    await pool.query(`
+      INSERT INTO whatsapp_messages 
+      (lead_id, phone_number, message_type, message_body, sender, is_from_user, message_id)
+      VALUES ($1, $2, 'invoice', $3, 'bot', FALSE, $4)
+    `, [
+      invoice.lead_id,
+      lead_phone,
+      `Invoice ${invoice.invoice_number} sent`,
+      response.data.messages[0].id
+    ]);
+    
+    logRequest('POST', '/api/whatsapp/send-invoice', 200);
+    res.json({
+      success: true,
+      message_id: response.data.messages[0].id,
+      invoice_number: invoice.invoice_number,
+      reminder_count: invoice.reminder_count + 1
+    });
+    
+  } catch (error) {
+    console.error('WhatsApp invoice send error:', error);
+    logRequest('POST', '/api/whatsapp/send-invoice', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Auto-send invoice reminders (call this via cron job)
+app.post('/api/whatsapp/send-invoice-reminders', async (req, res) => {
+  try {
+    // Get overdue invoices that haven't been reminded recently
+    const invoicesResult = await pool.query(`
+      SELECT i.*, l.phone_number, l.preferred_language, ai.id as agent_instance_id
+      FROM invoices i
+      JOIN leads l ON i.lead_id = l.id
+      JOIN agent_instances ai ON ai.company_id = (SELECT company_id FROM leads WHERE id = i.lead_id LIMIT 1)
+      WHERE i.status = 'pending'
+      AND i.due_date < NOW()
+      AND (i.last_reminder_sent IS NULL OR i.last_reminder_sent < NOW() - INTERVAL '3 days')
+      AND i.reminder_count < 5
+      AND ai.agent_type = 'whatsapp'
+      AND ai.is_active = TRUE
+      LIMIT 50
+    `);
+    
+    const results = [];
+    const errors = [];
+    
+    for (const invoice of invoicesResult.rows) {
+      try {
+        const response = await axios.post(
+          `${process.env.BASE_URL}/api/whatsapp/send-invoice`,
+          {
+            agent_instance_id: invoice.agent_instance_id,
+            lead_phone: invoice.phone_number,
+            invoice_id: invoice.id,
+            include_payment_link: true
+          }
+        );
+        
+        results.push({
+          invoice_id: invoice.id,
+          invoice_number: invoice.invoice_number,
+          status: 'sent'
+        });
+      } catch (error) {
+        errors.push({
+          invoice_id: invoice.id,
+          error: error.message
+        });
+      }
+      
+      // Rate limiting: 1 message per second
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    logRequest('POST', '/api/whatsapp/send-invoice-reminders', 200);
+    res.json({
+      success: true,
+      sent: results.length,
+      failed: errors.length,
+      results,
+      errors
+    });
+    
+  } catch (error) {
+    console.error('Invoice reminder batch error:', error);
+    logRequest('POST', '/api/whatsapp/send-invoice-reminders', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+// AI Lead Scoring Engine
+async function calculateLeadScore(lead_id) {
+  try {
+    const leadData = await pool.query(`
+      SELECT 
+        l.*,
+        COUNT(DISTINCT cl.id) as total_calls,
+        COUNT(DISTINCT wm.id) as total_messages,
+        AVG((cl.sentiment->>'tone_score')::int) as avg_sentiment,
+        COUNT(DISTINCT b.id) as total_bookings,
+        COUNT(DISTINCT i.id) as total_invoices,
+        MAX(cl.created_at) as last_call_date,
+        MAX(wm.timestamp) as last_message_date
+      FROM leads l
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN whatsapp_messages wm ON l.id = wm.lead_id
+      LEFT JOIN bookings b ON l.id = b.lead_id
+      LEFT JOIN invoices i ON l.id = i.lead_id
+      WHERE l.id = $1
+      GROUP BY l.id
+    `, [lead_id]);
+    
+    if (leadData.rows.length === 0) {
+      throw new Error('Lead not found');
+    }
+    
+    const lead = leadData.rows[0];
+    
+    // Scoring components (0-100 scale)
+    let score = 0;
+    const breakdown = {};
+    
+    // 1. Engagement Score (30 points)
+    const callScore = Math.min((lead.total_calls || 0) * 5, 15);
+    const messageScore = Math.min((lead.total_messages || 0) * 0.5, 15);
+    breakdown.engagement = callScore + messageScore;
+    score += breakdown.engagement;
+    
+    // 2. Interest Level (20 points)
+    breakdown.interest = (lead.interest_level || 1) * 2;
+    score += breakdown.interest;
+    
+    // 3. Sentiment Score (20 points)
+    if (lead.avg_sentiment) {
+      breakdown.sentiment = (lead.avg_sentiment / 10) * 20;
+      score += breakdown.sentiment;
+    } else {
+      breakdown.sentiment = 10; // Default neutral
+      score += 10;
+    }
+    
+    // 4. Conversion Indicators (20 points)
+    const bookingPoints = (lead.total_bookings || 0) * 5;
+    const invoicePoints = (lead.total_invoices || 0) * 5;
+    breakdown.conversion = Math.min(bookingPoints + invoicePoints, 20);
+    score += breakdown.conversion;
+    
+    // 5. Recency (10 points)
+    const now = new Date();
+    const lastInteraction = lead.last_call_date || lead.last_message_date || lead.last_contacted;
+    
+    if (lastInteraction) {
+      const daysSince = (now - new Date(lastInteraction)) / (1000 * 60 * 60 * 24);
+      
+      if (daysSince <= 1) breakdown.recency = 10;
+      else if (daysSince <= 3) breakdown.recency = 8;
+      else if (daysSince <= 7) breakdown.recency = 5;
+      else if (daysSince <= 14) breakdown.recency = 3;
+      else breakdown.recency = 1;
+      
+      score += breakdown.recency;
+    } else {
+      breakdown.recency = 0;
+    }
+    
+    // Normalize to 0-100
+    score = Math.min(Math.round(score), 100);
+    
+    // Determine grade
+    let grade;
+    if (score >= 80) grade = 'A'; // Hot lead
+    else if (score >= 60) grade = 'B'; // Warm lead
+    else if (score >= 40) grade = 'C'; // Lukewarm
+    else if (score >= 20) grade = 'D'; // Cold
+    else grade = 'F'; // Very cold
+    
+    // Store in metadata
+    await pool.query(`
+      UPDATE leads
+      SET metadata = jsonb_set(
+        COALESCE(metadata, '{}'::jsonb),
+        '{lead_score}',
+        $1::jsonb
+      )
+      WHERE id = $2
+    `, [
+      JSON.stringify({
+        score,
+        grade,
+        breakdown,
+        calculated_at: new Date().toISOString()
+      }),
+      lead_id
+    ]);
+    
+    return { score, grade, breakdown };
+    
+  } catch (error) {
+    console.error('Lead scoring error:', error);
+    throw error;
+  }
+}
+
+// Endpoint: Calculate lead score
+app.post('/api/leads/:lead_id/calculate-score', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const scoreData = await calculateLeadScore(lead_id);
+    
+    logRequest('POST', `/api/leads/${lead_id}/calculate-score`, 200);
+    res.json({
+      success: true,
+      lead_id: parseInt(lead_id),
+      ...scoreData
+    });
+    
+  } catch (error) {
+    console.error('Calculate score error:', error);
+    logRequest('POST', `/api/leads/${lead_id}/calculate-score`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Batch scoring endpoint
+app.post('/api/leads/batch-calculate-scores', async (req, res) => {
+  try {
+    const { company_id, lead_ids } = req.body;
+    
+    let query = 'SELECT id FROM leads WHERE 1=1';
+    const params = [];
+    
+    if (company_id) {
+      params.push(company_id);
+      query += ` AND company_id = $${params.length}`;
+    }
+    
+    if (lead_ids && lead_ids.length > 0) {
+      params.push(lead_ids);
+      query += ` AND id = ANY($${params.length})`;
+    }
+    
+    query += ' LIMIT 1000'; // Safety limit
+    
+    const leadsResult = await pool.query(query, params);
+    
+    const results = [];
+    const errors = [];
+    
+    for (const lead of leadsResult.rows) {
+      try {
+        const scoreData = await calculateLeadScore(lead.id);
+        results.push({
+          lead_id: lead.id,
+          ...scoreData
+        });
+      } catch (error) {
+        errors.push({
+          lead_id: lead.id,
+          error: error.message
+        });
+      }
+    }
+    
+    logRequest('POST', '/api/leads/batch-calculate-scores', 200);
+    res.json({
+      success: true,
+      processed: results.length,
+      failed: errors.length,
+      results,
+      errors
+    });
+    
+  } catch (error) {
+    console.error('Batch scoring error:', error);
+    logRequest('POST', '/api/leads/batch-calculate-scores', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get top leads by score
+app.get('/api/leads/top-scored', async (req, res) => {
+  try {
+    const { company_id, limit = 50, min_grade = 'C' } = req.query;
+    
+    const gradeOrder = { 'A': 1, 'B': 2, 'C': 3, 'D': 4, 'F': 5 };
+    const minGradeValue = gradeOrder[min_grade] || 3;
+    
+    let query = `
+      SELECT 
+        l.*,
+        (l.metadata->'lead_score'->>'score')::int as score,
+        l.metadata->'lead_score'->>'grade' as grade,
+        l.metadata->'lead_score'->'breakdown' as score_breakdown
+      FROM leads l
+      WHERE l.metadata->'lead_score' IS NOT NULL
+    `;
+    
+    const params = [];
+    
+    if (company_id) {
+      params.push(company_id);
+      query += ` AND l.company_id = $${params.length}`;
+    }
+    
+    query += ` ORDER BY (l.metadata->'lead_score'->>'score')::int DESC`;
+    
+    params.push(parseInt(limit));
+    query += ` LIMIT $${params.length}`;
+    
+    const result = await pool.query(query, params);
+    
+    // Filter by grade
+    const filteredLeads = result.rows.filter(lead => 
+      gradeOrder[lead.grade] <= minGradeValue
+    );
+    
+    logRequest('GET', '/api/leads/top-scored', 200);
+    res.json({
+      success: true,
+      count: filteredLeads.length,
+      data: filteredLeads
+    });
+    
+  } catch (error) {
+    console.error('Top scored leads error:', error);
+    logRequest('GET', '/api/leads/top-scored', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+// Smart Routing Rules Engine
+app.post('/api/routing-rules', async (req, res) => {
+  try {
+    const {
+      company_id,
+      rule_name,
+      rule_type, // 'score_based', 'source_based', 'language_based', 'time_based'
+      conditions,
+      action, // 'assign_agent', 'priority_queue', 'auto_call', 'send_notification'
+      target_agent_id,
+      priority,
+      is_active = true
+    } = req.body;
+    
+    if (!company_id || !rule_name || !rule_type || !conditions || !action) {
+      return res.status(400).json({
+        error: 'company_id, rule_name, rule_type, conditions, and action required'
+      });
+    }
+    
+    const query = `
+      INSERT INTO routing_rules (
+        company_id, rule_name, rule_type, conditions,
+        action, target_agent_id, priority, is_active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, [
+      company_id,
+      rule_name,
+      rule_type,
+      JSON.stringify(conditions),
+      action,
+      target_agent_id || null,
+      priority || 50,
+      is_active
+    ]);
+    
+    logRequest('POST', '/api/routing-rules', 201);
+    res.status(201).json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Create routing rule error:', error);
+    logRequest('POST', '/api/routing-rules', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+// Apply routing rules to a lead
+async function applyRoutingRules(lead_id, company_id) {
+  try {
+    // Get lead data with score
+    const leadResult = await pool.query(`
+      SELECT 
+        l.*,
+        (l.metadata->'lead_score'->>'score')::int as score,
+        l.metadata->'lead_score'->>'grade' as grade
+      FROM leads l
+      WHERE l.id = $1 AND l.company_id = $2
+    `, [lead_id, company_id]);
+    
+    if (leadResult.rows.length === 0) {
+      throw new Error('Lead not found');
+    }
+    
+    const lead = leadResult.rows[0];
+    
+    // Get active routing rules for company
+    const rulesResult = await pool.query(`
+      SELECT * FROM routing_rules
+      WHERE company_id = $1 AND is_active = TRUE
+      ORDER BY priority DESC, created_at ASC
+    `, [company_id]);
+    
+    const appliedActions = [];
+    
+    for (const rule of rulesResult.rows) {
+      const conditions = rule.conditions;
+      let conditionMet = false;
+      
+      // Evaluate conditions based on rule type
+      switch (rule.rule_type) {
+        case 'score_based':
+          if (conditions.min_score && lead.score >= conditions.min_score) {
+            conditionMet = true;
+          }
+          if (conditions.grade && conditions.grade.includes(lead.grade)) {
+            conditionMet = true;
+          }
+          break;
+          
+        case 'source_based':
+          if (conditions.sources && conditions.sources.includes(lead.lead_source)) {
+            conditionMet = true;
+          }
+          break;
+          
+        case 'language_based':
+          if (conditions.languages && conditions.languages.includes(lead.preferred_language)) {
+            conditionMet = true;
+          }
+          break;
+          
+        case 'time_based':
+          const currentHour = new Date().getHours();
+          if (conditions.hours) {
+            conditionMet = currentHour >= conditions.hours.start && 
+                          currentHour <= conditions.hours.end;
+          }
+          break;
+          
+        case 'custom':
+          // Evaluate custom conditions
+          if (conditions.status && conditions.status.includes(lead.lead_status)) {
+            conditionMet = true;
+          }
+          if (conditions.interest_level && lead.interest_level >= conditions.interest_level) {
+            conditionMet = true;
+          }
+          break;
+      }
+      
+      // Execute action if condition is met
+      if (conditionMet) {
+        let actionResult = null;
+        
+        switch (rule.action) {
+          case 'assign_agent':
+            if (rule.target_agent_id) {
+              await pool.query(`
+                UPDATE leads
+                SET assigned_to_agent = (
+                  SELECT name FROM human_agents WHERE id = $1
+                )
+                WHERE id = $2
+              `, [rule.target_agent_id, lead_id]);
+              
+              actionResult = { type: 'assigned', agent_id: rule.target_agent_id };
+            }
+            break;
+            
+          case 'priority_queue':
+            await pool.query(`
+              UPDATE leads
+              SET metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb),
+                '{priority}',
+                '"high"'
+              )
+              WHERE id = $1
+            `, [lead_id]);
+            
+            actionResult = { type: 'priority_set', priority: 'high' };
+            break;
+            
+          case 'auto_call':
+            // Schedule immediate callback
+            await pool.query(`
+              INSERT INTO scheduled_calls (
+                company_id, lead_id, call_type, scheduled_time, status
+              )
+              VALUES ($1, $2, 'callback', NOW() + INTERVAL '5 minutes', 'pending')
+            `, [company_id, lead_id]);
+            
+            actionResult = { type: 'call_scheduled', scheduled_in: '5 minutes' };
+            break;
+            
+          case 'send_notification':
+            // Create notification for assigned agent or default
+            const notificationMessage = conditions.notification_message || 
+              `New lead ${lead.name || lead.phone_number} needs attention`;
+            
+            await pool.query(`
+              INSERT INTO system_notifications (
+                notification_type, title, message, priority
+              )
+              VALUES ('lead_routing', $1, $2, 'high')
+            `, [`Lead #${lead_id} routed`, notificationMessage]);
+            
+            actionResult = { type: 'notification_sent' };
+            break;
+            
+          case 'tag_lead':
+            if (conditions.tags) {
+              await pool.query(`
+                UPDATE leads
+                SET tags = array_cat(COALESCE(tags, ARRAY[]::text[]), $1)
+                WHERE id = $2
+              `, [conditions.tags, lead_id]);
+              
+              actionResult = { type: 'tags_added', tags: conditions.tags };
+            }
+            break;
+        }
+        
+        if (actionResult) {
+          appliedActions.push({
+            rule_id: rule.id,
+            rule_name: rule.rule_name,
+            ...actionResult
+          });
+          
+          // Log routing action
+          await pool.query(`
+            INSERT INTO audit_logs (lead_id, action, details, created_by)
+            VALUES ($1, 'routing_rule_applied', $2, 'system')
+          `, [lead_id, JSON.stringify({
+            rule_id: rule.id,
+            rule_name: rule.rule_name,
+            action: rule.action,
+            result: actionResult
+          })]);
+        }
+      }
+    }
+    
+    return appliedActions;
+    
+  } catch (error) {
+    console.error('Apply routing rules error:', error);
+    throw error;
+  }
+}
+
+// Endpoint: Apply routing to lead
+app.post('/api/leads/:lead_id/apply-routing', async (req, res) => {
+  const { lead_id } = req.params; // Define at the top of function
+  
+  try {
+    const { company_id } = req.body;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id required' });
+    }
+    
+    const actions = await applyRoutingRules(lead_id, company_id);
+    
+    logRequest('POST', `/api/leads/${lead_id}/apply-routing`, 200);
+    res.json({
+      success: true,
+      lead_id: parseInt(lead_id),
+      actions_applied: actions.length,
+      actions
+    });
+    
+  } catch (error) {
+    console.error('Apply routing error:', error);
+    logRequest('POST', `/api/leads/${lead_id}/apply-routing`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get routing rules for company
+app.get('/api/routing-rules/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        rr.*,
+        ha.name as assigned_agent_name
+      FROM routing_rules rr
+      LEFT JOIN human_agents ha ON rr.target_agent_id = ha.id
+      WHERE rr.company_id = $1
+      ORDER BY rr.priority DESC, rr.created_at DESC
+    `, [company_id]);
+    
+    logRequest('GET', `/api/routing-rules/${company_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get routing rules error:', error);
+    logRequest('GET', `/api/routing-rules/${company_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update routing rule
+app.patch('/api/routing-rules/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      rule_name,
+      conditions,
+      action,
+      target_agent_id,
+      priority,
+      is_active
+    } = req.body;
+    
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+    
+    if (rule_name) {
+      paramCount++;
+      updates.push(`rule_name = $${paramCount}`);
+      params.push(rule_name);
+    }
+    
+    if (conditions) {
+      paramCount++;
+      updates.push(`conditions = $${paramCount}`);
+      params.push(JSON.stringify(conditions));
+    }
+    
+    if (action) {
+      paramCount++;
+      updates.push(`action = $${paramCount}`);
+      params.push(action);
+    }
+    
+    if (target_agent_id !== undefined) {
+      paramCount++;
+      updates.push(`target_agent_id = $${paramCount}`);
+      params.push(target_agent_id);
+    }
+    
+    if (priority !== undefined) {
+      paramCount++;
+      updates.push(`priority = $${paramCount}`);
+      params.push(priority);
+    }
+    
+    if (is_active !== undefined) {
+      paramCount++;
+      updates.push(`is_active = $${paramCount}`);
+      params.push(is_active);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    paramCount++;
+    params.push(id);
+    
+    const query = `
+      UPDATE routing_rules
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Routing rule not found' });
+    }
+    
+    logRequest('PATCH', `/api/routing-rules/${id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Update routing rule error:', error);
+    logRequest('PATCH', `/api/routing-rules/${id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete routing rule
+app.delete('/api/routing-rules/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(
+      'DELETE FROM routing_rules WHERE id = $1 RETURNING *',
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Routing rule not found' });
+    }
+    
+    logRequest('DELETE', `/api/routing-rules/${id}`, 200);
+    res.json({
+      success: true,
+      message: 'Routing rule deleted',
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Delete routing rule error:', error);
+    logRequest('DELETE', `/api/routing-rules/${id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+// Task Management System
+
+// Create task
+app.post('/api/tasks', async (req, res) => {
+  try {
+    const {
+      company_id,
+      lead_id,
+      assigned_to_agent_id,
+      task_type, // 'follow_up', 'callback', 'email', 'meeting', 'demo'
+      title,
+      description,
+      due_date,
+      priority = 'medium', // 'low', 'medium', 'high', 'urgent'
+      reminder_before_minutes = 30
+    } = req.body;
+    
+    if (!company_id || !lead_id || !task_type || !title) {
+      return res.status(400).json({
+        error: 'company_id, lead_id, task_type, and title required'
+      });
+    }
+    
+    const query = `
+      INSERT INTO tasks (
+        company_id, lead_id, assigned_to_agent_id,
+        task_type, title, description, due_date,
+        priority, reminder_before_minutes, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, [
+      company_id,
+      lead_id,
+      assigned_to_agent_id || null,
+      task_type,
+      title,
+      description || null,
+      due_date || null,
+      priority,
+      reminder_before_minutes
+    ]);
+    
+    // Auto-assign if no agent specified
+    if (!assigned_to_agent_id && lead_id) {
+      const leadAgent = await pool.query(
+        'SELECT assigned_to_agent FROM leads WHERE id = $1',
+        [lead_id]
+      );
+      
+      if (leadAgent.rows[0]?.assigned_to_agent) {
+        const agentResult = await pool.query(
+          'SELECT id FROM human_agents WHERE name = $1',
+          [leadAgent.rows[0].assigned_to_agent]
+        );
+        
+        if (agentResult.rows.length > 0) {
+          await pool.query(
+            'UPDATE tasks SET assigned_to_agent_id = $1 WHERE id = $2',
+            [agentResult.rows[0].id, result.rows[0].id]
+          );
+        }
+      }
+    }
+    
+    // Send notification to assigned agent
+    if (assigned_to_agent_id) {
+      await pool.query(`
+        INSERT INTO system_notifications (
+          notification_type, title, message, priority
+        )
+        VALUES ('task_assigned', $1, $2, $3)
+      `, [
+        `New Task: ${title}`,
+        `You have been assigned a ${task_type} task for Lead #${lead_id}`,
+        priority
+      ]);
+    }
+    
+    logRequest('POST', '/api/tasks', 201);
+    res.status(201).json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Create task error:', error);
+    logRequest('POST', '/api/tasks', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get tasks for agent
+app.get('/api/tasks/agent/:agent_id', async (req, res) => {
+  try {
+    const { agent_id } = req.params;
+    const { status, priority, limit = 50 } = req.query;
+    
+    let query = `
+      SELECT 
+        t.*,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        l.company_id
+      FROM tasks t
+      JOIN leads l ON t.lead_id = l.id
+      WHERE t.assigned_to_agent_id = $1
+    `;
+    
+    const params = [agent_id];
+    
+    if (status) {
+      params.push(status);
+      query += ` AND t.status = $${params.length}`;
+    }
+    
+    if (priority) {
+      params.push(priority);
+      query += ` AND t.priority = $${params.length}`;
+    }
+    
+    query += ` ORDER BY 
+      CASE t.priority 
+        WHEN 'urgent' THEN 1
+        WHEN 'high' THEN 2
+        WHEN 'medium' THEN 3
+        WHEN 'low' THEN 4
+      END,
+      t.due_date ASC NULLS LAST,
+      t.created_at DESC
+    `;
+    
+    params.push(parseInt(limit));
+    query += ` LIMIT $${params.length}`;
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', `/api/tasks/agent/${agent_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get agent tasks error:', error);
+    logRequest('GET', `/api/tasks/agent/${agent_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get tasks for lead
+app.get('/api/tasks/lead/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        t.*,
+        ha.name as assigned_agent_name,
+        ha.email as agent_email
+      FROM tasks t
+      LEFT JOIN human_agents ha ON t.assigned_to_agent_id = ha.id
+      WHERE t.lead_id = $1
+      ORDER BY t.created_at DESC
+    `, [lead_id]);
+    
+    logRequest('GET', `/api/tasks/lead/${lead_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get lead tasks error:', error);
+    logRequest('GET', `/api/tasks/lead/${lead_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Update task
+app.patch('/api/tasks/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      status,
+      assigned_to_agent_id,
+      due_date,
+      priority,
+      notes
+    } = req.body;
+    
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+    
+    if (status) {
+      paramCount++;
+      updates.push(`status = $${paramCount}`);
+      params.push(status);
+      
+      if (status === 'completed') {
+        paramCount++;
+        updates.push(`completed_at = $${paramCount}`);
+        params.push(new Date().toISOString());
+      }
+    }
+    
+    if (assigned_to_agent_id !== undefined) {
+      paramCount++;
+      updates.push(`assigned_to_agent_id = $${paramCount}`);
+      params.push(assigned_to_agent_id);
+    }
+    
+    if (due_date) {
+      paramCount++;
+      updates.push(`due_date = $${paramCount}`);
+      params.push(due_date);
+    }
+    
+    if (priority) {
+      paramCount++;
+      updates.push(`priority = $${paramCount}`);
+      params.push(priority);
+    }
+    
+    if (notes) {
+      paramCount++;
+      updates.push(`notes = $${paramCount}`);
+      params.push(notes);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    paramCount++;
+    params.push(id);
+    
+    const query = `
+      UPDATE tasks
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    logRequest('PATCH', `/api/tasks/${id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Update task error:', error);
+    logRequest('PATCH', `/api/tasks/${id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete task
+app.delete('/api/tasks/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(
+      'DELETE FROM tasks WHERE id = $1 RETURNING *',
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    logRequest('DELETE', `/api/tasks/${id}`, 200);
+    res.json({
+      success: true,
+      message: 'Task deleted',
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Delete task error:', error);
+    logRequest('DELETE', `/api/tasks/${id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get overdue tasks
+app.get('/api/tasks/overdue/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        t.*,
+        l.name as lead_name,
+        l.phone_number,
+        ha.name as assigned_agent_name
+      FROM tasks t
+      JOIN leads l ON t.lead_id = l.id
+      LEFT JOIN human_agents ha ON t.assigned_to_agent_id = ha.id
+      WHERE t.company_id = $1
+      AND t.status NOT IN ('completed', 'cancelled')
+      AND t.due_date < NOW()
+      ORDER BY t.due_date ASC
+    `, [company_id]);
+    
+    logRequest('GET', `/api/tasks/overdue/${company_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get overdue tasks error:', error);
+    logRequest('GET', `/api/tasks/overdue/${company_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Auto-create tasks from routing rules
+async function autoCreateTask(lead_id, company_id, task_config) {
+  try {
+    await pool.query(`
+      INSERT INTO tasks (
+        company_id, lead_id, task_type, title,
+        description, due_date, priority, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+    `, [
+      company_id,
+      lead_id,
+      task_config.type || 'follow_up',
+      task_config.title,
+      task_config.description || null,
+      task_config.due_date || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      task_config.priority || 'medium'
+    ]);
+    
+    console.log(`✅ Auto-created task for lead ${lead_id}`);
+  } catch (error) {
+    console.error('Auto-create task error:', error);
+  }
+}
+
+
+
+
+// Parse user slot selection from WhatsApp message
+function parseSlotSelection(messageText) {
+  // Match patterns like "1", "slot 1", "book 2", "option 3"
+  const patterns = [
+    /^(\d+)$/,                    // Just "1"
+    /slot\s*(\d+)/i,              // "slot 1"
+    /book\s*(\d+)/i,              // "book 1"
+    /option\s*(\d+)/i,            // "option 1"
+    /number\s*(\d+)/i,            // "number 1"
+    /^(\d+)\./                    // "1."
+  ];
+  
+  for (const pattern of patterns) {
+    const match = messageText.match(pattern);
+    if (match) {
+      return parseInt(match[1]);
+    }
+  }
+  
+  return null;
+}
+
+// Handle appointment booking flow via WhatsApp
+app.post('/api/whatsapp/handle-booking-flow', async (req, res) => {
+  try {
+    const {
+      agent_instance_id,
+      lead_phone,
+      message_text
+    } = req.body;
+    
+    if (!agent_instance_id || !lead_phone || !message_text) {
+      return res.status(400).json({
+        error: 'agent_instance_id, lead_phone, and message_text required'
+      });
+    }
+    
+    // Check if message is a slot selection
+    const slotNumber = parseSlotSelection(message_text);
+    
+    if (slotNumber) {
+      // First check if conversations table has metadata column
+      const tableCheck = await pool.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name='conversations' AND column_name='metadata'
+      `);
+      
+      if (tableCheck.rows.length === 0) {
+        // Metadata column doesn't exist, return graceful error
+        return res.json({
+          success: false,
+          message: 'Booking flow metadata not available. Please upgrade database schema.'
+        });
+      }
+
+
+      // Get pending slot options from conversation context
+      const contextResult = await pool.query(`
+        SELECT metadata
+        FROM conversations
+        WHERE phone_number = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `, [lead_phone]);
+      
+      if (contextResult.rows.length > 0) {
+        const metadata = contextResult.rows[0].metadata || {};
+        const pendingSlots = metadata.pending_appointment_slots;
+        
+        if (pendingSlots && pendingSlots.length >= slotNumber) {
+          const selectedSlot = pendingSlots[slotNumber - 1];
+          
+          // Book the appointment
+          const bookingResponse = await axios.post(
+            `${process.env.BASE_URL}/api/whatsapp/schedule-appointment`,
+            {
+              agent_instance_id,
+              lead_phone,
+              preferred_date: selectedSlot.start,
+              duration_minutes: selectedSlot.duration_minutes || 60
+            }
+          );
+          
+          // Clear pending slots
+          await pool.query(`
+            UPDATE conversations
+            SET metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb),
+              '{pending_appointment_slots}',
+              '[]'::jsonb
+            )
+            WHERE phone_number = $1
+          `, [lead_phone]);
+          
+          return res.json({
+            success: true,
+            slot_selected: slotNumber,
+            booking_confirmed: true,
+            booking_data: bookingResponse.data
+          });
+        }
+      }
+    }
+    
+    // Not a slot selection - handle as regular booking request
+    res.json({
+      success: true,
+      slot_selected: null,
+      booking_confirmed: false,
+      message: 'Not a slot selection'
+    });
+    
+  } catch (error) {
+    console.error('Booking flow error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+// Complete Lead Analytics Dashboard
+app.get('/api/analytics/leads-complete/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { start_date, end_date } = req.query;
+    
+    let dateFilter = '';
+    const params = [company_id];
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND l.created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Overall statistics
+    const overallStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'new') as new_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'qualified') as qualified_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as won_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_lost') as lost_leads,
+        AVG(interest_level) as avg_interest,
+        AVG((metadata->'lead_score'->>'score')::int) FILTER (WHERE metadata->'lead_score' IS NOT NULL) as avg_score
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+    `, params);
+    
+    // Source breakdown
+    const sourceStats = await pool.query(`
+      SELECT 
+        lead_source,
+        COUNT(*) as count,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as conversions,
+        AVG((metadata->'lead_score'->>'score')::int) FILTER (WHERE metadata->'lead_score' IS NOT NULL) as avg_score
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY lead_source
+      ORDER BY count DESC
+    `, params);
+    
+    // Language distribution
+    const languageStats = await pool.query(`
+      SELECT 
+        preferred_language,
+        COUNT(*) as count
+      FROM leads 
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY preferred_language
+    `, params);
+    
+    // Score distribution
+    const scoreStats = await pool.query(`
+      SELECT 
+        metadata->'lead_score'->>'grade' as grade,
+        COUNT(*) as count
+      FROM leads 
+      WHERE company_id = $1 
+      AND metadata->'lead_score' IS NOT NULL
+      ${dateFilter}
+      GROUP BY metadata->'lead_score'->>'grade'
+      ORDER BY 
+        CASE metadata->'lead_score'->>'grade'
+          WHEN 'A' THEN 1
+          WHEN 'B' THEN 2
+          WHEN 'C' THEN 3
+          WHEN 'D' THEN 4
+          WHEN 'F' THEN 5
+        END
+    `, params);
+    
+    // Engagement metrics
+    const engagementStats = await pool.query(`
+      SELECT 
+        AVG(call_count) as avg_calls_per_lead,
+        AVG(message_count) as avg_messages_per_lead,
+        AVG(booking_count) as avg_bookings_per_lead
+      FROM (
+        SELECT 
+          leads.id,
+          COUNT(DISTINCT cl.id) as call_count,
+          COUNT(DISTINCT wm.id) as message_count,
+          COUNT(DISTINCT b.id) as booking_count
+        FROM leads
+        LEFT JOIN call_logs cl ON leads.id = cl.lead_id
+        LEFT JOIN whatsapp_messages wm ON leads.id = wm.lead_id
+        LEFT JOIN bookings b ON leads.id = b.lead_id
+        WHERE leads.company_id = $1 ${dateFilter}
+        GROUP BY leads.id
+      ) sub
+    `, params);
+    
+    // Task completion stats
+    const taskStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_tasks,
+        COUNT(*) FILTER (WHERE status = 'completed') as completed_tasks,
+        COUNT(*) FILTER (WHERE status = 'pending' AND due_date < NOW()) as overdue_tasks,
+        AVG(
+          EXTRACT(EPOCH FROM (completed_at - created_at)) / 3600
+        ) FILTER (WHERE status = 'completed') as avg_completion_hours
+      FROM tasks
+      WHERE company_id = $1 ${dateFilter}
+    `, params);
+    
+    logRequest('GET', `/api/analytics/leads-complete/${company_id}`, 200);
+    res.json({
+      success: true,
+      data: {
+        overall: overallStats.rows[0],
+        by_source: sourceStats.rows,
+        by_language: languageStats.rows,
+        by_score: scoreStats.rows,
+        engagement: engagementStats.rows[0],
+        tasks: taskStats.rows[0]
+      }
+    });
+    
+  } catch (error) {
+    console.error('Complete analytics error:', error);
+    logRequest('GET', `/api/analytics/leads-complete/${company_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+   
+
+
+
+
+
+
+
+// ============================================
+// AUTOMATED BACKGROUND TASKS
+// ============================================
+
+// Auto-score leads every hour
+if (process.env.NODE_ENV === 'production') {
+  setInterval(async () => {
+    try {
+      console.log('🔄 Running auto-scoring for pending leads...');
+      
+      const leadsResult = await pool.query(`
+        SELECT id, company_id 
+        FROM leads 
+        WHERE metadata->>'auto_score_pending' = 'true'
+        OR metadata->'lead_score' IS NULL
+        OR (metadata->'lead_score'->>'calculated_at')::timestamp < NOW() - INTERVAL '24 hours'
+        LIMIT 100
+      `);
+      
+      for (const lead of leadsResult.rows) {
+        try {
+          await calculateLeadScore(lead.id);
+          await applyRoutingRules(lead.id, lead.company_id);
+        } catch (error) {
+          console.error(`Failed to score lead ${lead.id}:`, error.message);
+        }
+      }
+      
+      console.log(`✅ Auto-scored ${leadsResult.rows.length} leads`);
+    } catch (error) {
+      console.error('Auto-scoring error:', error);
+    }
+  }, 60 * 60 * 1000); // Every hour
+
+  // Send task reminders
+  setInterval(async () => {
+    try {
+      console.log('🔔 Checking for task reminders...');
+      
+      const tasksResult = await pool.query(`
+        SELECT 
+          t.*,
+          ha.email as agent_email,
+          ha.phone as agent_phone,
+          l.name as lead_name
+        FROM tasks t
+        JOIN human_agents ha ON t.assigned_to_agent_id = ha.id
+        JOIN leads l ON t.lead_id = l.id
+        WHERE t.status = 'pending'
+        AND t.reminder_sent = FALSE
+        AND t.due_date <= NOW() + (t.reminder_before_minutes || ' minutes')::interval
+        AND t.due_date > NOW()
+        LIMIT 50
+      `);
+      
+      for (const task of tasksResult.rows) {
+        try {
+          await pool.query(`
+            INSERT INTO system_notifications (
+              notification_type, title, message, priority
+            )
+            VALUES ('task_reminder', $1, $2, 'high')
+          `, [
+            `⏰ Task Due Soon: ${task.title}`,
+            `Task for ${task.lead_name} is due in ${task.reminder_before_minutes} minutes`
+          ]);
+          
+          await pool.query(
+            'UPDATE tasks SET reminder_sent = TRUE WHERE id = $1',
+            [task.id]
+          );
+        } catch (error) {
+          console.error(`Failed to send reminder for task ${task.id}:`, error.message);
+        }
+      }
+      console.log(`✅ Sent ${tasksResult.rows.length} task reminders`);
+    } catch (error) {
+      console.error('Task reminder error:', error);
+    }
+  }, 15 * 60 * 1000); // Every 15 minutes
+
+
+  // Auto-create follow-up tasks for hot leads
+  setInterval(async () => {
+    try {
+      console.log('📋 Auto-creating follow-up tasks...');
+      
+      const hotLeadsResult = await pool.query(`
+        SELECT 
+          l.id,
+          l.company_id,
+          l.name,
+          (l.metadata->'lead_score'->>'grade') as grade
+        FROM leads l
+        WHERE (l.metadata->'lead_score'->>'grade') IN ('A', 'B')
+        AND l.lead_status NOT IN ('closed_won', 'closed_lost')
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks t
+          WHERE t.lead_id = l.id
+          AND t.status = 'pending'
+          AND t.created_at > NOW() - INTERVAL '24 hours'
+        )
+        LIMIT 20
+      `);
+      
+      for (const lead of hotLeadsResult.rows) {
+        try {
+          await pool.query(`
+            INSERT INTO tasks (
+              company_id, lead_id, task_type, title,
+              description, due_date, priority, status
+            )
+            VALUES ($1, $2, 'follow_up', $3, $4, $5, $6, 'pending')
+          `, [
+            lead.company_id,
+            lead.id,
+            `Follow up with ${lead.name || 'lead'}`,
+            `High-value lead (Grade ${lead.grade}) needs immediate follow-up`,
+            new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours from now
+            lead.grade === 'A' ? 'urgent' : 'high'
+          ]);
+        } catch (error) {
+          console.error(`Failed to create task for lead ${lead.id}:`, error.message);
+        }
+      }
+      
+      console.log(`✅ Created ${hotLeadsResult.rows.length} follow-up tasks`);
+    } catch (error) {
+      console.error('Auto-create tasks error:', error);
+    }
+  }, 2 * 60 * 60 * 1000); // Every 2 hours
+
+  // Invoice reminder automation
+  setInterval(async () => {
+    try {
+      console.log('💰 Checking invoice reminders...');
+      
+      await axios.post(`${process.env.BASE_URL}/api/whatsapp/send-invoice-reminders`);
+      
+    } catch (error) {
+      console.error('Invoice reminder automation error:', error);
+    }
+  }, 24 * 60 * 60 * 1000); // Daily
+
+  console.log('✓ Automated background tasks initialized');
+}
 
 
 

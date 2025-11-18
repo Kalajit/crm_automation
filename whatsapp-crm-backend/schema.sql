@@ -115,6 +115,7 @@ CREATE TABLE conversations (
   message_count INTEGER DEFAULT 0,
   sentiment VARCHAR(50),
   ai_summary TEXT,
+  metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(lead_id) 
@@ -269,33 +270,6 @@ CREATE TABLE agent_configs (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, prompt_key)
 );
-
-
-
-
-
--- -- AGENT INSTANCES (Multiple AI agents per company)
--- DROP TABLE IF EXISTS agent_instances CASCADE;
--- CREATE TABLE agent_instances (
---   id SERIAL PRIMARY KEY,
---   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
---   agent_name VARCHAR(255) NOT NULL,
---   agent_type VARCHAR(50) DEFAULT 'voice', -- 'voice' or 'whatsapp'
---   phone_number VARCHAR(20), -- Dedicated number for this agent
---   whatsapp_number VARCHAR(20), -- WhatsApp number if applicable
---   agent_config_id INTEGER REFERENCES agent_configs(id) ON DELETE SET NULL,
---   custom_prompt TEXT, -- Override default prompt
---   custom_voice VARCHAR(50), -- Override default voice
---   is_active BOOLEAN DEFAULT TRUE,
---   metadata JSONB DEFAULT '{}'::jsonb,
---   supported_languages TEXT[] DEFAULT ARRAY['en', 'hi', 'kn', 'ml'], -- NEW: Add supported languages
---   whatsapp_credentials JSONB DEFAULT '{}'::jsonb, -- NEW: WhatsApp API credentials
---   webhook_verify_token VARCHAR(255), -- NEW: For webhook verification
---   token_expires_at TIMESTAMP, -- NEW: WhatsApp token expiration
---   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
---   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
---   UNIQUE(company_id, agent_name)
--- );
 
 
 
@@ -804,6 +778,49 @@ CREATE TABLE calendar_events (
 
 
 
+-- ============================================
+-- MISSING TABLES FOR MODULE 2 & 3
+-- ============================================
+
+-- Routing Rules Table
+DROP TABLE IF EXISTS routing_rules CASCADE;
+CREATE TABLE routing_rules (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  rule_name VARCHAR(255) NOT NULL,
+  rule_type VARCHAR(50) NOT NULL, -- 'score_based', 'source_based', 'language_based', 'time_based', 'custom'
+  conditions JSONB NOT NULL,
+  action VARCHAR(50) NOT NULL, -- 'assign_agent', 'priority_queue', 'auto_call', 'send_notification', 'tag_lead'
+  target_agent_id INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  priority INTEGER DEFAULT 50,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tasks Table
+DROP TABLE IF EXISTS tasks CASCADE;
+CREATE TABLE tasks (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  assigned_to_agent_id INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  task_type VARCHAR(50) NOT NULL, -- 'follow_up', 'callback', 'email', 'meeting', 'demo'
+  title VARCHAR(500) NOT NULL,
+  description TEXT,
+  due_date TIMESTAMP,
+  priority VARCHAR(20) DEFAULT 'medium', -- 'low', 'medium', 'high', 'urgent'
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'in_progress', 'completed', 'cancelled'
+  reminder_before_minutes INTEGER DEFAULT 30,
+  reminder_sent BOOLEAN DEFAULT FALSE,
+  notes TEXT,
+  completed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+
 
 
 -- ============================================
@@ -966,6 +983,22 @@ CREATE INDEX IF NOT EXISTS idx_calendar_events_start_time ON calendar_events(sta
 
 
 
+CREATE INDEX idx_routing_rules_company ON routing_rules(company_id, is_active);
+CREATE INDEX idx_routing_rules_priority ON routing_rules(priority DESC);
+CREATE INDEX idx_tasks_agent ON tasks(assigned_to_agent_id, status);
+CREATE INDEX idx_tasks_lead ON tasks(lead_id);
+CREATE INDEX idx_tasks_due_date ON tasks(due_date) WHERE status NOT IN ('completed', 'cancelled');
+CREATE INDEX idx_tasks_priority ON tasks(priority, due_date);
+
+
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_lead ON audit_logs(lead_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+
+
+
+
+
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
 -- ============================================
@@ -1075,6 +1108,14 @@ CREATE TRIGGER update_calendar_configs_timestamp BEFORE UPDATE ON calendar_confi
 
 DROP TRIGGER IF EXISTS update_calendar_events_timestamp ON calendar_events;
 CREATE TRIGGER update_calendar_events_timestamp BEFORE UPDATE ON calendar_events FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+
+DROP TRIGGER IF EXISTS update_routing_rules_timestamp ON routing_rules;
+CREATE TRIGGER update_routing_rules_timestamp BEFORE UPDATE ON routing_rules FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_tasks_timestamp ON tasks;
+CREATE TRIGGER update_tasks_timestamp BEFORE UPDATE ON tasks FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
 
@@ -1815,6 +1856,16 @@ INSERT INTO email_configs (company_id, email_address, provider, ai_rules) VALUES
 }'::jsonb)
 ON CONFLICT (company_id, email_address) DO NOTHING;
 
+
+
+-- Sample Routing Rules
+INSERT INTO routing_rules (company_id, rule_name, rule_type, conditions, action, priority) VALUES
+(1, 'High Score Auto-Assign', 'score_based', '{"min_score": 80, "grade": ["A", "B"]}', 'assign_agent', 90),
+(1, 'WhatsApp Leads Priority', 'source_based', '{"sources": ["whatsapp", "website"]}', 'priority_queue', 80),
+(1, 'Hindi Speakers', 'language_based', '{"languages": ["hi", "kn", "ml"]}', 'assign_agent', 70),
+(1, 'After Hours Auto-Tag', 'time_based', '{"hours": {"start": 18, "end": 9}}', 'tag_lead', 60)
+ON CONFLICT DO NOTHING;
+
 -- ============================================
 -- UTILITY VIEWS
 -- ============================================
@@ -1914,6 +1965,45 @@ BEGIN
   RAISE NOTICE 'Cleanup completed at %', NOW();
 END;
 $$ LANGUAGE plpgsql;
+
+
+
+
+
+CREATE OR REPLACE VIEW tasks_dashboard AS
+SELECT 
+  t.*,
+  l.name as lead_name,
+  l.phone_number,
+  l.email,
+  ha.name as agent_name,
+  CASE 
+    WHEN t.due_date < NOW() AND t.status NOT IN ('completed', 'cancelled') THEN 'overdue'
+    WHEN t.due_date < NOW() + INTERVAL '24 hours' AND t.status NOT IN ('completed', 'cancelled') THEN 'due_soon'
+    ELSE 'on_track'
+  END as task_urgency
+FROM tasks t
+JOIN leads l ON t.lead_id = l.id
+LEFT JOIN human_agents ha ON t.assigned_to_agent_id = ha.id;
+
+-- Function to auto-score leads on insert/update
+CREATE OR REPLACE FUNCTION auto_score_lead()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Calculate basic score on lead creation/update
+  NEW.metadata = jsonb_set(
+    COALESCE(NEW.metadata, '{}'::jsonb),
+    '{auto_score_pending}',
+    'true'::jsonb
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+DROP TRIGGER IF EXISTS trigger_auto_score_lead ON leads;
+CREATE TRIGGER trigger_auto_score_lead BEFORE INSERT OR UPDATE ON leads FOR EACH ROW EXECUTE FUNCTION auto_score_lead();
 
 -- ============================================
 -- VERIFICATION
