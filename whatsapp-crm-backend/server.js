@@ -338,7 +338,7 @@ const INDICTRANS_URL = process.env.INDICTRANS_URL || 'http://indictrans:5000';
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || null;
 
 
-const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || 'my_secret_verify_token_2025';
+const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
 
 
@@ -2090,6 +2090,25 @@ app.post('/api/webhook/call-completed', async (req, res) => {
         `, [lead_id, to_phone, transcript, sentiment?.sentiment, summary?.summary]);
       }
     }
+
+    // **NEW: Auto-send summaries to customer**
+    try {
+      await autoSendCallSummaries(call_sid);
+      console.log(`✅ Auto-sent call summaries for ${call_sid}`);
+    } catch (summaryError) {
+      console.error('Failed to send summaries:', summaryError);
+      // Don't fail the webhook if summary delivery fails
+    }
+    
+    // Broadcast WebSocket update
+    broadcastToCall(call_sid, {
+      type: 'call_completed',
+      call_sid,
+      status: 'completed',
+      summary: summary,
+      sentiment: sentiment,
+      timestamp: new Date().toISOString()
+    });
     
     logRequest('POST', '/api/webhook/call-completed', 200);
     res.json({ 
@@ -6326,6 +6345,13 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
            VALUES ($1, $2, $3, 'text', $4, 'user', $5, TRUE);`,
           [convId, leadId, phone, text, message.id || `usr_${Date.now()}`]
         );
+
+        // Auto-summarize if needed
+        try {
+          await autoSummarizeIfNeeded(convId);
+        } catch (summaryError) {
+          console.error('Auto-summarize failed:', summaryError);
+        }
       } catch (err) {
         console.error('⚠️ DB insert error for user message:', err);
       }
@@ -7790,7 +7816,9 @@ app.get('/api/oauth/meta/start', async (req, res) => {
       `client_id=${process.env.META_APP_ID}&` +
       `redirect_uri=${encodeURIComponent(redirectUri)}&` +
       `state=${encodeURIComponent(state)}&` +
-      `scope=ads_read,leads_retrieval,business_management`;
+      // `scope=ads_read,leads_retrieval,business_management`;
+      `scope=ads_read,leads_retrieval,business_management,pages_show_list,pages_read_engagement,ads_management&` +
+      `response_type=code`;
     
     res.json({ success: true, auth_url: authUrl });
   } catch (error) {
@@ -7830,7 +7858,8 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
       }
     );
     
-    const accessToken = tokenResponse.data.access_token;
+    // const accessToken = tokenResponse.data.access_token;
+    const { access_token, expires_in } = tokenResponse.data;
     
     // Get Ad Accounts
     const accountsResponse = await axios.get(
@@ -7838,7 +7867,7 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
       {
         params: {
           access_token: accessToken,
-          fields: 'id,name,account_status'
+          fields: 'id,name,account_status,currency,timezone_name'
         }
       }
     );
@@ -7850,6 +7879,20 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
     }
     
     const primaryAccount = accounts[0];
+
+    // Get lead gen forms for this account
+    const formsResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${primaryAccount.id}/leadgen_forms`,
+      {
+        params: {
+          access_token: access_token,
+          fields: 'id,name,status,leads_count,page_id,questions'
+        }
+      }
+    );
+    
+    const forms = formsResponse.data.data || [];
+    
     
     // Store credentials
     await pool.query(`
@@ -7857,28 +7900,42 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
         company_id, platform, access_token, account_id, 
         account_name, token_expires_at, scopes
       )
-      VALUES ($1, 'meta', $2, $3, $4, NOW() + INTERVAL '60 days', $5)
+      VALUES ($1, 'meta', $2, $3, $4, NOW() + $5 * INTERVAL '1 second', $6)
       ON CONFLICT (company_id, platform) DO UPDATE
       SET 
         access_token = EXCLUDED.access_token,
         account_id = EXCLUDED.account_id,
         account_name = EXCLUDED.account_name,
         token_expires_at = EXCLUDED.token_expires_at,
+        scopes = EXCLUDED.scopes,
         updated_at = CURRENT_TIMESTAMP
-    `, [company_id, accessToken, primaryAccount.id, primaryAccount.name, ['ads_read', 'leads_retrieval']]);
+    `, [company_id, accessToken, primaryAccount.id, primaryAccount.name, expires_in, ['ads_read', 'leads_retrieval', 'business_management']]);
     
-    // Get Lead Forms
-    const formsResponse = await axios.get(
-      `https://graph.facebook.com/v21.0/${primaryAccount.id}/leadgen_forms`,
-      {
-        params: {
-          access_token: accessToken,
-          fields: 'id,name,status,leads_count'
-        }
-      }
-    );
+    // // Get Lead Forms
+    // const formsResponse = await axios.get(
+    //   `https://graph.facebook.com/v21.0/${primaryAccount.id}/leadgen_forms`,
+    //   {
+    //     params: {
+    //       access_token: accessToken,
+    //       fields: 'id,name,status,leads_count'
+    //     }
+    //   }
+    // );
     
-    const forms = formsResponse.data.data;
+    // const forms = formsResponse.data.data;
+
+
+    // Auto-configure webhooks for forms
+    for (const form of forms) {
+      await configureMetaFormWebhook(company_id, form.id, form.name, access_token);
+    }
+    
+    logRequest('GET', '/api/oauth/meta/callback', 200);
+    res.send(generateSuccessPage('Meta Ads', {
+      account: primaryAccount.name,
+      forms: forms.length,
+      forms_list: forms
+    }));
     
     res.send(`
       <!DOCTYPE html>
@@ -7923,9 +7980,399 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
   } catch (error) {
     console.error('Meta OAuth callback error:', error);
     res.status(500).send(`Error: ${error.message}`);
+    logRequest('GET', '/api/oauth/meta/callback', 500);
+    res.status(500).send(generateErrorPage('Connection Failed', error.message));
   }
 });
 
+
+
+/**
+ * Auto-configure webhook for Meta form
+ */
+async function configureMetaFormWebhook(company_id, form_id, form_name, access_token) {
+  try {
+    const webhookToken = `meta_${company_id}_${form_id}_${Date.now()}`;
+    const webhookUrl = `${process.env.BASE_URL}/api/webhooks/meta-leads/${webhookToken}`;
+    
+    // Subscribe to lead updates
+    await axios.post(
+      `https://graph.facebook.com/v21.0/${form_id}/subscribed_apps`,
+      null,
+      {
+        params: { access_token: access_token }
+      }
+    );
+    
+    // Store form configuration
+    await pool.query(`
+      INSERT INTO lead_source_configs (
+        company_id, platform, form_id, form_name, 
+        field_mappings, webhook_url, is_active
+      )
+      VALUES ($1, 'meta', $2, $3, $4, $5, TRUE)
+      ON CONFLICT (company_id, platform, form_id) DO UPDATE
+      SET 
+        form_name = EXCLUDED.form_name,
+        webhook_url = EXCLUDED.webhook_url,
+        updated_at = CURRENT_TIMESTAMP
+    `, [
+      company_id,
+      form_id,
+      form_name,
+      JSON.stringify({
+        full_name: 'name',
+        email: 'email',
+        phone_number: 'phone_number',
+        custom_question: 'notes'
+      }),
+      webhookUrl
+    ]);
+    
+    console.log(`✅ Meta form ${form_id} webhook configured`);
+    return true;
+    
+  } catch (error) {
+    console.error(`Failed to configure webhook for form ${form_id}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Meta Webhook for lead capture
+ */
+app.post('/api/webhooks/meta-leads/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const rawData = req.body;
+    
+    console.log('📥 Meta webhook received:', JSON.stringify(rawData, null, 2));
+    
+    // Handle webhook verification
+    if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token']) {
+      const verifyToken = req.query['hub.verify_token'];
+      
+      if (verifyToken === token || verifyToken === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+        return res.send(req.query['hub.challenge']);
+      }
+      return res.status(403).send('Invalid verify token');
+    }
+    
+    // Find configuration
+    const configResult = await pool.query(
+      `SELECT * FROM lead_source_configs WHERE webhook_url LIKE $1 AND is_active = TRUE`,
+      [`%${token}%`]
+    );
+    
+    if (configResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Invalid webhook token' });
+    }
+    
+    const config = configResult.rows[0];
+    const { company_id, form_id, field_mappings } = config;
+    
+    // Process Meta lead data
+    const entry = rawData.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    
+    if (!value || !value.leadgen_id) {
+      return res.json({ success: true, message: 'No lead data' });
+    }
+    
+    // Get OAuth credentials
+    const credResult = await pool.query(
+      'SELECT access_token FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, 'meta']
+    );
+    
+    if (credResult.rows.length === 0) {
+      throw new Error('Meta OAuth credentials not found');
+    }
+    
+    const access_token = credResult.rows[0].access_token;
+    
+    // Fetch full lead data from Meta
+    const leadResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${value.leadgen_id}`,
+      {
+        params: {
+          access_token: access_token,
+          fields: 'id,created_time,field_data,ad_id,form_id'
+        }
+      }
+    );
+    
+    const leadData = leadResponse.data;
+    const fieldData = leadData.field_data || [];
+    
+    // Map fields
+    const mappedData = {};
+    fieldData.forEach(field => {
+      const crmField = field_mappings[field.name] || field.name;
+      mappedData[crmField] = field.values?.[0] || '';
+    });
+    
+    // Ensure required fields
+    if (!mappedData.phone_number && !mappedData.email) {
+      throw new Error('No contact information in Meta lead');
+    }
+    
+    // Normalize phone
+    let phone = mappedData.phone_number;
+    if (phone) {
+      phone = phone.replace(/\D/g, '');
+      if (phone.length === 10) phone = '+91' + phone;
+      else if (!phone.startsWith('+')) phone = '+' + phone;
+    }
+    
+    // Create/update lead
+    let leadId;
+    const existingLead = await pool.query(
+      'SELECT id FROM leads WHERE (phone_number = $1 OR email = $2) AND company_id = $3',
+      [phone, mappedData.email, company_id]
+    );
+    
+    if (existingLead.rows.length > 0) {
+      leadId = existingLead.rows[0].id;
+      await pool.query(`
+        UPDATE leads
+        SET 
+          name = COALESCE($1, name),
+          email = COALESCE($2, email),
+          lead_source = 'meta_ads',
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+      `, [mappedData.name, mappedData.email, leadId]);
+    } else {
+      const newLead = await pool.query(`
+        INSERT INTO leads (
+          company_id, phone_number, name, email,
+          lead_source, lead_source_config_id, metadata
+        )
+        VALUES ($1, $2, $3, $4, 'meta_ads', $5, $6)
+        RETURNING id
+      `, [
+        company_id,
+        phone,
+        mappedData.name || 'Meta Lead',
+        mappedData.email,
+        config.id,
+        JSON.stringify({ meta: leadData })
+      ]);
+      leadId = newLead.rows[0].id;
+    }
+    
+    // Log import
+    await pool.query(`
+      INSERT INTO lead_import_logs (
+        company_id, platform, lead_id, form_id,
+        raw_data, mapped_data, status
+      )
+      VALUES ($1, 'meta', $2, $3, $4, $5, 'success')
+    `, [
+      company_id,
+      leadId,
+      form_id,
+      JSON.stringify(rawData),
+      JSON.stringify(mappedData)
+    ]);
+    
+    console.log(`✅ Meta lead captured: ${leadId}`);
+    res.json({ success: true, lead_id: leadId });
+    
+  } catch (error) {
+    console.error('Meta webhook error:', error);
+    
+    // Log error
+    try {
+      await pool.query(`
+        INSERT INTO lead_import_logs (
+          company_id, platform, form_id, raw_data, status, error_message
+        )
+        VALUES (0, 'meta', 'unknown', $1, 'failed', $2)
+      `, [JSON.stringify(req.body), error.message]);
+    } catch (logError) {
+      console.error('Failed to log error:', logError);
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get Meta forms for configuration
+ */
+app.get('/api/oauth/meta/forms/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const credResult = await pool.query(
+      'SELECT access_token, account_id FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, 'meta']
+    );
+    
+    if (credResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Meta not connected' });
+    }
+    
+    const { access_token, account_id } = credResult.rows[0];
+    
+    const formsResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${account_id}/leadgen_forms`,
+      {
+        params: {
+          access_token: access_token,
+          fields: 'id,name,status,leads_count,questions,page_id'
+        }
+      }
+    );
+    
+    logRequest('GET', `/api/oauth/meta/forms/${company_id}`, 200);
+    res.json({ 
+      success: true, 
+      forms: formsResponse.data.data || [] 
+    });
+    
+  } catch (error) {
+    console.error('Get Meta forms error:', error);
+    logRequest('GET', `/api/oauth/meta/forms/${company_id}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Sync Meta leads manually
+ */
+app.post('/api/oauth/meta/sync-leads', async (req, res) => {
+  try {
+    const { company_id, form_id, limit = 50 } = req.body;
+    
+    if (!company_id || !form_id) {
+      return res.status(400).json({ error: 'company_id and form_id required' });
+    }
+    
+    const credResult = await pool.query(
+      'SELECT access_token FROM oauth_credentials WHERE company_id = $1 AND platform = $2',
+      [company_id, 'meta']
+    );
+    
+    if (credResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Meta not connected' });
+    }
+    
+    const access_token = credResult.rows[0].access_token;
+    
+    // Fetch leads from Meta
+    const leadsResponse = await axios.get(
+      `https://graph.facebook.com/v21.0/${form_id}/leads`,
+      {
+        params: {
+          access_token: access_token,
+          limit: limit,
+          fields: 'id,created_time,field_data'
+        }
+      }
+    );
+    
+    const leads = leadsResponse.data.data || [];
+    const results = [];
+    const errors = [];
+    
+    for (const lead of leads) {
+      try {
+        // Process each lead through webhook
+        await axios.post(`${process.env.BASE_URL}/api/webhooks/meta-leads/sync`, {
+          entry: [{
+            changes: [{
+              value: {
+                leadgen_id: lead.id,
+                form_id: form_id
+              }
+            }]
+          }]
+        });
+        
+        results.push({ lead_id: lead.id, success: true });
+      } catch (error) {
+        errors.push({ lead_id: lead.id, error: error.message });
+      }
+    }
+    
+    logRequest('POST', '/api/oauth/meta/sync-leads', 200);
+    res.json({
+      success: true,
+      synced: results.length,
+      failed: errors.length,
+      results,
+      errors
+    });
+    
+  } catch (error) {
+    console.error('Sync Meta leads error:', error);
+    logRequest('POST', '/api/oauth/meta/sync-leads', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper functions for HTML pages
+function generateSuccessPage(platform, data) {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>${platform} Connected</title>
+  <style>
+    body { font-family: Arial; padding: 50px; background: #f5f5f5; }
+    .container { background: white; padding: 40px; border-radius: 10px; max-width: 800px; margin: 0 auto; }
+    .success { color: #28a745; font-size: 24px; margin-bottom: 20px; }
+    .info { background: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }
+    .btn { background: #007bff; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin: 10px 5px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="success">✅ ${platform} Connected Successfully!</div>
+    <div class="info">
+      <p><strong>Account:</strong> ${data.account}</p>
+      <p><strong>Lead Forms Found:</strong> ${data.forms}</p>
+      ${data.forms_list ? `
+        <ul>
+          ${data.forms_list.map(form => `<li>${form.name} (${form.leads_count} leads)</li>`).join('')}
+        </ul>
+      ` : ''}
+    </div>
+    <p>Webhooks have been auto-configured. Leads will now sync automatically.</p>
+    <a href="/dashboard?tab=integrations" class="btn">Go to Dashboard</a>
+  </div>
+</body>
+</html>
+  `;
+}
+
+function generateErrorPage(title, message) {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Error - ${title}</title>
+  <style>
+    body { font-family: Arial; padding: 50px; background: #f5f5f5; text-align: center; }
+    .container { background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; }
+    .error { color: #dc3545; font-size: 24px; margin-bottom: 20px; }
+    .btn { background: #6c757d; color: white; padding: 12px 24px; border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="error">❌ ${title}</div>
+    <p>${message}</p>
+    <a href="/dashboard?tab=integrations" class="btn">← Back to Dashboard</a>
+  </div>
+</body>
+</html>
+  `;
+}
 
 
 
@@ -14526,6 +14973,2263 @@ app.get('/api/analytics/leads-complete/:company_id', async (req, res) => {
 
 
 
+
+
+// ============================================
+// AUTOMATED CALL SUMMARY DELIVERY
+// Add these functions to server.js
+// ============================================
+
+/**
+ * Generate customer-friendly call summary
+ */
+async function generateCustomerSummary(call_sid) {
+  try {
+    const callResult = await pool.query(`
+      SELECT 
+        cl.*,
+        l.name as lead_name,
+        l.email,
+        l.phone_number,
+        l.preferred_language,
+        c.name as company_name
+      FROM call_logs cl
+      JOIN leads l ON cl.lead_id = l.id
+      JOIN companies c ON cl.company_id = c.id
+      WHERE cl.call_sid = $1
+    `, [call_sid]);
+    
+    if (callResult.rows.length === 0) {
+      throw new Error('Call log not found');
+    }
+    
+    const call = callResult.rows[0];
+    const summary = call.summary || {};
+    const sentiment = call.sentiment || {};
+    
+    // Generate customer-friendly summary using AI
+    const groq = require('groq-sdk');
+    const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
+    
+    const prompt = `
+Transform this call summary into a professional, customer-friendly message:
+
+Call Details:
+- Duration: ${call.call_duration} seconds
+- Sentiment: ${sentiment.sentiment || 'neutral'}
+- Intent: ${summary.intent || 'general inquiry'}
+
+AI Summary: ${summary.summary || 'Call completed successfully'}
+
+Create a brief, professional summary (max 200 words) that:
+1. Thanks them for their time
+2. Highlights key discussion points
+3. Mentions next steps if any
+4. Maintains a warm, professional tone
+
+Format as plain text, no markdown.
+`;
+    
+    const completion = await client.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+      max_tokens: 300
+    });
+    
+    const customerSummary = completion.choices[0].message.content.trim();
+    
+    // Translate if needed
+    let finalSummary = customerSummary;
+    if (call.preferred_language && call.preferred_language !== 'en') {
+      finalSummary = await translateText(customerSummary, call.preferred_language, 'en');
+    }
+    
+    // Store in database
+    await pool.query(`
+      UPDATE call_logs
+      SET summary = jsonb_set(
+        COALESCE(summary, '{}'::jsonb),
+        '{customer_summary}',
+        to_jsonb($1::text)
+      )
+      WHERE call_sid = $2
+    `, [finalSummary, call_sid]);
+    
+    return {
+      summary: finalSummary,
+      lead: call,
+      company_name: call.company_name
+    };
+    
+  } catch (error) {
+    console.error('Generate customer summary error:', error);
+    throw error;
+  }
+}
+
+
+/**
+ * Send call summary via email
+ */
+async function sendCallSummaryEmail(call_sid) {
+  try {
+    const summaryData = await generateCustomerSummary(call_sid);
+    const { summary, lead, company_name } = summaryData;
+    
+    if (!lead.email) {
+      console.log(`No email available for lead ${lead.id}, skipping email summary`);
+      return { success: false, reason: 'No email address' };
+    }
+    
+    // Get company email config
+    const emailConfig = await getCompanyEmailConfig(lead.company_id || 1);
+    const transporter = await createEmailTransporter(emailConfig);
+    
+    const emailHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Call Summary</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px 10px 0 0; text-align: center; }
+    .content { background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px; }
+    .summary-box { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #667eea; }
+    .footer { text-align: center; margin-top: 30px; color: #6c757d; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>📞 Call Summary</h1>
+    <p>Thank you for speaking with ${company_name}</p>
+  </div>
+  <div class="content">
+    <p>Dear ${lead.name || 'Valued Customer'},</p>
+    
+    <div class="summary-box">
+      ${summary.split('\n').map(line => `<p>${line}</p>`).join('')}
+    </div>
+    
+    <p>If you have any questions or need further assistance, please don't hesitate to reach out.</p>
+    
+    <div class="footer">
+      <p><strong>${company_name}</strong></p>
+      <p>This is an automated summary. Please do not reply to this email.</p>
+    </div>
+  </div>
+</body>
+</html>
+    `;
+    
+    const mailOptions = {
+      from: `${company_name} <${emailConfig.email_address}>`,
+      to: lead.email,
+      subject: `Call Summary - ${company_name}`,
+      html: emailHTML
+    };
+    
+    const info = await transporter.sendMail(mailOptions);
+    
+    // Log the email
+    await pool.query(`
+      INSERT INTO email_queue (to_email, subject, body, lead_id, status, sent_at)
+      VALUES ($1, $2, $3, $4, 'sent', NOW())
+    `, [lead.email, mailOptions.subject, 'Call summary sent', lead.id]);
+    
+    console.log(`✅ Call summary email sent to ${lead.email}`);
+    return { success: true, message_id: info.messageId };
+    
+  } catch (error) {
+    console.error('Send call summary email error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Send call summary via WhatsApp
+ */
+async function sendCallSummaryWhatsApp(call_sid) {
+  try {
+    const summaryData = await generateCustomerSummary(call_sid);
+    const { summary, lead, company_name } = summaryData;
+    
+    // Get agent instance for WhatsApp
+    const agentResult = await pool.query(`
+      SELECT ai.*
+      FROM agent_instances ai
+      WHERE ai.company_id = $1 
+      AND ai.agent_type = 'whatsapp'
+      AND ai.is_active = TRUE
+      LIMIT 1
+    `, [lead.company_id || 1]);
+    
+    if (agentResult.rows.length === 0) {
+      console.log('No WhatsApp agent available for summary delivery');
+      return { success: false, reason: 'No WhatsApp agent configured' };
+    }
+    
+    const agent = agentResult.rows[0];
+    const credentials = agent.whatsapp_credentials;
+    
+    if (!credentials.access_token) {
+      return { success: false, reason: 'WhatsApp not configured' };
+    }
+    
+    const message = `📞 *Call Summary*\n\n${summary}\n\n_Thank you for speaking with ${company_name}_`;
+    
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: lead.phone_number.replace('+', ''),
+        type: 'text',
+        text: { body: message }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${credentials.access_token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    // Log the message
+    await pool.query(`
+      INSERT INTO whatsapp_messages 
+      (lead_id, phone_number, message_type, message_body, sender, is_from_user, message_id)
+      VALUES ($1, $2, 'text', $3, 'bot', FALSE, $4)
+    `, [lead.id, lead.phone_number, message, response.data.messages[0].id]);
+    
+    console.log(`✅ Call summary WhatsApp sent to ${lead.phone_number}`);
+    return { success: true, message_id: response.data.messages[0].id };
+    
+  } catch (error) {
+    console.error('Send call summary WhatsApp error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Automatically send summaries after call completion
+ */
+async function autoSendCallSummaries(call_sid) {
+  try {
+    const callResult = await pool.query(`
+      SELECT l.email, l.phone_number, l.preferred_language, cl.company_id
+      FROM call_logs cl
+      JOIN leads l ON cl.lead_id = l.id
+      WHERE cl.call_sid = $1
+    `, [call_sid]);
+    
+    if (callResult.rows.length === 0) {
+      console.log('No lead found for call summary delivery');
+      return;
+    }
+    
+    const lead = callResult.rows[0];
+    const results = [];
+    
+    // Send email if available
+    if (lead.email) {
+      const emailResult = await sendCallSummaryEmail(call_sid);
+      results.push({ channel: 'email', ...emailResult });
+    }
+    
+    // Send WhatsApp
+    const whatsappResult = await sendCallSummaryWhatsApp(call_sid);
+    results.push({ channel: 'whatsapp', ...whatsappResult });
+    
+    console.log(`📊 Summary delivery results for ${call_sid}:`, results);
+    return results;
+    
+  } catch (error) {
+    console.error('Auto send summaries error:', error);
+  }
+}
+
+// ============================================
+// API ENDPOINTS FOR SUMMARY DELIVERY
+// ============================================
+
+app.post('/api/call-summaries/send', async (req, res) => {
+  try {
+    const { call_sid, channels } = req.body;
+    
+    if (!call_sid) {
+      return res.status(400).json({ error: 'call_sid required' });
+    }
+    
+    const results = {};
+    
+    if (!channels || channels.includes('email')) {
+      results.email = await sendCallSummaryEmail(call_sid);
+    }
+    
+    if (!channels || channels.includes('whatsapp')) {
+      results.whatsapp = await sendCallSummaryWhatsApp(call_sid);
+    }
+    
+    logRequest('POST', '/api/call-summaries/send', 200);
+    res.json({
+      success: true,
+      call_sid,
+      results
+    });
+    
+  } catch (error) {
+    console.error('Send call summary error:', error);
+    logRequest('POST', '/api/call-summaries/send', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/call-summaries/:call_sid', async (req, res) => {
+  try {
+    const { call_sid } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        cl.call_sid,
+        cl.call_duration,
+        cl.transcript,
+        cl.sentiment,
+        cl.summary,
+        l.name as lead_name,
+        l.email,
+        l.phone_number
+      FROM call_logs cl
+      JOIN leads l ON cl.lead_id = l.id
+      WHERE cl.call_sid = $1
+    `, [call_sid]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+    
+    logRequest('GET', `/api/call-summaries/${call_sid}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Get call summary error:', error);
+    logRequest('GET', `/api/call-summaries/${call_sid}`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/call-summaries/regenerate', async (req, res) => {
+  try {
+    const { call_sid } = req.body;
+    
+    if (!call_sid) {
+      return res.status(400).json({ error: 'call_sid required' });
+    }
+    
+    const summaryData = await generateCustomerSummary(call_sid);
+    
+    logRequest('POST', '/api/call-summaries/regenerate', 200);
+    res.json({
+      success: true,
+      data: summaryData
+    });
+    
+  } catch (error) {
+    console.error('Regenerate summary error:', error);
+    logRequest('POST', '/api/call-summaries/regenerate', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+// ============================================
+// WHATSAPP CHAT SUMMARIZATION
+// Add these new functions to server.js
+// ============================================
+
+/**
+ * Generate summary of WhatsApp conversation
+ */
+async function summarizeWhatsAppConversation(conversation_id) {
+  try {
+    const messagesResult = await pool.query(`
+      SELECT 
+        wm.message_body,
+        wm.sender,
+        wm.timestamp,
+        l.name as lead_name,
+        l.preferred_language
+      FROM whatsapp_messages wm
+      JOIN leads l ON wm.lead_id = l.id
+      WHERE wm.conversation_id = $1
+      ORDER BY wm.timestamp ASC
+    `, [conversation_id]);
+    
+    if (messagesResult.rows.length === 0) {
+      throw new Error('No messages found for this conversation');
+    }
+    
+    const messages = messagesResult.rows;
+    const lead_name = messages[0].lead_name;
+    const preferred_language = messages[0].preferred_language;
+    
+    // Format conversation for AI
+    const formattedChat = messages.map(msg => 
+      `${msg.sender === 'user' ? 'Customer' : 'Agent'}: ${msg.message_body}`
+    ).join('\n');
+    
+    // Generate summary using Groq
+    const groq = require('groq-sdk');
+    const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
+    
+    const prompt = `
+Analyze this WhatsApp conversation and provide a structured summary:
+
+Conversation:
+${formattedChat}
+
+Provide a JSON response with:
+{
+  "summary": "Brief 2-3 sentence summary",
+  "key_points": ["point1", "point2", "point3"],
+  "customer_sentiment": "positive/neutral/negative",
+  "intent": "inquiry/purchase/support/complaint/other",
+  "action_items": ["action1", "action2"],
+  "next_steps": "What should happen next"
+}
+
+JSON:
+`;
+    
+    const completion = await client.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: 500
+    });
+    
+    const responseText = completion.choices[0].message.content;
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    
+    if (!jsonMatch) {
+      throw new Error('Failed to parse AI summary response');
+    }
+    
+    const summaryData = JSON.parse(jsonMatch[0]);
+    
+    // Store summary in conversation
+    await pool.query(`
+      UPDATE conversations
+      SET 
+        ai_summary = $1,
+        sentiment = $2,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [
+      summaryData.summary,
+      summaryData.customer_sentiment,
+      conversation_id
+    ]);
+    
+    return summaryData;
+    
+  } catch (error) {
+    console.error('Summarize WhatsApp conversation error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Auto-summarize conversations after N messages
+ */
+async function autoSummarizeIfNeeded(conversation_id) {
+  try {
+    const convResult = await pool.query(`
+      SELECT 
+        c.message_count,
+        c.ai_summary,
+        c.updated_at
+      FROM conversations c
+      WHERE c.id = $1
+    `, [conversation_id]);
+    
+    if (convResult.rows.length === 0) return;
+    
+    const conv = convResult.rows[0];
+    
+    // Trigger summary every 10 messages or if no summary exists
+    const shouldSummarize = 
+      !conv.ai_summary || 
+      conv.message_count % 10 === 0 ||
+      (new Date() - new Date(conv.updated_at)) > 24 * 60 * 60 * 1000; // 24 hours
+    
+    if (shouldSummarize) {
+      console.log(`🤖 Auto-summarizing conversation ${conversation_id}`);
+      await summarizeWhatsAppConversation(conversation_id);
+    }
+    
+  } catch (error) {
+    console.error('Auto summarize error:', error);
+  }
+}
+
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+app.post('/api/whatsapp/summarize', async (req, res) => {
+  try {
+    const { conversation_id, phone_number } = req.body;
+    
+    let convId = conversation_id;
+    
+    // If phone provided instead of ID, find conversation
+    if (!convId && phone_number) {
+      const convResult = await pool.query(
+        'SELECT id FROM conversations WHERE phone_number = $1 LIMIT 1',
+        [phone_number]
+      );
+      
+      if (convResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+      
+      convId = convResult.rows[0].id;
+    }
+    
+    if (!convId) {
+      return res.status(400).json({ error: 'conversation_id or phone_number required' });
+    }
+    
+    const summary = await summarizeWhatsAppConversation(convId);
+    
+    logRequest('POST', '/api/whatsapp/summarize', 200);
+    res.json({
+      success: true,
+      conversation_id: convId,
+      summary
+    });
+    
+  } catch (error) {
+    console.error('WhatsApp summarize error:', error);
+    logRequest('POST', '/api/whatsapp/summarize', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/whatsapp/batch-summarize', async (req, res) => {
+  try {
+    const { company_id, limit = 50 } = req.body;
+    
+    // Find conversations needing summarization
+    const conversationsResult = await pool.query(`
+      SELECT c.id
+      FROM conversations c
+      JOIN leads l ON c.lead_id = l.id
+      WHERE l.company_id = $1
+      AND (c.ai_summary IS NULL OR c.message_count % 10 = 0)
+      AND c.message_count > 3
+      ORDER BY c.updated_at DESC
+      LIMIT $2
+    `, [company_id, limit]);
+    
+    const results = [];
+    const errors = [];
+    
+    for (const conv of conversationsResult.rows) {
+      try {
+        const summary = await summarizeWhatsAppConversation(conv.id);
+        results.push({ conversation_id: conv.id, success: true, summary });
+      } catch (error) {
+        errors.push({ conversation_id: conv.id, error: error.message });
+      }
+      
+      // Rate limit: wait 1 second between summaries
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    logRequest('POST', '/api/whatsapp/batch-summarize', 200);
+    res.json({
+      success: true,
+      summarized: results.length,
+      failed: errors.length,
+      results,
+      errors
+    });
+    
+  } catch (error) {
+    console.error('Batch summarize error:', error);
+    logRequest('POST', '/api/whatsapp/batch-summarize', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/conversations/:phone/summary', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    
+    const result = await pool.query(`
+      SELECT 
+        c.id,
+        c.ai_summary,
+        c.sentiment,
+        c.message_count,
+        c.last_message,
+        c.updated_at,
+        l.name as lead_name
+      FROM conversations c
+      JOIN leads l ON c.lead_id = l.id
+      WHERE c.phone_number = $1
+      ORDER BY c.updated_at DESC
+      LIMIT 1
+    `, [phone]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    
+    logRequest('GET', `/api/conversations/${phone}/summary`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Get conversation summary error:', error);
+    logRequest('GET', `/api/conversations/${phone}/summary`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+
+// ============================================
+// TRANSCRIPT SEARCH (PostgreSQL Full-Text Search)
+// Add these new endpoints to server.js
+// ============================================
+
+app.get('/api/transcripts/search', async (req, res) => {
+  try {
+    const { 
+      query, 
+      company_id, 
+      start_date, 
+      end_date,
+      sentiment,
+      limit = 50 
+    } = req.query;
+    
+    if (!query || query.trim().length < 3) {
+      return res.status(400).json({ error: 'Search query must be at least 3 characters' });
+    }
+    
+    let searchQuery = `
+      SELECT 
+        cl.call_sid,
+        cl.transcript,
+        cl.call_duration,
+        cl.sentiment,
+        cl.summary,
+        cl.created_at,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        ts_rank(to_tsvector('english', cl.transcript), plainto_tsquery('english', $1)) as relevance
+      FROM call_logs cl
+      JOIN leads l ON cl.lead_id = l.id
+      WHERE to_tsvector('english', cl.transcript) @@ plainto_tsquery('english', $1)
+      AND cl.transcript IS NOT NULL
+    `;
+    
+    const params = [query];
+    let paramCount = 1;
+    
+    if (company_id) {
+      paramCount++;
+      searchQuery += ` AND cl.company_id = $${paramCount}`;
+      params.push(parseInt(company_id));
+    }
+    
+    if (start_date) {
+      paramCount++;
+      searchQuery += ` AND cl.created_at >= $${paramCount}`;
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      paramCount++;
+      searchQuery += ` AND cl.created_at <= $${paramCount}`;
+      params.push(end_date);
+    }
+    
+    if (sentiment) {
+      paramCount++;
+      searchQuery += ` AND cl.sentiment->>'sentiment' = $${paramCount}`;
+      params.push(sentiment);
+    }
+    
+    searchQuery += ` ORDER BY relevance DESC, cl.created_at DESC`;
+    
+    paramCount++;
+    searchQuery += ` LIMIT $${paramCount}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(searchQuery, params);
+    
+    // Highlight search terms in results
+    const highlightedResults = result.rows.map(row => ({
+      ...row,
+      transcript_excerpt: extractRelevantExcerpt(row.transcript, query),
+      relevance_score: parseFloat(row.relevance).toFixed(4)
+    }));
+    
+    logRequest('GET', '/api/transcripts/search', 200);
+    res.json({
+      success: true,
+      query,
+      count: highlightedResults.length,
+      results: highlightedResults
+    });
+    
+  } catch (error) {
+    console.error('Transcript search error:', error);
+    logRequest('GET', '/api/transcripts/search', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/whatsapp/search', async (req, res) => {
+  try {
+    const { 
+      query, 
+      company_id, 
+      start_date, 
+      end_date,
+      limit = 50 
+    } = req.query;
+    
+    if (!query || query.trim().length < 3) {
+      return res.status(400).json({ error: 'Search query must be at least 3 characters' });
+    }
+    
+    let searchQuery = `
+      SELECT 
+        wm.id,
+        wm.message_body,
+        wm.sender,
+        wm.timestamp,
+        l.name as lead_name,
+        l.phone_number,
+        l.email,
+        c.ai_summary,
+        ts_rank(to_tsvector('english', wm.message_body), plainto_tsquery('english', $1)) as relevance
+      FROM whatsapp_messages wm
+      JOIN leads l ON wm.lead_id = l.id
+      JOIN conversations c ON wm.conversation_id = c.id
+      WHERE to_tsvector('english', wm.message_body) @@ plainto_tsquery('english', $1)
+    `;
+    
+    const params = [query];
+    let paramCount = 1;
+    
+    if (company_id) {
+      paramCount++;
+      searchQuery += ` AND l.company_id = $${paramCount}`;
+      params.push(parseInt(company_id));
+    }
+    
+    if (start_date) {
+      paramCount++;
+      searchQuery += ` AND wm.timestamp >= $${paramCount}`;
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      paramCount++;
+      searchQuery += ` AND wm.timestamp <= $${paramCount}`;
+      params.push(end_date);
+    }
+    
+    searchQuery += ` ORDER BY relevance DESC, wm.timestamp DESC`;
+    
+    paramCount++;
+    searchQuery += ` LIMIT $${paramCount}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(searchQuery, params);
+    
+    // Highlight search terms
+    const highlightedResults = result.rows.map(row => ({
+      ...row,
+      message_excerpt: extractRelevantExcerpt(row.message_body, query),
+      relevance_score: parseFloat(row.relevance).toFixed(4)
+    }));
+    
+    logRequest('GET', '/api/whatsapp/search', 200);
+    res.json({
+      success: true,
+      query,
+      count: highlightedResults.length,
+      results: highlightedResults
+    });
+    
+  } catch (error) {
+    console.error('WhatsApp search error:', error);
+    logRequest('GET', '/api/whatsapp/search', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Extract relevant excerpt around search term
+ */
+function extractRelevantExcerpt(text, query, contextLength = 150) {
+  if (!text) return '';
+  
+  const lowerText = text.toLowerCase();
+  const lowerQuery = query.toLowerCase();
+  const index = lowerText.indexOf(lowerQuery);
+  
+  if (index === -1) {
+    return text.substring(0, contextLength) + '...';
+  }
+  
+  const start = Math.max(0, index - Math.floor(contextLength / 2));
+  const end = Math.min(text.length, index + query.length + Math.floor(contextLength / 2));
+  
+  let excerpt = text.substring(start, end);
+  
+  if (start > 0) excerpt = '...' + excerpt;
+  if (end < text.length) excerpt = excerpt + '...';
+  
+  // Highlight the search term
+  const regex = new RegExp(`(${query})`, 'gi');
+  excerpt = excerpt.replace(regex, '**$1**');
+  
+  return excerpt;
+}
+
+app.get('/api/search/combined', async (req, res) => {
+  try {
+    const { query, company_id, limit = 20 } = req.query;
+    
+    if (!query || query.trim().length < 3) {
+      return res.status(400).json({ error: 'Search query must be at least 3 characters' });
+    }
+    
+    // Search both call transcripts and WhatsApp messages
+    const [transcriptResults, whatsappResults] = await Promise.all([
+      axios.get(`${process.env.BASE_URL}/api/transcripts/search`, {
+        params: { query, company_id, limit }
+      }),
+      axios.get(`${process.env.BASE_URL}/api/whatsapp/search`, {
+        params: { query, company_id, limit }
+      })
+    ]);
+    
+    logRequest('GET', '/api/search/combined', 200);
+    res.json({
+      success: true,
+      query,
+      results: {
+        call_transcripts: transcriptResults.data.results || [],
+        whatsapp_messages: whatsappResults.data.results || [],
+        total_count: 
+          (transcriptResults.data.count || 0) + 
+          (whatsappResults.data.count || 0)
+      }
+    });
+    
+  } catch (error) {
+    console.error('Combined search error:', error);
+    logRequest('GET', '/api/search/combined', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// ============================================
+// MODULE 7: DRIP CAMPAIGN ENDPOINTS
+// ============================================
+
+/**
+ * Create a new drip campaign
+ * POST /api/drip-campaigns
+ */
+app.post('/api/drip-campaigns', async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const {
+      company_id,
+      campaign_name,
+      description,
+      trigger_type,
+      trigger_conditions,
+      steps
+    } = req.body;
+    
+    if (!company_id || !campaign_name || !trigger_type) {
+      return res.status(400).json({
+        error: 'company_id, campaign_name, and trigger_type are required'
+      });
+    }
+    
+    const campaignResult = await client.query(`
+      INSERT INTO drip_campaigns (
+        company_id, campaign_name, description,
+        trigger_type, trigger_conditions, is_active
+      )
+      VALUES ($1, $2, $3, $4, $5, FALSE)
+      RETURNING *
+    `, [
+      company_id,
+      campaign_name,
+      description || null,
+      trigger_type,
+      JSON.stringify(trigger_conditions || {})
+    ]);
+    
+    const campaign_id = campaignResult.rows[0].id;
+    
+    if (steps && Array.isArray(steps)) {
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        await client.query(`
+          INSERT INTO drip_campaign_steps (
+            campaign_id, step_number, step_type,
+            delay_days, delay_hours, delay_minutes,
+            subject, message_body, template_id,
+            send_conditions, is_active
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+        `, [
+          campaign_id,
+          i + 1,
+          step.step_type,
+          step.delay_days || 0,
+          step.delay_hours || 0,
+          step.delay_minutes || 0,
+          step.subject || null,
+          step.message_body || null,
+          step.template_id || null,
+          JSON.stringify(step.send_conditions || {})
+        ]);
+      }
+    }
+    
+    await client.query('COMMIT');
+    
+    logRequest('POST', '/api/drip-campaigns', 201);
+    res.status(201).json({
+      success: true,
+      data: campaignResult.rows[0],
+      message: 'Drip campaign created successfully'
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Create drip campaign error:', error);
+    logRequest('POST', '/api/drip-campaigns', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+/**
+ * Get all drip campaigns for a company
+ * GET /api/drip-campaigns/:company_id
+ */
+app.get('/api/drip-campaigns/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { is_active } = req.query;
+    
+    let query = `
+      SELECT 
+        dc.*,
+        COUNT(DISTINCT dcs.id) as total_steps,
+        COUNT(DISTINCT dcsu.id) FILTER (WHERE dcsu.status = 'active') as active_subscribers,
+        COUNT(DISTINCT dcsu.id) FILTER (WHERE dcsu.status = 'completed') as completed_subscribers
+      FROM drip_campaigns dc
+      LEFT JOIN drip_campaign_steps dcs ON dc.id = dcs.campaign_id
+      LEFT JOIN drip_campaign_subscribers dcsu ON dc.id = dcsu.campaign_id
+      WHERE dc.company_id = $1
+    `;
+    
+    const params = [company_id];
+    
+    if (is_active !== undefined) {
+      params.push(is_active === 'true');
+      query += ` AND dc.is_active = $${params.length}`;
+    }
+    
+    query += `
+      GROUP BY dc.id
+      ORDER BY dc.created_at DESC
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', `/api/drip-campaigns/${company_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get drip campaigns error:', error);
+    logRequest('GET', `/api/drip-campaigns/${company_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+/**
+ * Get campaign details with steps
+ * GET /api/drip-campaigns/:company_id/:campaign_id
+ */
+app.get('/api/drip-campaigns/:company_id/:campaign_id', async (req, res) => {
+  try {
+    const { company_id, campaign_id } = req.params;
+    
+    const campaignResult = await pool.query(`
+      SELECT * FROM drip_campaigns
+      WHERE id = $1 AND company_id = $2
+    `, [campaign_id, company_id]);
+    
+    if (campaignResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    
+    const stepsResult = await pool.query(`
+      SELECT * FROM drip_campaign_steps
+      WHERE campaign_id = $1
+      ORDER BY step_number ASC
+    `, [campaign_id]);
+    
+    logRequest('GET', `/api/drip-campaigns/${company_id}/${campaign_id}`, 200);
+    res.json({
+      success: true,
+      data: {
+        ...campaignResult.rows[0],
+        steps: stepsResult.rows
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get campaign details error:', error);
+    logRequest('GET', `/api/drip-campaigns/${company_id}/${campaign_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+/**
+ * Update drip campaign
+ * PATCH /api/drip-campaigns/:campaign_id
+ */
+app.patch('/api/drip-campaigns/:campaign_id', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { campaign_name, description, is_active, trigger_conditions } = req.body;
+    
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+    
+    if (campaign_name) {
+      paramCount++;
+      updates.push(`campaign_name = $${paramCount}`);
+      params.push(campaign_name);
+    }
+    
+    if (description !== undefined) {
+      paramCount++;
+      updates.push(`description = $${paramCount}`);
+      params.push(description);
+    }
+    
+    if (is_active !== undefined) {
+      paramCount++;
+      updates.push(`is_active = $${paramCount}`);
+      params.push(is_active);
+    }
+    
+    if (trigger_conditions) {
+      paramCount++;
+      updates.push(`trigger_conditions = $${paramCount}`);
+      params.push(JSON.stringify(trigger_conditions));
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    updates.push('updated_at = CURRENT_TIMESTAMP');
+    paramCount++;
+    params.push(campaign_id);
+    
+    const query = `
+      UPDATE drip_campaigns
+      SET ${updates.join(', ')}
+      WHERE id = $${paramCount}
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    
+    logRequest('PATCH', `/api/drip-campaigns/${campaign_id}`, 200);
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Update campaign error:', error);
+    logRequest('PATCH', `/api/drip-campaigns/${campaign_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
+ * Subscribe a lead to a drip campaign
+ * POST /api/drip-campaigns/subscribe
+ */
+app.post('/api/drip-campaigns/subscribe', async (req, res) => {
+  try {
+    const { campaign_id, lead_id } = req.body;
+    
+    if (!campaign_id || !lead_id) {
+      return res.status(400).json({
+        error: 'campaign_id and lead_id are required'
+      });
+    }
+    
+    const existingResult = await pool.query(`
+      SELECT * FROM drip_campaign_subscribers
+      WHERE campaign_id = $1 AND lead_id = $2
+    `, [campaign_id, lead_id]);
+    
+    if (existingResult.rows.length > 0) {
+      const existing = existingResult.rows[0];
+      
+      if (existing.status === 'unsubscribed') {
+        return res.status(400).json({
+          error: 'Lead has unsubscribed from this campaign'
+        });
+      }
+      
+      return res.status(400).json({
+        error: 'Lead is already subscribed to this campaign'
+      });
+    }
+    
+    const result = await pool.query(`
+      INSERT INTO drip_campaign_subscribers (
+        campaign_id, lead_id, current_step, status, started_at
+      )
+      VALUES ($1, $2, 0, 'active', NOW())
+      RETURNING *
+    `, [campaign_id, lead_id]);
+    
+    await pool.query(`
+      UPDATE drip_campaigns
+      SET total_subscribers = total_subscribers + 1
+      WHERE id = $1
+    `, [campaign_id]);
+    
+    await scheduleNextDripStep(result.rows[0].id);
+    
+    logRequest('POST', '/api/drip-campaigns/subscribe', 201);
+    res.status(201).json({
+      success: true,
+      data: result.rows[0],
+      message: 'Lead subscribed to campaign successfully'
+    });
+    
+  } catch (error) {
+    console.error('Subscribe to campaign error:', error);
+    logRequest('POST', '/api/drip-campaigns/subscribe', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+/**
+ * Unsubscribe a lead from campaigns
+ * POST /api/drip-campaigns/unsubscribe
+ */
+app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const {
+      lead_id,
+      company_id,
+      unsubscribe_type = 'all',
+      campaign_id,
+      reason,
+      ip_address,
+      user_agent
+    } = req.body;
+    
+    if (!lead_id || !company_id) {
+      return res.status(400).json({
+        error: 'lead_id and company_id are required'
+      });
+    }
+    
+    await client.query(`
+      INSERT INTO unsubscribes (
+        lead_id, company_id, unsubscribe_type,
+        campaign_id, reason, ip_address, user_agent
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (lead_id, unsubscribe_type, campaign_id) DO UPDATE
+      SET unsubscribed_at = NOW(), reason = EXCLUDED.reason
+    `, [
+      lead_id,
+      company_id,
+      unsubscribe_type,
+      campaign_id || null,
+      reason || null,
+      ip_address || null,
+      user_agent || null
+    ]);
+    
+    if (campaign_id) {
+      await client.query(`
+        UPDATE drip_campaign_subscribers
+        SET status = 'unsubscribed', unsubscribed_at = NOW()
+        WHERE lead_id = $1 AND campaign_id = $2
+      `, [lead_id, campaign_id]);
+    } else if (unsubscribe_type === 'all') {
+      await client.query(`
+        UPDATE drip_campaign_subscribers
+        SET status = 'unsubscribed', unsubscribed_at = NOW()
+        WHERE lead_id = $1
+      `, [lead_id]);
+    }
+    
+    await client.query(`
+      UPDATE drip_step_executions dse
+      SET status = 'skipped', error_message = 'Lead unsubscribed'
+      FROM drip_campaign_subscribers dcs
+      WHERE dse.subscriber_id = dcs.id
+      AND dcs.lead_id = $1
+      AND dse.status = 'pending'
+      ${campaign_id ? 'AND dcs.campaign_id = $2' : ''}
+    `, campaign_id ? [lead_id, campaign_id] : [lead_id]);
+    
+    await client.query('COMMIT');
+    
+    logRequest('POST', '/api/drip-campaigns/unsubscribe', 200);
+    res.json({
+      success: true,
+      message: 'Unsubscribed successfully'
+    });
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Unsubscribe error:', error);
+    logRequest('POST', '/api/drip-campaigns/unsubscribe', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+/**
+ * Get campaign performance metrics
+ * GET /api/drip-campaigns/:campaign_id/performance
+ */
+app.get('/api/drip-campaigns/:campaign_id/performance', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { start_date, end_date } = req.query;
+    
+    let dateFilter = '';
+    const params = [campaign_id];
+    
+    if (start_date && end_date) {
+      params.push(start_date, end_date);
+      dateFilter = ` AND date BETWEEN $2 AND $3`;
+    }
+    
+    const performanceResult = await pool.query(`
+      SELECT 
+        SUM(messages_sent) as total_sent,
+        SUM(messages_delivered) as total_delivered,
+        SUM(messages_opened) as total_opened,
+        SUM(messages_clicked) as total_clicked,
+        SUM(messages_failed) as total_failed,
+        SUM(unsubscribes) as total_unsubscribes,
+        SUM(leads_converted) as total_conversions,
+        SUM(revenue_generated) as total_revenue,
+        SUM(total_cost) as total_cost,
+        CASE 
+          WHEN SUM(messages_sent) > 0 
+          THEN (SUM(messages_delivered)::float / SUM(messages_sent) * 100)
+          ELSE 0 
+        END as delivery_rate,
+        CASE 
+          WHEN SUM(messages_delivered) > 0 
+          THEN (SUM(messages_opened)::float / SUM(messages_delivered) * 100)
+          ELSE 0 
+        END as open_rate,
+        CASE 
+          WHEN SUM(messages_opened) > 0 
+          THEN (SUM(messages_clicked)::float / SUM(messages_opened) * 100)
+          ELSE 0 
+        END as click_rate,
+        CASE 
+          WHEN SUM(messages_sent) > 0 
+          THEN (SUM(leads_converted)::float / SUM(messages_sent) * 100)
+          ELSE 0 
+        END as conversion_rate,
+        CASE 
+          WHEN SUM(total_cost) > 0 
+          THEN (SUM(revenue_generated) - SUM(total_cost))
+          ELSE 0 
+        END as net_profit,
+        CASE 
+          WHEN SUM(total_cost) > 0 
+          THEN ((SUM(revenue_generated) - SUM(total_cost)) / SUM(total_cost) * 100)
+          ELSE 0 
+        END as roi
+      FROM campaign_performance
+      WHERE campaign_id = $1 ${dateFilter}
+    `, params);
+    
+    const subscriberStats = await pool.query(`
+      SELECT 
+        status,
+        COUNT(*) as count
+      FROM drip_campaign_subscribers
+      WHERE campaign_id = $1
+      GROUP BY status
+    `, [campaign_id]);
+    
+    const stepPerformance = await pool.query(`
+      SELECT 
+        dcs.step_number,
+        dcs.step_type,
+        COUNT(dse.id) as total_executions,
+        COUNT(dse.id) FILTER (WHERE dse.status = 'sent') as sent,
+        COUNT(dse.id) FILTER (WHERE dse.status = 'failed') as failed,
+        COUNT(dse.id) FILTER (WHERE dse.opened_at IS NOT NULL) as opened,
+        COUNT(dse.id) FILTER (WHERE dse.clicked_at IS NOT NULL) as clicked
+      FROM drip_campaign_steps dcs
+      LEFT JOIN drip_step_executions dse ON dcs.id = dse.step_id
+      WHERE dcs.campaign_id = $1
+      GROUP BY dcs.id, dcs.step_number, dcs.step_type
+      ORDER BY dcs.step_number
+    `, [campaign_id]);
+    
+    logRequest('GET', `/api/drip-campaigns/${campaign_id}/performance`, 200);
+    res.json({
+      success: true,
+      data: {
+        overall_metrics: performanceResult.rows[0],
+        subscriber_stats: subscriberStats.rows,
+        step_performance: stepPerformance.rows
+      }
+    });
+    
+  } catch (error) {
+    console.error('Get campaign performance error:', error);
+    logRequest('GET', `/api/drip-campaigns/${campaign_id}/performance`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+// ============================================
+// DRIP CAMPAIGN HELPER FUNCTIONS
+// ============================================
+
+async function scheduleNextDripStep(subscriber_id) {
+  try {
+    const subscriberResult = await pool.query(`
+      SELECT 
+        dcs.*,
+        dc.campaign_name,
+        l.id as lead_id,
+        l.phone_number,
+        l.email,
+        l.preferred_language,
+        l.company_id
+      FROM drip_campaign_subscribers dcs
+      JOIN drip_campaigns dc ON dcs.campaign_id = dc.id
+      JOIN leads l ON dcs.lead_id = l.id
+      WHERE dcs.id = $1 AND dcs.status = 'active'
+    `, [subscriber_id]);
+    
+    if (subscriberResult.rows.length === 0) {
+      return;
+    }
+    
+    const subscriber = subscriberResult.rows[0];
+    const next_step_number = subscriber.current_step + 1;
+    
+    const stepResult = await pool.query(`
+      SELECT * FROM drip_campaign_steps
+      WHERE campaign_id = $1 AND step_number = $2 AND is_active = TRUE
+    `, [subscriber.campaign_id, next_step_number]);
+    
+    if (stepResult.rows.length === 0) {
+      await pool.query(`
+        UPDATE drip_campaign_subscribers
+        SET status = 'completed', completed_at = NOW(), current_step = $1
+        WHERE id = $2
+      `, [next_step_number - 1, subscriber_id]);
+      
+      await pool.query(`
+        UPDATE drip_campaigns
+        SET total_completed = total_completed + 1
+        WHERE id = $1
+      `, [subscriber.campaign_id]);
+      
+      return;
+    }
+    
+    const step = stepResult.rows[0];
+    
+    const delay_minutes = 
+      (step.delay_days * 24 * 60) + 
+      (step.delay_hours * 60) + 
+      step.delay_minutes;
+    
+    const scheduled_for = new Date(Date.now() + delay_minutes * 60 * 1000);
+    
+    await pool.query(`
+      INSERT INTO drip_step_executions (
+        subscriber_id, step_id, lead_id,
+        status, scheduled_for
+      )
+      VALUES ($1, $2, $3, 'pending', $4)
+    `, [subscriber_id, step.id, subscriber.lead_id, scheduled_for]);
+    
+    await pool.query(`
+      UPDATE drip_campaign_subscribers
+      SET current_step = $1
+      WHERE id = $2
+    `, [next_step_number, subscriber_id]);
+    
+    console.log(`✅ Scheduled step ${next_step_number} for subscriber ${subscriber_id}`);
+    
+  } catch (error) {
+    console.error('Schedule next step error:', error);
+    throw error;
+  }
+}
+
+async function executePendingDripSteps() {
+  try {
+    const pendingResult = await pool.query(`
+      SELECT 
+        dse.*,
+        dcs.step_type,
+        dcs.subject,
+        dcs.message_body,
+        dcs.template_id,
+        dcsu.campaign_id,
+        l.phone_number,
+        l.email,
+        l.name as lead_name,
+        l.preferred_language,
+        l.company_id
+      FROM drip_step_executions dse
+      JOIN drip_campaign_steps dcs ON dse.step_id = dcs.id
+      JOIN drip_campaign_subscribers dcsu ON dse.subscriber_id = dcsu.id
+      JOIN leads l ON dse.lead_id = l.id
+      WHERE dse.status = 'pending'
+      AND dse.scheduled_for <= NOW()
+      AND dcsu.status = 'active'
+      LIMIT 100
+    `);
+    
+    for (const execution of pendingResult.rows) {
+      try {
+        let sent = false;
+        
+        switch (execution.step_type) {
+          case 'email':
+            if (execution.email) {
+              sent = await sendDripEmail(execution);
+            }
+            break;
+            
+          case 'whatsapp':
+            if (execution.phone_number) {
+              sent = await sendDripWhatsApp(execution);
+            }
+            break;
+            
+          case 'wait':
+            sent = true;
+            break;
+            
+          case 'task':
+            sent = await createDripTask(execution);
+            break;
+        }
+        
+        if (sent) {
+          await pool.query(`
+            UPDATE drip_step_executions
+            SET status = 'sent', sent_at = NOW()
+            WHERE id = $1
+          `, [execution.id]);
+          
+          await pool.query(`
+            UPDATE drip_campaign_subscribers
+            SET last_step_sent_at = NOW()
+            WHERE id = $1
+          `, [execution.subscriber_id]);
+          
+          await scheduleNextDripStep(execution.subscriber_id);
+          
+          await updateCampaignPerformance(execution.campaign_id, 'messages_sent');
+        }
+        
+      } catch (error) {
+        console.error(`Execution ${execution.id} failed:`, error);
+        
+        await pool.query(`
+          UPDATE drip_step_executions
+          SET status = 'failed', error_message = $1
+          WHERE id = $2
+        `, [error.message, execution.id]);
+      }
+    }
+    
+    if (pendingResult.rows.length > 0) {
+      console.log(`✅ Executed ${pendingResult.rows.length} drip steps`);
+    }
+    
+  } catch (error) {
+    console.error('Execute pending drip steps error:', error);
+  }
+}
+
+
+
+
+
+async function sendDripEmail(execution) {
+  try {
+    const emailConfig = await getCompanyEmailConfig(execution.company_id);
+    const transporter = await createEmailTransporter(emailConfig);
+    
+    let message = execution.message_body;
+    if (execution.preferred_language !== 'en') {
+      message = await translateText(message, execution.preferred_language, 'en');
+    }
+    
+    const mailOptions = {
+      from: emailConfig.email_address,
+      to: execution.email,
+      subject: execution.subject,
+      html: message
+    };
+    
+    await transporter.sendMail(mailOptions);
+    
+    await pool.query(`
+      INSERT INTO email_queue (
+        to_email, subject, body, lead_id, status, sent_at
+      )
+      VALUES ($1, $2, $3, $4, 'sent', NOW())
+    `, [execution.email, execution.subject, 'Drip email sent', execution.lead_id]);
+    
+    return true;
+  } catch (error) {
+    console.error('Send drip email error:', error);
+    return false;
+  }
+}
+
+
+
+
+async function sendDripWhatsApp(execution) {
+  try {
+    const agentResult = await pool.query(`
+      SELECT ai.* FROM agent_instances ai
+      WHERE ai.company_id = $1 
+      AND ai.agent_type = 'whatsapp'
+      AND ai.is_active = TRUE
+      LIMIT 1
+    `, [execution.company_id]);
+    
+    if (agentResult.rows.length === 0) {
+      throw new Error('No WhatsApp agent configured');
+    }
+    
+    const agent = agentResult.rows[0];
+    const credentials = agent.whatsapp_credentials;
+    
+    let message = execution.message_body;
+    if (execution.preferred_language !== 'en') {
+      message = await translateText(message, execution.preferred_language, 'en');
+    }
+    
+    const response = await axios.post(
+      `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: execution.phone_number.replace('+', ''),
+        type: 'text',
+        text: { body: message }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${credentials.access_token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    await pool.query(`
+      INSERT INTO whatsapp_messages 
+      (lead_id, phone_number, message_type, message_body, sender, is_from_user, message_id)
+      VALUES ($1, $2, 'text', $3, 'bot', FALSE, $4)
+    `, [execution.lead_id, execution.phone_number, message, response.data.messages[0].id]);
+    
+    return true;
+  } catch (error) {
+    console.error('Send drip WhatsApp error:', error);
+    return false;
+  }
+}
+
+
+async function createDripTask(execution) {
+  try {
+    await pool.query(`
+      INSERT INTO tasks (
+        company_id, lead_id, task_type, title,
+        description, due_date, priority, status
+      )
+      VALUES ($1, $2, 'follow_up', $3, $4, $5, 'medium', 'pending')
+    `, [
+      execution.company_id,
+      execution.lead_id,
+      `Drip Campaign Task: ${execution.subject || 'Follow up'}`,
+      execution.message_body,
+      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    ]);
+    
+    return true;
+  } catch (error) {
+    console.error('Create drip task error:', error);
+    return false;
+  }
+}
+
+async function updateCampaignPerformance(campaign_id, metric, increment = 1) {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    await pool.query(`
+      INSERT INTO campaign_performance (campaign_id, date, ${metric})
+      VALUES ($1, $2, $3)
+      ON CONFLICT (campaign_id, date) DO UPDATE
+      SET ${metric} = campaign_performance.${metric} + $3
+    `, [campaign_id, today, increment]);
+    
+  } catch (error) {
+    console.error('Update campaign performance error:', error);
+  }
+}
+
+
+
+
+
+// ============================================
+// MODULE 8: ADVANCED REPORTING ENDPOINTS
+// ============================================
+
+/**
+ * Get comprehensive agent performance report
+ * GET /api/reports/agent-performance
+ */
+app.get('/api/reports/agent-performance', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date, agent_id } = req.query;
+    
+    let dateFilter = '';
+    const params = [];
+    let paramCount = 0;
+    
+    if (company_id) {
+      paramCount++;
+      params.push(company_id);
+    }
+    
+    if (start_date && end_date) {
+      paramCount += 2;
+      params.push(start_date, end_date);
+      dateFilter = ` AND l.created_at BETWEEN $${paramCount - 1} AND $${paramCount}`;
+    }
+    
+    let agentFilter = '';
+    if (agent_id) {
+      paramCount++;
+      params.push(agent_id);
+      agentFilter = ` AND ha.id = $${paramCount}`;
+    }
+    
+    const query = `
+      SELECT 
+        ha.id as agent_id,
+        ha.name as agent_name,
+        ha.email as agent_email,
+        ha.role as agent_role,
+        
+        -- Lead Metrics
+        COUNT(DISTINCT l.id) as total_leads_assigned,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'qualified') as qualified_leads,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won') as won_deals,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_lost') as lost_deals,
+        AVG(l.interest_level) as avg_lead_interest,
+        
+        -- Call Metrics
+        COUNT(DISTINCT cl.id) as total_calls,
+        COUNT(DISTINCT cl.id) FILTER (WHERE cl.call_status = 'completed') as completed_calls,
+        AVG(cl.call_duration) FILTER (WHERE cl.call_status = 'completed') as avg_call_duration,
+        COUNT(DISTINCT cl.id) FILTER (WHERE cl.sentiment->>'sentiment' = 'positive') as positive_sentiment_calls,
+        
+        -- Task Metrics
+        COUNT(DISTINCT t.id) as total_tasks,
+        COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'completed') as completed_tasks,
+        COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'pending' AND t.due_date < NOW()) as overdue_tasks,
+        AVG(EXTRACT(EPOCH FROM (t.completed_at - t.created_at)) / 3600) 
+          FILTER (WHERE t.status = 'completed') as avg_task_completion_hours,
+        
+        -- Revenue Metrics
+        SUM(i.amount) FILTER (WHERE i.status = 'paid') as total_revenue,
+        COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'paid') as paid_invoices,
+        
+        -- Conversion Rates
+        CASE 
+          WHEN COUNT(DISTINCT l.id) > 0 
+          THEN (COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won')::float / COUNT(DISTINCT l.id) * 100)
+          ELSE 0 
+        END as win_rate,
+        
+        CASE 
+          WHEN COUNT(DISTINCT cl.id) > 0 
+          THEN (COUNT(DISTINCT cl.id) FILTER (WHERE cl.call_status = 'completed')::float / COUNT(DISTINCT cl.id) * 100)
+          ELSE 0 
+        END as call_completion_rate,
+        
+        CASE 
+          WHEN COUNT(DISTINCT t.id) > 0 
+          THEN (COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'completed')::float / COUNT(DISTINCT t.id) * 100)
+          ELSE 0 
+        END as task_completion_rate
+        
+      FROM human_agents ha
+      LEFT JOIN leads l ON l.assigned_to_agent = ha.name ${company_id ? 'AND l.company_id = $1' : ''} ${dateFilter}
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN tasks t ON t.assigned_to_agent_id = ha.id
+      LEFT JOIN invoices i ON l.id = i.lead_id
+      WHERE 1=1 ${agentFilter}
+      GROUP BY ha.id, ha.name, ha.email, ha.role
+      ORDER BY total_revenue DESC, won_deals DESC
+    `;
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', '/api/reports/agent-performance', 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Agent performance report error:', error);
+    logRequest('GET', '/api/reports/agent-performance', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+/**
+ * Get revenue forecasting report
+ * GET /api/reports/revenue-forecast
+ */
+app.get('/api/reports/revenue-forecast', async (req, res) => {
+  try {
+    const { company_id, months = 3 } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id is required' });
+    }
+    
+    // Historical revenue data
+    const historicalResult = await pool.query(`
+      SELECT 
+        DATE_TRUNC('month', i.created_at) as month,
+        SUM(i.amount) FILTER (WHERE i.status = 'paid') as revenue,
+        COUNT(DISTINCT i.lead_id) FILTER (WHERE i.status = 'paid') as customers,
+        AVG(i.amount) FILTER (WHERE i.status = 'paid') as avg_deal_size,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'new') as new_leads
+      FROM invoices i
+      JOIN leads l ON i.lead_id = l.id
+      WHERE l.company_id = $1
+      AND i.created_at >= NOW() - INTERVAL '12 months'
+      GROUP BY DATE_TRUNC('month', i.created_at)
+      ORDER BY month DESC
+    `, [company_id]);
+    
+    // Current pipeline value
+    const pipelineResult = await pool.query(`
+      SELECT 
+        l.lead_status,
+        COUNT(*) as count,
+        SUM(COALESCE((l.metadata->>'expected_value')::numeric, 1000)) as pipeline_value
+      FROM leads l
+      WHERE l.company_id = $1
+      AND l.lead_status NOT IN ('closed_won', 'closed_lost')
+      GROUP BY l.lead_status
+    `, [company_id]);
+    
+    // Calculate metrics for forecasting
+    const recentMonths = historicalResult.rows.slice(0, 6);
+    const avgMonthlyRevenue = recentMonths.reduce((sum, row) => sum + parseFloat(row.revenue || 0), 0) / recentMonths.length;
+    const avgMonthlyGrowth = recentMonths.length > 1 
+      ? ((parseFloat(recentMonths[0].revenue) - parseFloat(recentMonths[recentMonths.length - 1].revenue)) / parseFloat(recentMonths[recentMonths.length - 1].revenue)) / recentMonths.length
+      : 0.05;
+    
+    // Generate forecast
+    const forecast = [];
+    let forecastRevenue = avgMonthlyRevenue;
+    
+    for (let i = 0; i < parseInt(months); i++) {
+      const forecastDate = new Date();
+      forecastDate.setMonth(forecastDate.getMonth() + i + 1);
+      
+      forecastRevenue *= (1 + avgMonthlyGrowth);
+      
+      forecast.push({
+        month: forecastDate.toISOString().split('T')[0].substring(0, 7),
+        forecasted_revenue: Math.round(forecastRevenue * 100) / 100,
+        confidence: Math.max(0.5, 1 - (i * 0.1)) // Confidence decreases over time
+      });
+    }
+    
+    logRequest('GET', '/api/reports/revenue-forecast', 200);
+    res.json({
+      success: true,
+      data: {
+        historical_data: historicalResult.rows,
+        current_pipeline: pipelineResult.rows,
+        forecast: forecast,
+        metrics: {
+          avg_monthly_revenue: Math.round(avgMonthlyRevenue * 100) / 100,
+          avg_growth_rate: Math.round(avgMonthlyGrowth * 10000) / 100,
+          total_pipeline_value: pipelineResult.rows.reduce((sum, row) => sum + parseFloat(row.pipeline_value || 0), 0)
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('Revenue forecast error:', error);
+    logRequest('GET', '/api/reports/revenue-forecast', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
+ * Get churn prediction report
+ * GET /api/reports/churn-prediction
+ */
+app.get('/api/reports/churn-prediction', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id is required' });
+    }
+    
+    // Identify at-risk customers
+    const atRiskResult = await pool.query(`
+      SELECT 
+        l.id,
+        l.name,
+        l.phone_number,
+        l.email,
+        l.lead_status,
+        l.interest_level,
+        
+        -- Engagement metrics
+        EXTRACT(DAY FROM (NOW() - l.last_contacted)) as days_since_contact,
+        COUNT(DISTINCT cl.id) as total_calls,
+        COUNT(DISTINCT wm.id) as total_messages,
+        MAX(cl.created_at) as last_call_date,
+        MAX(wm.timestamp) as last_message_date,
+        
+        -- Revenue metrics
+        COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'paid') as paid_invoices,
+        COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'overdue') as overdue_invoices,
+        SUM(i.amount) FILTER (WHERE i.status = 'overdue') as overdue_amount,
+        
+        -- Churn risk score calculation
+        CASE
+          WHEN EXTRACT(DAY FROM (NOW() - l.last_contacted)) > 30 THEN 40
+          WHEN EXTRACT(DAY FROM (NOW() - l.last_contacted)) > 14 THEN 20
+          ELSE 0
+        END +
+        CASE
+          WHEN l.interest_level < 3 THEN 30
+          WHEN l.interest_level < 5 THEN 15
+          ELSE 0
+        END +
+        CASE
+          WHEN COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'overdue') > 0 THEN 30
+          ELSE 0
+        END as churn_risk_score
+        
+      FROM leads l
+      LEFT JOIN call_logs cl ON l.id = cl.lead_id
+      LEFT JOIN whatsapp_messages wm ON l.id = wm.lead_id
+      LEFT JOIN invoices i ON l.id = i.lead_id
+      WHERE l.company_id = $1
+      AND l.lead_status NOT IN ('closed_lost')
+      GROUP BY l.id
+      HAVING 
+        EXTRACT(DAY FROM (NOW() - l.last_contacted)) > 14 
+        OR l.interest_level < 5
+        OR COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'overdue') > 0
+      ORDER BY 
+        CASE
+          WHEN EXTRACT(DAY FROM (NOW() - l.last_contacted)) > 30 THEN 40
+          WHEN EXTRACT(DAY FROM (NOW() - l.last_contacted)) > 14 THEN 20
+          ELSE 0
+        END +
+        CASE
+          WHEN l.interest_level < 3 THEN 30
+          WHEN l.interest_level < 5 THEN 15
+          ELSE 0
+        END +
+        CASE
+          WHEN COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'overdue') > 0 THEN 30
+          ELSE 0
+        END DESC
+    `, [company_id]);
+    
+    // Categorize by risk level
+    const highRisk = atRiskResult.rows.filter(r => r.churn_risk_score >= 60);
+    const mediumRisk = atRiskResult.rows.filter(r => r.churn_risk_score >= 30 && r.churn_risk_score < 60);
+    const lowRisk = atRiskResult.rows.filter(r => r.churn_risk_score < 30);
+    
+    logRequest('GET', '/api/reports/churn-prediction', 200);
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          total_at_risk: atRiskResult.rows.length,
+          high_risk_count: highRisk.length,
+          medium_risk_count: mediumRisk.length,
+          low_risk_count: lowRisk.length
+        },
+        high_risk_leads: highRisk,
+        medium_risk_leads: mediumRisk,
+        low_risk_leads: lowRisk
+      }
+    });
+    
+  } catch (error) {
+    console.error('Churn prediction error:', error);
+    logRequest('GET', '/api/reports/churn-prediction', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
+ * Get campaign ROI analysis
+ * GET /api/reports/campaign-roi
+ */
+app.get('/api/reports/campaign-roi', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+    
+    if (!company_id) {
+      return res.status(400).json({ error: 'company_id is required' });
+    }
+    
+    let dateFilter = '';
+    const params = [company_id];
+    
+    if (start_date && end_date) {
+      params.push(start_date, end_date);
+      dateFilter = ` AND c.created_at BETWEEN $2 AND $3`;
+    }
+    
+    // Analyze all campaigns (both scheduled_calls and drip_campaigns)
+    const scheduledCampaignsResult = await pool.query(`
+      SELECT 
+        c.id as campaign_id,
+        c.campaign_name,
+        'scheduled_calls' as campaign_type,
+        COUNT(DISTINCT sc.id) as total_contacts,
+        COUNT(DISTINCT sc.id) FILTER (WHERE sc.status = 'called') as contacted,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won') as conversions,
+        SUM(i.amount) FILTER (WHERE i.status = 'paid') as revenue_generated,
+        0 as total_cost,
+        CASE 
+          WHEN COUNT(DISTINCT sc.id) FILTER (WHERE sc.status = 'called') > 0 
+          THEN (COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won')::float / COUNT(DISTINCT sc.id) FILTER (WHERE sc.status = 'called') * 100)
+          ELSE 0 
+        END as conversion_rate
+      FROM campaigns c
+      LEFT JOIN scheduled_calls sc ON c.id = sc.company_id
+      LEFT JOIN leads l ON sc.lead_id = l.id
+      LEFT JOIN invoices i ON l.id = i.lead_id
+      WHERE c.company_id = $1 ${dateFilter}
+      GROUP BY c.id, c.campaign_name
+    `, params);
+    
+    const dripCampaignsResult = await pool.query(`
+      SELECT 
+        dc.id as campaign_id,
+        dc.campaign_name,
+        'drip_campaign' as campaign_type,
+        COUNT(DISTINCT dcs.id) as total_contacts,
+        COUNT(DISTINCT dse.id) FILTER (WHERE dse.status = 'sent') as contacted,
+        COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won') as conversions,
+        SUM(COALESCE(cp.revenue_generated, 0)) as revenue_generated,
+        SUM(COALESCE(cp.total_cost, 0)) as total_cost,
+        CASE 
+          WHEN COUNT(DISTINCT dse.id) FILTER (WHERE dse.status = 'sent') > 0 
+          THEN (COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won')::float / COUNT(DISTINCT dse.id) FILTER (WHERE dse.status = 'sent') * 100)
+          ELSE 0 
+        END as conversion_rate
+      FROM drip_campaigns dc
+      LEFT JOIN drip_campaign_subscribers dcs ON dc.id = dcs.campaign_id
+      LEFT JOIN drip_step_executions dse ON dcs.id = dse.subscriber_id
+      LEFT JOIN leads l ON dcs.lead_id = l.id
+      LEFT JOIN campaign_performance cp ON dc.id = cp.campaign_id
+      WHERE dc.company_id = $1 ${dateFilter}
+      GROUP BY dc.id, dc.campaign_name
+    `, params);
+    
+    // Combine results and calculate ROI
+    const allCampaigns = [
+      ...scheduledCampaignsResult.rows,
+      ...dripCampaignsResult.rows
+    ].map(campaign => {
+      const revenue = parseFloat(campaign.revenue_generated) || 0;
+      const cost = parseFloat(campaign.total_cost) || 0;
+      const netProfit = revenue - cost;
+      const roi = cost > 0 ? ((netProfit / cost) * 100) : 0;
+      
+      return {
+        ...campaign,
+        revenue_generated: Math.round(revenue * 100) / 100,
+        total_cost: Math.round(cost * 100) / 100,
+        net_profit: Math.round(netProfit * 100) / 100,
+        roi: Math.round(roi * 100) / 100,
+        conversion_rate: Math.round(parseFloat(campaign.conversion_rate) * 100) / 100
+      };
+    });
+    
+    // Sort by ROI
+    allCampaigns.sort((a, b) => b.roi - a.roi);
+    
+    logRequest('GET', '/api/reports/campaign-roi', 200);
+    res.json({
+      success: true,
+      count: allCampaigns.length,
+      data: allCampaigns
+    });
+    
+  } catch (error) {
+    console.error('Campaign ROI analysis error:', error);
+    logRequest('GET', '/api/reports/campaign-roi', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
+ * Schedule report delivery
+ * POST /api/reports/schedule
+ */
+app.post('/api/reports/schedule', async (req, res) => {
+  try {
+    const {
+      company_id,
+      report_type,
+      frequency,
+      recipients,
+      format = 'pdf',
+      delivery_time = '09:00'
+    } = req.body;
+    
+    if (!company_id || !report_type || !frequency || !recipients) {
+      return res.status(400).json({
+        error: 'company_id, report_type, frequency, and recipients are required'
+      });
+    }
+    
+    const result = await pool.query(`
+      INSERT INTO scheduled_reports (
+        company_id, report_type, frequency,
+        recipients, format, delivery_time,
+        is_active, next_delivery
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, TRUE, 
+        CASE 
+          WHEN $3 = 'daily' THEN (CURRENT_DATE + 1) + $6::time
+          WHEN $3 = 'weekly' THEN (CURRENT_DATE + 7) + $6::time
+          WHEN $3 = 'monthly' THEN (CURRENT_DATE + 30) + $6::time
+        END
+      )
+      RETURNING *
+    `, [
+      company_id,
+      report_type,
+      frequency,
+      JSON.stringify(recipients),
+      format,
+      delivery_time
+    ]);
+    
+    logRequest('POST', '/api/reports/schedule', 201);
+    res.status(201).json({
+      success: true,
+      data: result.rows[0],
+      message: 'Report scheduled successfully'
+    });
+    
+  } catch (error) {
+    console.error('Schedule report error:', error);
+    logRequest('POST', '/api/reports/schedule', 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+
+/**
+ * Get scheduled reports
+ * GET /api/reports/scheduled/:company_id
+ */
+app.get('/api/reports/scheduled/:company_id', async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT * FROM scheduled_reports
+      WHERE company_id = $1
+      ORDER BY created_at DESC
+    `, [company_id]);
+    
+    logRequest('GET', `/api/reports/scheduled/${company_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get scheduled reports error:', error);
+    logRequest('GET', `/api/reports/scheduled/${company_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
    
 
 
@@ -14680,6 +17384,71 @@ if (process.env.NODE_ENV === 'production') {
 
   console.log('✓ Automated background tasks initialized');
 }
+
+
+
+// ============================================
+// AUTOMATED LEAD SYNC FROM AD PLATFORMS
+// Add this at the bottom before server.listen()
+// ============================================
+
+if (process.env.NODE_ENV === 'production') {
+  // Sync leads every 15 minutes
+  setInterval(async () => {
+    try {
+      console.log('🔄 Running automated lead sync...');
+      
+      // Get all active lead source configs
+      const configsResult = await pool.query(`
+        SELECT DISTINCT company_id, platform
+        FROM lead_source_configs
+        WHERE is_active = TRUE
+      `);
+      
+      for (const config of configsResult.rows) {
+        try {
+          if (config.platform === 'meta') {
+            await axios.post(`${process.env.BASE_URL}/api/oauth/meta/sync-leads`, {
+              company_id: config.company_id,
+              limit: 10
+            });
+          }
+          // Add Google Ads and LinkedIn sync here if needed
+        } catch (syncError) {
+          console.error(`Failed to sync ${config.platform} for company ${config.company_id}:`, syncError.message);
+        }
+      }
+      
+      console.log('✅ Lead sync completed');
+    } catch (error) {
+      console.error('Lead sync error:', error);
+    }
+  }, 15 * 60 * 1000); // Every 15 minutes
+  
+  console.log('✓ Automated lead sync initialized (15min intervals)');
+}
+
+
+
+// ============================================
+// BACKGROUND TASKS FOR MODULE 7 & 8
+// ============================================
+
+if (process.env.NODE_ENV === 'production') {
+  // Execute drip campaign steps every 5 minutes
+  setInterval(async () => {
+    try {
+      console.log('🔄 Executing pending drip campaign steps...');
+      await executePendingDripSteps();
+    } catch (error) {
+      console.error('Drip campaign execution error:', error);
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+  
+  console.log('✓ Drip campaign automation initialized (5min intervals)');
+}
+
+
 
 
 
