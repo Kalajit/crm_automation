@@ -12,6 +12,14 @@ const multer = require('multer');
 const path = require('path');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
+const PDFDocument = require('pdfkit');
+
+const { Translate } = require('@google-cloud/translate').v2;
+const invoicePayment = require('./invoicePayment.js');
+
+
 
 
 
@@ -19,192 +27,25 @@ require('dotenv').config();
 
 const app = express();
 
-
-
-// Create HTTP server for both Express and WebSocket
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// Track active WebSocket connections per call_sid
-const activeConnections = new Map(); // call_sid -> Set of WebSocket clients
-
-// // Translation function using Google Translate API
-// async function translateText(text, targetLang, sourceLang = 'en') {
-//   if (targetLang === sourceLang || !text) return text;
-  
-//   try {
-//     // Primary: LibreTranslate
-//     const response = await axios.post(`${INDICTRANS_URL}/translate`, {
-//       q: text,
-//       source: sourceLang,
-//       target: targetLang,
-//       format: 'text'
-//     }, { timeout: 15000 });
-    
-//     const translated = response.data.translatedText;
-    
-//     if (translated && translated !== text) {
-//       console.log(`LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
-//       return translated;
-//     }
-    
-//   } catch (error) {
-//     console.error('LibreTranslate error:', error.message);
-    
-//     // Fallback: DeepL (if API key set)
-//     if (DEEPL_API_KEY && !['hi', 'kn', 'ml', 'ta', 'te'].includes(targetLang)) {
-//       try {
-//         const deepl = require('deepl-node');
-//         const translator = new deepl.Translator(DEEPL_API_KEY);
-//         const result = await translator.translateText(text, sourceLang, targetLang);
-//         console.log(`DeepL fallback used: ${text.substring(0, 50)}...`);
-//         return result.text;
-//       } catch (deeplError) {
-//         console.error('DeepL fallback error:', deeplError.message);
-//       }
-//     }
-//   }
-
-//   // Ultimate fallback: return original
-//   console.warn(`Translation failed, returning original: ${text.substring(0, 50)}...`);
-//   return text;
-// }
+// Initialize Google Cloud Translation client
+const translate = new Translate({
+  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS || path.join(__dirname, 'google-credentials.json')
+});
 
 
 
 
-// /**
-//  * Detect language from text using Unicode ranges + keywords
-//  * (No external API needed, instant detection)
-//  */
-// function detectLanguage(text) {
-//   const lowerText = text.toLowerCase();
-  
-//   // Keyword-based detection
-//   if (lowerText.includes('hindi') || lowerText.includes('हिंदी') || /[\u0900-\u097F]/.test(text)) {
-//     return 'hi';
-//   }
-  
-//   if (lowerText.includes('kannada') || lowerText.includes('ಕನ್ನಡ') || /[\u0C80-\u0CFF]/.test(text)) {
-//     return 'kn';
-//   }
-  
-//   if (lowerText.includes('malayalam') || lowerText.includes('മലയാളം') || /[\u0D00-\u0D7F]/.test(text)) {
-//     return 'ml';
-//   }
-  
-//   if (lowerText.includes('tamil') || lowerText.includes('தமிழ்') || /[\u0B80-\u0BFF]/.test(text)) {
-//     return 'ta';
-//   }
-  
-//   if (lowerText.includes('telugu') || lowerText.includes('తెలుగు') || /[\u0C00-\u0C7F]/.test(text)) {
-//     return 'te';
-//   }
-  
-//   return 'en';
-// }
+// Language mappings
+const LANGUAGE_MAP = {
+  'en': 'English',
+  'hi': 'Hindi',
+  'kn': 'Kannada',
+  'ml': 'Malayalam',
+  'ta': 'Tamil',
+  'te': 'Telugu'
+};
 
-
-// ============================================
-// ✅ UPDATED: Translation Function (LibreTranslate + DeepL Fallback)
-// ============================================
-
-/**
- * Translates text using LibreTranslate (free) with DeepL fallback (paid)
- * @param {string} text - Text to translate
- * @param {string} targetLang - Target language code (hi, kn, ml, ta, te, en)
- * @param {string} sourceLang - Source language code (default: 'en')
- * @returns {Promise<string>} - Translated text (or original if translation fails)
- */
-async function translateText(text, targetLang, sourceLang = 'en') {
-  // Skip translation if same language or empty text
-  if (targetLang === sourceLang || !text || text.trim().length === 0) {
-    return text;
-  }
-  
-  try {
-    // ========================================
-    // PRIMARY: LibreTranslate (Free Public API)
-    // ========================================
-    console.log(`🌐 Translating: ${sourceLang} → ${targetLang} | "${text.substring(0, 50)}..."`);
-    
-    const response = await axios.post(`${INDICTRANS_URL}/translate`, {
-      q: text,
-      source: sourceLang,
-      target: targetLang,
-      format: 'text'
-    }, { 
-      timeout: 15000,
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    const translated = response.data.translatedText;
-    
-    // Validate translation quality
-    if (translated && translated !== text && translated.trim().length > 0) {
-      console.log(`✅ LibreTranslate: ${text.substring(0, 50)}... → ${translated.substring(0, 50)}...`);
-      return translated;
-    } else {
-      console.warn(`⚠️ LibreTranslate returned invalid/same text, trying fallback...`);
-    }
-    
-  } catch (error) {
-    console.error(`❌ LibreTranslate error (${error.message}), trying fallback...`);
-  }
-  
-  // ========================================
-  // FALLBACK: DeepL (Paid, for non-Indic languages)
-  // ========================================
-  if (DEEPL_API_KEY && !['hi', 'kn', 'ml', 'ta', 'te'].includes(targetLang)) {
-    try {
-      console.log(`🔄 Using DeepL fallback for ${sourceLang} → ${targetLang}`);
-      
-      const deepl = require('deepl-node');
-      const translator = new deepl.Translator(DEEPL_API_KEY);
-      
-      const result = await translator.translateText(
-        text, 
-        sourceLang.toUpperCase(), 
-        targetLang.toUpperCase()
-      );
-      
-      console.log(`✅ DeepL: ${text.substring(0, 50)}... → ${result.text.substring(0, 50)}...`);
-      return result.text;
-      
-    } catch (deeplError) {
-      console.error(`❌ DeepL fallback error: ${deeplError.message}`);
-    }
-  }
-  
-  // ========================================
-  // LAST RESORT: Return original text
-  // ========================================
-  console.warn(`⚠️ Translation failed for "${text.substring(0, 50)}...", returning original`);
-  return text;
-}
-
-// ============================================
-// ✅ UPDATED: Language Detection Function
-// ============================================
-
-/**
- * Detects language from text using Unicode ranges + keywords
- * @param {string} text - Text to analyze
- * @returns {string} - Detected language code (hi, kn, ml, ta, te, en)
- */
-function detectLanguage(text) {
-  if (!text || text.trim().length < 3) {
-    return 'en'; // Default to English for short/empty text
-  }
-  
-  const lowerText = text.toLowerCase();
-  
-  // ========================================
-  // 1. Keyword-based detection (explicit language requests)
-  // ========================================
-  const languageKeywords = {
+const LANGUAGE_KEYWORDS = {
     'hi': ['hindi', 'hindi mein', 'हिंदी', 'hindi me bolo', 'speak hindi', 'हिन्दी में'],
     'kn': ['kannada', 'kannada mein', 'ಕನ್ನಡ', 'kannada nalli', 'speak kannada', 'ಕನ್ನಡದಲ್ಲಿ'],
     'ml': ['malayalam', 'malayalam il', 'മലയാളം', 'malayalam parayamo', 'speak malayalam', 'മലയാളത്തിൽ'],
@@ -213,74 +54,98 @@ function detectLanguage(text) {
     'en': ['english', 'english mein', 'speak english', 'english please', 'talk in english']
   };
   
-  for (const [langCode, keywords] of Object.entries(languageKeywords)) {
-    if (keywords.some(keyword => lowerText.includes(keyword))) {
+
+// Create HTTP server for both Express and WebSocket
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// Track active WebSocket connections per call_sid
+const activeConnections = new Map(); // call_sid -> Set of WebSocket clients
+
+
+
+// ============================================
+// ✅ UPDATED: Translation Function (LibreTranslate + DeepL Fallback)
+// ============================================
+
+
+
+/**
+ * Translate text using Google Cloud Translation API
+ * @param {string} text - Text to translate
+ * @param {string} targetLang - Target language code
+ * @param {string} sourceLang - Source language code (optional)
+ * @returns {Promise<string>} - Translated text
+ */
+async function translateText(text, targetLang, sourceLang = null) {
+  if (!text || !text.trim()) {
+    return text;
+  }
+
+  // No translation needed
+  if (sourceLang === targetLang) {
+    return text;
+  }
+
+  try {
+    const options = {
+      to: targetLang
+    };
+    
+    if (sourceLang) {
+      options.from = sourceLang;
+    }
+
+    const [translation] = await translate.translate(text, options);
+    console.log(`✅ Translated: ${text.substring(0, 50)}... → ${translation.substring(0, 50)}...`);
+    return translation;
+  } catch (error) {
+    console.error('❌ Translation failed:', error);
+    return text; // Return original text on failure
+  }
+}
+
+
+
+
+/**
+ * Detect language using Google Cloud Translation API
+ * @param {string} text - Text to detect language for
+ * @returns {Promise<string>} - Language code
+ */
+async function detectLanguage(text) {
+  if (!text || text.trim().length < 3) {
+    return 'en';
+  }
+
+  // Check for explicit language keywords first
+  const textLower = text.toLowerCase();
+  for (const [langCode, keywords] of Object.entries(LANGUAGE_KEYWORDS)) {
+    if (keywords.some(keyword => textLower.includes(keyword))) {
       console.log(`🔍 Detected language via keyword: ${langCode}`);
       return langCode;
     }
   }
-  
-  // ========================================
-  // 2. Unicode range detection (script-based)
-  // ========================================
-  const unicodeRanges = {
-    'hi': /[\u0900-\u097F]/,  // Devanagari (Hindi)
-    'kn': /[\u0C80-\u0CFF]/,  // Kannada
-    'ml': /[\u0D00-\u0D7F]/,  // Malayalam
-    'ta': /[\u0B80-\u0BFF]/,  // Tamil
-    'te': /[\u0C00-\u0C7F]/   // Telugu
-  };
-  
-  for (const [langCode, regex] of Object.entries(unicodeRanges)) {
-    if (regex.test(text)) {
-      console.log(`🔍 Detected language via Unicode: ${langCode}`);
-      return langCode;
-    }
-  }
-  
-  // ========================================
-  // 3. Advanced: Use langdetect library (optional)
-  // ========================================
+
   try {
-    const { detect } = require('langdetect');
-    const detectedLang = detect(text)[0].lang;
-    
-    // Map langdetect codes to our system
-    const langMap = {
-      'hi': 'hi',
-      'kn': 'kn', 
-      'ml': 'ml',
-      'ta': 'ta',
-      'te': 'te',
-      'en': 'en'
-    };
-    
-    if (langMap[detectedLang]) {
-      console.log(`🔍 Detected language via langdetect: ${detectedLang}`);
-      return langMap[detectedLang];
+    const [detection] = await translate.detect(text);
+    const detectedLang = detection.language;
+    const confidence = detection.confidence;
+
+    if (LANGUAGE_MAP[detectedLang]) {
+      console.log(`🔍 Detected language: ${detectedLang} (confidence: ${confidence.toFixed(2)})`);
+      return detectedLang;
+    } else {
+      console.log(`⚠️ Unsupported language detected: ${detectedLang}, defaulting to English`);
+      return 'en';
     }
-  } catch (detectError) {
-    console.debug(`langdetect not available or failed: ${detectError.message}`);
+  } catch (error) {
+    console.error('❌ Language detection failed:', error);
+    return 'en';
   }
-  
-  // ========================================
-  // 4. Default to English
-  // ========================================
-  console.log(`🔍 No language detected, defaulting to English`);
-  return 'en';
 }
 
-// ============================================
-// ✅ NEW: Batch Translation Function (for efficiency)
-// ============================================
 
-/**
- * Translates multiple texts in a single batch (more efficient)
- * @param {Array<string>} texts - Array of texts to translate
- * @param {string} targetLang - Target language code
- * @param {string} sourceLang - Source language code (default: 'en')
- * @returns {Promise<Array<string>>} - Array of translated texts
- */
 async function translateBatch(texts, targetLang, sourceLang = 'en') {
   if (targetLang === sourceLang || !texts || texts.length === 0) {
     return texts;
@@ -321,14 +186,15 @@ async function translateBatch(texts, targetLang, sourceLang = 'en') {
 // // ✅ EXPORT FUNCTIONS
 // // ============================================
 
-// module.exports = {
-//   translateText,
-//   detectLanguage,
-//   translateBatch
-// };
-
-// // LibreTranslate Configuration
-// const LIBRETRANSLATE_URL = process.env.LIBRETRANSLATE_URL || 'http://libretranslate:5000';
+module.exports = {
+  detectLanguage,
+  translateText,
+  handleMultilingualWhatsAppMessage,
+  sendWhatsAppResponse,
+  generateWhatsAppConfirmation,
+  generateAlternativeSlotsMessage,
+  LANGUAGE_MAP
+};
 
 
 // IndicTrans2 Configuration (AI4Bharat - Best for Indian Languages)
@@ -340,6 +206,19 @@ const DEEPL_API_KEY = process.env.DEEPL_API_KEY || null;
 
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 
+
+// ============================================
+// PHONEPE CONFIGURATION
+// ============================================
+
+const PHONEPE_CONFIG = {
+  merchantId: process.env.PHONEPE_MERCHANT_ID || 'PGTESTPAYUAT',
+  saltKey: process.env.PHONEPE_SALT_KEY || '099eb0cd-02cf-4e2a-8aca-3e6c6aff0399',
+  saltIndex: parseInt(process.env.PHONEPE_SALT_INDEX || '1'),
+  baseUrl: process.env.PHONEPE_BASE_URL || 'https://api-preprod.phonepe.com/apis/pg-sandbox',
+  redirectUrl: process.env.PHONEPE_REDIRECT_URL || 'http://localhost:3000/payment-result',
+  callbackUrl: process.env.PHONEPE_CALLBACK_URL || 'http://localhost:3000/api/payment-callback'
+};
 
 
 // ============================================
@@ -355,6 +234,7 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -1349,41 +1229,6 @@ app.post('/api/faqs', async (req, res) => {
 // 5. BOOKING ENDPOINTS
 // ============================================
 
-// Create booking
-// app.post('/api/bookings', async (req, res) => {
-//   try {
-//     const { lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location } = req.body;
-
-//     if (!lead_id || !scheduled_date) {
-//       return res.status(400).json({ error: 'lead_id and scheduled_date are required' });
-//     }
-
-//     const query = `
-//       INSERT INTO bookings (lead_id, phone_number, booking_type, scheduled_date, duration_minutes, location)
-//       VALUES ($1, $2, $3, $4, $5, $6)
-//       RETURNING *;
-//     `;
-
-//     const result = await pool.query(query, [
-//       lead_id,
-//       phone_number,
-//       booking_type,
-//       scheduled_date,
-//       duration_minutes || 30,
-//       location,
-//     ]);
-
-//     logRequest('POST', '/api/bookings', 201);
-//     res.status(201).json({ success: true, data: result.rows[0] });
-//   } catch (error) {
-//     logRequest('POST', '/api/bookings', 500);
-//     handleError(res, error);
-//   }
-// });
-
-
-
-
 // Create new booking
 app.post('/api/bookings', async (req, res) => {
   try {
@@ -2233,7 +2078,6 @@ app.get('/api/notifications/pending/:phone', async (req, res) => {
 });
 
 
-// Add to server.js
 app.get('/api/notifications/pending/all', async (req, res) => {
   try {
     const now = new Date();
@@ -2257,7 +2101,6 @@ app.get('/api/notifications/pending/all', async (req, res) => {
 
 
 
-// Add to server.js
 app.patch('/api/notifications/:id/sent', async (req, res) => {
   try {
     const { id } = req.params;
@@ -4822,7 +4665,7 @@ app.post('/api/conversations/ai-fallback', async (req, res) => {
 // ============================================
 // RATE LIMITING: CONVERSATION THROTTLE CHECK
 // ============================================
-const conversationRateLimits = new Map(); // phone_number -> {count, resetTime}
+const conversationRateLimits = new Map(); 
 
 app.get('/api/conversations/rate-check/:phone', async (req, res) => {
   try {
@@ -4893,9 +4736,6 @@ app.get('/api/system/status', async (req, res) => {
     `);
     metrics.pending_takeovers = parseInt(takeoverCount.rows[0].count);
     
-    // Active calls
-    // metrics.active_calls = len(ACTIVE_CALLS);
-    // FIX: Use proper activeConnections.size
     metrics.active_websocket_connections = activeConnections.size;
     
     res.json({
@@ -5516,7 +5356,6 @@ app.get('/api/whatsapp/oauth/start', async (req, res) => {
 
 
 // ✅ FINAL WORKING VERSION - Tested in both Dev and Live modes
-// ✅ FINAL WORKING VERSION - Tested in both Dev and Live modes
 app.get('/api/whatsapp/oauth/callback', async (req, res) => {
   try {
     const { code, state, error: oauth_error, error_description } = req.query;
@@ -5595,7 +5434,6 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     
     // ============================================
     // STEP 3: Extract WABA ID from granted scopes
-    // 🔥 KEY FIX: This works in both Dev and Live mode
     // ============================================
     let wabaId = null;
     
@@ -6712,7 +6550,6 @@ app.post('/api/whatsapp/send-bulk', async (req, res) => {
 
 /**
  * Start Twilio OAuth Flow
- * GET /api/twilio/oauth/start?company_id=X&agent_instance_id=Y
  */
 app.get('/api/twilio/oauth/start', async (req, res) => {
   try {
@@ -6749,7 +6586,6 @@ app.get('/api/twilio/oauth/start', async (req, res) => {
 
 /**
  * Twilio OAuth Callback
- * GET /api/twilio/oauth/callback?code=XXX&state=YYY
  */
 app.get('/api/twilio/oauth/callback', async (req, res) => {
   try {
@@ -6856,7 +6692,6 @@ app.get('/api/twilio/oauth/callback', async (req, res) => {
 
 /**
  * Check Twilio Connection Status
- * GET /api/twilio/oauth/status/:agent_instance_id
  */
 app.get('/api/twilio/oauth/status/:agent_instance_id', async (req, res) => {
   try {
@@ -6897,7 +6732,6 @@ app.get('/api/twilio/oauth/status/:agent_instance_id', async (req, res) => {
 
 /**
  * Disconnect Twilio Account
- * DELETE /api/twilio/oauth/disconnect/:agent_instance_id
  */
 app.delete('/api/twilio/oauth/disconnect/:agent_instance_id', async (req, res) => {
   try {
@@ -7008,7 +6842,6 @@ app.post('/twilio/voice-webhook', async (req, res) => {
 
 /**
  * Configure Airtel SIP Credentials (Manual Setup)
- * POST /api/airtel-sip/configure
  */
 app.post('/api/airtel-sip/configure', async (req, res) => {
   try {
@@ -7063,7 +6896,6 @@ app.post('/api/airtel-sip/configure', async (req, res) => {
 
 /**
  * Get SIP Configuration Status
- * GET /api/sip/status/:agent_instance_id
  */
 app.get('/api/sip/status/:agent_instance_id', async (req, res) => {
   try {
@@ -7552,7 +7384,6 @@ app.post('/api/webhook/lead-capture', async (req, res) => {
     );
 
     // ---- Welcome Notification ----
-    // const welcomeMsg = `Hi ${lead.name.split(' ')[0]}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
     const firstName = (lead.name || "there").trim().split(" ")[0];
     const welcomeMsg = `Hi ${firstName}! Thanks for your interest in chess coaching. We'll contact you within 24 hours.`;
     await client.query(
@@ -8951,7 +8782,6 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
         ]
       );
 
-      // ✅ FIX: Create conversation (removed ON CONFLICT - will be handled by UNIQUE constraint)
       try {
         await client.query(
           `
@@ -10180,7 +10010,7 @@ app.post('/api/email-config', async (req, res) => {
     }
 
     // Encrypt credentials before storing (using crypto)
-    const crypto = require('crypto');
+    // const crypto = require('crypto');
     const algorithm = 'aes-256-cbc';
     const key = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8');
     const iv = crypto.randomBytes(16);
@@ -10685,7 +10515,6 @@ app.delete('/api/email-config/:id', async (req, res) => {
 
 // ============================================
 // MULTI-TENANT EMAIL INBOX SCANNING
-// Each company uses their own Gmail/Outlook OAuth
 // ============================================
 
 // 1. GMAIL OAUTH SETUP (Per Company)
@@ -11053,7 +10882,6 @@ app.get('/api/email/status/:company_id', async (req, res) => {
 
 
 
-
 // 4. DISCONNECT EMAIL ACCOUNT
 // ============================================
 
@@ -11181,10 +11009,6 @@ app.post('/api/email/scan/:company_id', async (req, res) => {
 
 
 
-
-
-// AT THE TOP (after requires)
-const crypto = require('crypto');
 const algorithm = 'aes-256-cbc';
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
@@ -11519,81 +11343,6 @@ async function processEmailForLead(emailData) {
   }
 }
 
-
-
-
-
-// // AI extraction function (same as before)
-// async function extractLeadFromEmail(emailData) {
-//   const { from, subject, body, company_id } = emailData;
-  
-//   try {
-//     const groq = require('groq-sdk');
-//     const client = new groq.Groq({ apiKey: process.env.GROQ_API_KEY });
-    
-//     const prompt = `Extract lead information from this email. Return ONLY valid JSON:
-// {
-//   "name": "Full name if found",
-//   "phone_number": "Phone number in any format",
-//   "email": "Email address",
-//   "company": "Company name if mentioned",
-//   "interest": "What they're interested in",
-//   "urgency": "low|medium|high"
-// }
-
-// From: ${from}
-// Subject: ${subject}
-// Body: ${body.substring(0, 2000)}
-
-// JSON:`;
-    
-//     const completion = await client.chat.completions.create({
-//       model: 'llama-3.1-8b-instant',
-//       messages: [{ role: 'user', content: prompt }],
-//       temperature: 0.3,
-//       max_tokens: 500
-//     });
-    
-//     const responseText = completion.choices[0].message.content;
-//     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-//     if (!jsonMatch) throw new Error('No JSON found');
-    
-//     const extractedData = JSON.parse(jsonMatch[0]);
-    
-//     // Fallback regex extraction
-//     if (!extractedData.phone_number) {
-//       const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
-//       const phoneMatches = body.match(phoneRegex);
-//       if (phoneMatches) extractedData.phone_number = phoneMatches[0];
-//     }
-    
-//     if (!extractedData.email) {
-//       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-//       const emailMatches = body.match(emailRegex);
-//       if (emailMatches) extractedData.email = emailMatches[0];
-//     }
-    
-//     if (!extractedData.email) {
-//       const senderMatch = from.match(/<(.+?)>/);
-//       extractedData.email = senderMatch ? senderMatch[1] : from;
-//     }
-    
-//     return extractedData;
-    
-//   } catch (error) {
-//     console.error('AI extraction error:', error);
-    
-//     // Fallback to regex
-//     return {
-//       name: null,
-//       phone_number: body.match(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/)?.[0] || null,
-//       email: body.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0] || from,
-//       company: null,
-//       interest: subject,
-//       urgency: 'medium'
-//     };
-//   }
-// }
 
 
 
@@ -12481,7 +12230,6 @@ app.post('/api/calendar/available-slots', async (req, res) => {
 // CALENDAR CONFIRMATION EMAIL API
 // ============================================
 
-
 // Helper function to get company's email configuration
 async function getCompanyEmailConfig(company_id) {
   try {
@@ -13107,7 +12855,56 @@ app.get('/api/calendar/email-status/:event_id', async (req, res) => {
 
 
 
-// Enhanced multi-language WhatsApp message handler
+// // Enhanced multi-language WhatsApp message handler
+// async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPhone) {
+//   try {
+//     const leadResult = await pool.query(
+//       'SELECT preferred_language FROM leads WHERE phone_number = $1',
+//       [fromPhone]
+//     );
+    
+//     const preferredLang = leadResult.rows[0]?.preferred_language || 'en';
+//     const detectedLang = detectLanguage(message);
+    
+//     // If user switched language, update their preference
+//     if (detectedLang !== preferredLang && detectedLang !== 'en') {
+//       await pool.query(
+//         'UPDATE leads SET preferred_language = $1 WHERE phone_number = $2',
+//         [detectedLang, fromPhone]
+//       );
+//       console.log(`🔄 Language updated: ${preferredLang} → ${detectedLang} for ${fromPhone}`);
+//     }
+    
+//     const activeLang = detectedLang !== 'en' ? detectedLang : preferredLang;
+    
+//     // Translate message to English for AI processing
+//     let messageForAI = message;
+//     if (activeLang !== 'en') {
+//       messageForAI = await translateText(message, 'en', activeLang);
+//     }
+    
+//     return {
+//       originalMessage: message,
+//       translatedMessage: messageForAI,
+//       detectedLanguage: detectedLang,
+//       preferredLanguage: activeLang,
+//       needsTranslation: activeLang !== 'en'
+//     };
+//   } catch (error) {
+//     console.error('Multi-lingual handling error:', error);
+//     return {
+//       originalMessage: message,
+//       translatedMessage: message,
+//       detectedLanguage: 'en',
+//       preferredLanguage: 'en',
+//       needsTranslation: false
+//     };
+//   }
+// }
+
+
+
+
 async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPhone) {
   try {
     const leadResult = await pool.query(
@@ -13116,9 +12913,9 @@ async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPho
     );
     
     const preferredLang = leadResult.rows[0]?.preferred_language || 'en';
-    const detectedLang = detectLanguage(message);
-    
-    // If user switched language, update their preference
+    const detectedLang = await detectLanguage(message);
+
+    // Update language preference if changed
     if (detectedLang !== preferredLang && detectedLang !== 'en') {
       await pool.query(
         'UPDATE leads SET preferred_language = $1 WHERE phone_number = $2',
@@ -13128,8 +12925,8 @@ async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPho
     }
     
     const activeLang = detectedLang !== 'en' ? detectedLang : preferredLang;
-    
-    // Translate message to English for AI processing
+
+    // Translate to English for AI processing
     let messageForAI = message;
     if (activeLang !== 'en') {
       messageForAI = await translateText(message, 'en', activeLang);
@@ -13154,12 +12951,15 @@ async function handleMultilingualWhatsAppMessage(message, agentInstance, fromPho
   }
 }
 
+
+
+
 // Enhanced WhatsApp response sender with translation
 async function sendWhatsAppResponse(agentInstance, toPhone, message, leadLanguage = 'en') {
   try {
     const credentials = agentInstance.whatsapp_credentials;
-    
-    // Translate response to user's language if needed
+
+    // Translate from English to lead's language
     let finalMessage = message;
     if (leadLanguage !== 'en') {
       finalMessage = await translateText(message, leadLanguage, 'en');
@@ -13180,8 +12980,8 @@ async function sendWhatsAppResponse(agentInstance, toPhone, message, leadLanguag
         }
       }
     );
-    
-    // Log message to database
+
+    // Save to database
     await pool.query(`
       INSERT INTO whatsapp_messages 
       (lead_id, phone_number, message_type, message_body, sender, is_from_user, message_id)
@@ -13380,83 +13180,106 @@ app.post('/api/whatsapp/schedule-appointment', async (req, res) => {
 });
 
 // Helper: Generate alternative slots message
-async function generateAlternativeSlotsMessage(calendar_config_id, requestedDate, language = 'en') {
-  const startDate = new Date(requestedDate);
-  startDate.setHours(0, 0, 0, 0);
-  const endDate = new Date(startDate);
-  endDate.setDate(endDate.getDate() + 7); // Next 7 days
+// async function generateAlternativeSlotsMessage(calendar_config_id, requestedDate, language = 'en') {
+//   const startDate = new Date(requestedDate);
+//   startDate.setHours(0, 0, 0, 0);
+//   const endDate = new Date(startDate);
+//   endDate.setDate(endDate.getDate() + 7); // Next 7 days
   
-  const response = await axios.post(
-    `${process.env.BASE_URL}/api/calendar/available-slots`,
-    {
-      calendar_config_id,
-      start_date: startDate.toISOString(),
-      end_date: endDate.toISOString(),
-      duration_minutes: 60
-    }
-  );
+//   const response = await axios.post(
+//     `${process.env.BASE_URL}/api/calendar/available-slots`,
+//     {
+//       calendar_config_id,
+//       start_date: startDate.toISOString(),
+//       end_date: endDate.toISOString(),
+//       duration_minutes: 60
+//     }
+//   );
   
-  const slots = response.data.data.available_slots.slice(0, 5); // First 5 slots
+//   const slots = response.data.data.available_slots.slice(0, 5); // First 5 slots
   
-  let message = '⚠️ The requested time is not available.\n\n';
-  message += '📅 Available slots:\n\n';
+//   let message = '⚠️ The requested time is not available.\n\n';
+//   message += '📅 Available slots:\n\n';
   
-  slots.forEach((slot, index) => {
+//   slots.forEach((slot, index) => {
+//     const slotDate = new Date(slot.start);
+//     const dateStr = slotDate.toLocaleDateString('en-IN', {
+//       weekday: 'short',
+//       day: 'numeric',
+//       month: 'short'
+//     });
+//     const timeStr = slotDate.toLocaleTimeString('en-IN', {
+//       hour: '2-digit',
+//       minute: '2-digit',
+//       hour12: true
+//     });
+//     message += `${index + 1}. ${dateStr} at ${timeStr}\n`;
+//   });
+  
+//   message += '\nReply with the slot number to book!';
+  
+//   if (language !== 'en') {
+//     message = await translateText(message, language, 'en');
+//   }
+  
+//   return message;
+// }
+
+
+
+async function generateAlternativeSlotsMessage(calendarConfigId, requestedDate, language) {
+  let message = `⚠️ The requested time slot is not available.\n\n`;
+  message += `Here are some alternative times:\n`;
+  
+  // Fetch alternative slots (implement your logic here)
+  const slots = await getAvailableSlots(calendarConfigId, requestedDate);
+  
+  slots.slice(0, 3).forEach((slot, index) => {
     const slotDate = new Date(slot.start);
     const dateStr = slotDate.toLocaleDateString('en-IN', {
       weekday: 'short',
       day: 'numeric',
-      month: 'short'
-    });
-    const timeStr = slotDate.toLocaleTimeString('en-IN', {
+      month: 'short',
       hour: '2-digit',
-      minute: '2-digit',
-      hour12: true
+      minute: '2-digit'
     });
-    message += `${index + 1}. ${dateStr} at ${timeStr}\n`;
+    message += `${index + 1}. ${dateStr}\n`;
   });
   
-  message += '\nReply with the slot number to book!';
-  
+  message += `\nReply with the number of your preferred slot.`;
+
+  // Translate if needed
   if (language !== 'en') {
     message = await translateText(message, language, 'en');
   }
-  
+
   return message;
 }
 
 // Helper: Generate WhatsApp confirmation
 async function generateWhatsAppConfirmation(lead, appointmentDate, meetingLink, companyName) {
   const dateStr = appointmentDate.toLocaleDateString('en-IN', {
-    weekday: 'long',
     day: 'numeric',
     month: 'long',
-    year: 'numeric'
-  });
-  
-  const timeStr = appointmentDate.toLocaleTimeString('en-IN', {
+    year: 'numeric',
     hour: '2-digit',
-    minute: '2-digit',
-    hour12: true
+    minute: '2-digit'
   });
-  
-  let message = `✅ *Appointment Confirmed!*\n\n`;
-  message += `Dear ${lead.name || 'Customer'},\n\n`;
-  message += `Your appointment with ${companyName} is confirmed:\n\n`;
-  message += `📅 *Date:* ${dateStr}\n`;
-  message += `🕐 *Time:* ${timeStr}\n\n`;
-  
+
+  let message = `✅ Appointment Confirmed!\n\n`;
+  message += `📅 Date: ${dateStr}\n`;
+  message += `🏢 Company: ${companyName}\n`;
   if (meetingLink) {
-    message += `🔗 *Meeting Link:*\n${meetingLink}\n\n`;
+    message += `🔗 Meeting Link: ${meetingLink}\n`;
   }
-  
-  message += `We'll send you a reminder 30 minutes before.\n\n`;
-  message += `To reschedule, reply with "reschedule".`;
-  
-  if (lead.preferred_language !== 'en') {
-    message = await translateText(message, lead.preferred_language, 'en');
+  message += `\nWe look forward to meeting you!`;
+
+  // Translate if needed
+  const leadLang = lead.preferred_language || 'en';
+  if (leadLang !== 'en') {
+    message = await translateText(message, leadLang, 'en');
   }
-  
+
   return message;
 }
 
@@ -14977,7 +14800,6 @@ app.get('/api/analytics/leads-complete/:company_id', async (req, res) => {
 
 // ============================================
 // AUTOMATED CALL SUMMARY DELIVERY
-// Add these functions to server.js
 // ============================================
 
 /**
@@ -15349,7 +15171,6 @@ app.post('/api/call-summaries/regenerate', async (req, res) => {
 
 // ============================================
 // WHATSAPP CHAT SUMMARIZATION
-// Add these new functions to server.js
 // ============================================
 
 /**
@@ -15612,7 +15433,6 @@ app.get('/api/conversations/:phone/summary', async (req, res) => {
 
 // ============================================
 // TRANSCRIPT SEARCH (PostgreSQL Full-Text Search)
-// Add these new endpoints to server.js
 // ============================================
 
 app.get('/api/transcripts/search', async (req, res) => {
@@ -15862,7 +15682,6 @@ app.get('/api/search/combined', async (req, res) => {
 
 /**
  * Create a new drip campaign
- * POST /api/drip-campaigns
  */
 app.post('/api/drip-campaigns', async (req, res) => {
   const client = await pool.connect();
@@ -15954,7 +15773,6 @@ app.post('/api/drip-campaigns', async (req, res) => {
 
 /**
  * Get all drip campaigns for a company
- * GET /api/drip-campaigns/:company_id
  */
 app.get('/api/drip-campaigns/:company_id', async (req, res) => {
   try {
@@ -16008,8 +15826,111 @@ app.get('/api/drip-campaigns/:company_id', async (req, res) => {
 
 
 /**
+ * Get all subscribers of a campaign
+ */
+app.get('/api/drip-campaigns/subscribers/:campaign_id', async (req, res) => {
+  try {
+    const { campaign_id } = req.params;
+    const { status } = req.query;
+    
+    let query = `
+      SELECT 
+        dcs.*,
+        l.name as lead_name,
+        l.email,
+        l.phone_number,
+        l.lead_status
+      FROM drip_campaign_subscribers dcs
+      JOIN leads l ON dcs.lead_id = l.id
+      WHERE dcs.campaign_id = $1
+    `;
+    
+    const params = [campaign_id];
+    
+    if (status) {
+      params.push(status);
+      query += ` AND dcs.status = $${params.length}`;
+    }
+    
+    query += ' ORDER BY dcs.created_at DESC';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', `/api/drip-campaigns/subscribers/${campaign_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get campaign subscribers error:', error);
+    logRequest('GET', `/api/drip-campaigns/subscribers/${req.params.campaign_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
+ * Get execution history of a lead
+ */
+app.get('/api/drip-campaigns/executions/:lead_id', async (req, res) => {
+  try {
+    const { lead_id } = req.params;
+    const { campaign_id } = req.query;
+    
+    let query = `
+      SELECT 
+        dse.*,
+        dcs.step_type,
+        dcs.step_number,
+        dcs.subject,
+        dc.campaign_name,
+        l.name as lead_name
+      FROM drip_step_executions dse
+      JOIN drip_campaign_steps dcs ON dse.step_id = dcs.id
+      JOIN drip_campaign_subscribers dcsu ON dse.subscriber_id = dcsu.id
+      JOIN drip_campaigns dc ON dcsu.campaign_id = dc.id
+      JOIN leads l ON dse.lead_id = l.id
+      WHERE dse.lead_id = $1
+    `;
+    
+    const params = [lead_id];
+    
+    if (campaign_id) {
+      params.push(campaign_id);
+      query += ` AND dcsu.campaign_id = $${params.length}`;
+    }
+    
+    query += ' ORDER BY dse.created_at DESC';
+    
+    const result = await pool.query(query, params);
+    
+    logRequest('GET', `/api/drip-campaigns/executions/${lead_id}`, 200);
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+    
+  } catch (error) {
+    console.error('Get execution history error:', error);
+    logRequest('GET', `/api/drip-campaigns/executions/${req.params.lead_id}`, 500);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+
+/**
  * Get campaign details with steps
- * GET /api/drip-campaigns/:company_id/:campaign_id
  */
 app.get('/api/drip-campaigns/:company_id/:campaign_id', async (req, res) => {
   try {
@@ -16055,7 +15976,6 @@ app.get('/api/drip-campaigns/:company_id/:campaign_id', async (req, res) => {
 
 /**
  * Update drip campaign
- * PATCH /api/drip-campaigns/:campaign_id
  */
 app.patch('/api/drip-campaigns/:campaign_id', async (req, res) => {
   try {
@@ -16131,7 +16051,6 @@ app.patch('/api/drip-campaigns/:campaign_id', async (req, res) => {
 
 /**
  * Subscribe a lead to a drip campaign
- * POST /api/drip-campaigns/subscribe
  */
 app.post('/api/drip-campaigns/subscribe', async (req, res) => {
   try {
@@ -16201,7 +16120,6 @@ app.post('/api/drip-campaigns/subscribe', async (req, res) => {
 
 /**
  * Unsubscribe a lead from campaigns
- * POST /api/drip-campaigns/unsubscribe
  */
 app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
   const client = await pool.connect();
@@ -16219,9 +16137,27 @@ app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
       user_agent
     } = req.body;
     
-    if (!lead_id || !company_id) {
+    if (!lead_id) {
       return res.status(400).json({
-        error: 'lead_id and company_id are required'
+        error: 'lead_id is required'
+      });
+    }
+    
+    // Get company_id from lead if not provided
+    let finalCompanyId = company_id;
+    if (!finalCompanyId && lead_id) {
+      const leadResult = await client.query(
+        'SELECT company_id FROM leads WHERE id = $1',
+        [lead_id]
+      );
+      if (leadResult.rows.length > 0) {
+        finalCompanyId = leadResult.rows[0].company_id;
+      }
+    }
+    
+    if (!finalCompanyId) {
+      return res.status(400).json({
+        error: 'company_id could not be determined. Please provide company_id or valid lead_id'
       });
     }
     
@@ -16235,7 +16171,7 @@ app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
       SET unsubscribed_at = NOW(), reason = EXCLUDED.reason
     `, [
       lead_id,
-      company_id,
+      finalCompanyId,
       unsubscribe_type,
       campaign_id || null,
       reason || null,
@@ -16294,7 +16230,6 @@ app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
 
 /**
  * Get campaign performance metrics
- * GET /api/drip-campaigns/:campaign_id/performance
  */
 app.get('/api/drip-campaigns/:campaign_id/performance', async (req, res) => {
   try {
@@ -16713,7 +16648,6 @@ async function updateCampaignPerformance(campaign_id, metric, increment = 1) {
 
 /**
  * Get comprehensive agent performance report
- * GET /api/reports/agent-performance
  */
 app.get('/api/reports/agent-performance', async (req, res) => {
   try {
@@ -16825,7 +16759,6 @@ app.get('/api/reports/agent-performance', async (req, res) => {
 
 /**
  * Get revenue forecasting report
- * GET /api/reports/revenue-forecast
  */
 app.get('/api/reports/revenue-forecast', async (req, res) => {
   try {
@@ -16916,7 +16849,6 @@ app.get('/api/reports/revenue-forecast', async (req, res) => {
 
 /**
  * Get churn prediction report
- * GET /api/reports/churn-prediction
  */
 app.get('/api/reports/churn-prediction', async (req, res) => {
   try {
@@ -17027,7 +16959,6 @@ app.get('/api/reports/churn-prediction', async (req, res) => {
 
 /**
  * Get campaign ROI analysis
- * GET /api/reports/campaign-roi
  */
 app.get('/api/reports/campaign-roi', async (req, res) => {
   try {
@@ -17042,14 +16973,14 @@ app.get('/api/reports/campaign-roi', async (req, res) => {
     
     if (start_date && end_date) {
       params.push(start_date, end_date);
-      dateFilter = ` AND c.created_at BETWEEN $2 AND $3`;
+      dateFilter = ` AND campaigns.created_at BETWEEN $2 AND $3`;
     }
     
     // Analyze all campaigns (both scheduled_calls and drip_campaigns)
     const scheduledCampaignsResult = await pool.query(`
       SELECT 
-        c.id as campaign_id,
-        c.campaign_name,
+        campaigns.id as campaign_id,
+        campaigns.campaign_name,
         'scheduled_calls' as campaign_type,
         COUNT(DISTINCT sc.id) as total_contacts,
         COUNT(DISTINCT sc.id) FILTER (WHERE sc.status = 'called') as contacted,
@@ -17061,13 +16992,18 @@ app.get('/api/reports/campaign-roi', async (req, res) => {
           THEN (COUNT(DISTINCT l.id) FILTER (WHERE l.lead_status = 'closed_won')::float / COUNT(DISTINCT sc.id) FILTER (WHERE sc.status = 'called') * 100)
           ELSE 0 
         END as conversion_rate
-      FROM campaigns c
-      LEFT JOIN scheduled_calls sc ON c.id = sc.company_id
+      FROM campaigns
+      LEFT JOIN scheduled_calls sc ON campaigns.id = sc.campaign_id
       LEFT JOIN leads l ON sc.lead_id = l.id
       LEFT JOIN invoices i ON l.id = i.lead_id
-      WHERE c.company_id = $1 ${dateFilter}
-      GROUP BY c.id, c.campaign_name
+      WHERE campaigns.company_id = $1 ${dateFilter}
+      GROUP BY campaigns.id, campaigns.campaign_name
     `, params);
+    
+    let dripDateFilter = '';
+    if (start_date && end_date) {
+      dripDateFilter = ` AND dc.created_at BETWEEN $2 AND $3`;
+    }
     
     const dripCampaignsResult = await pool.query(`
       SELECT 
@@ -17089,7 +17025,7 @@ app.get('/api/reports/campaign-roi', async (req, res) => {
       LEFT JOIN drip_step_executions dse ON dcs.id = dse.subscriber_id
       LEFT JOIN leads l ON dcs.lead_id = l.id
       LEFT JOIN campaign_performance cp ON dc.id = cp.campaign_id
-      WHERE dc.company_id = $1 ${dateFilter}
+      WHERE dc.company_id = $1 ${dripDateFilter}
       GROUP BY dc.id, dc.campaign_name
     `, params);
     
@@ -17137,8 +17073,8 @@ app.get('/api/reports/campaign-roi', async (req, res) => {
 
 /**
  * Schedule report delivery
- * POST /api/reports/schedule
  */
+
 app.post('/api/reports/schedule', async (req, res) => {
   try {
     const {
@@ -17156,19 +17092,31 @@ app.post('/api/reports/schedule', async (req, res) => {
       });
     }
     
+    // Calculate next_delivery based on frequency
+    let next_delivery;
+    const deliveryTimeStr = delivery_time;
+    
+    switch(frequency) {
+      case 'daily':
+        next_delivery = `(CURRENT_DATE + 1) + '${deliveryTimeStr}'::time`;
+        break;
+      case 'weekly':
+        next_delivery = `(CURRENT_DATE + 7) + '${deliveryTimeStr}'::time`;
+        break;
+      case 'monthly':
+        next_delivery = `(CURRENT_DATE + 30) + '${deliveryTimeStr}'::time`;
+        break;
+      default:
+        next_delivery = `(CURRENT_DATE + 1) + '${deliveryTimeStr}'::time`;
+    }
+    
     const result = await pool.query(`
       INSERT INTO scheduled_reports (
         company_id, report_type, frequency,
         recipients, format, delivery_time,
         is_active, next_delivery
       )
-      VALUES ($1, $2, $3, $4, $5, $6, TRUE, 
-        CASE 
-          WHEN $3 = 'daily' THEN (CURRENT_DATE + 1) + $6::time
-          WHEN $3 = 'weekly' THEN (CURRENT_DATE + 7) + $6::time
-          WHEN $3 = 'monthly' THEN (CURRENT_DATE + 30) + $6::time
-        END
-      )
+      VALUES ($1, $2, $3, $4, $5, $6, TRUE, ${next_delivery})
       RETURNING *
     `, [
       company_id,
@@ -17176,7 +17124,7 @@ app.post('/api/reports/schedule', async (req, res) => {
       frequency,
       JSON.stringify(recipients),
       format,
-      delivery_time
+      deliveryTimeStr
     ]);
     
     logRequest('POST', '/api/reports/schedule', 201);
@@ -17201,7 +17149,6 @@ app.post('/api/reports/schedule', async (req, res) => {
 
 /**
  * Get scheduled reports
- * GET /api/reports/scheduled/:company_id
  */
 app.get('/api/reports/scheduled/:company_id', async (req, res) => {
   try {
@@ -17229,6 +17176,339 @@ app.get('/api/reports/scheduled/:company_id', async (req, res) => {
     });
   }
 });
+
+
+
+// // Utility function for logging (add to your server.js if not exists)
+// function logRequest(method, endpoint, statusCode, details = {}) {
+//   const logEntry = {
+//     timestamp: new Date().toISOString(),
+//     method,
+//     endpoint,
+//     statusCode,
+//     ...details
+//   };
+//   console.log(JSON.stringify(logEntry));
+// }
+
+
+// ============================================
+// 1. AUTO-INVOICE GENERATION
+// ============================================
+
+/**
+ * POST /api/invoices/auto-generate
+ * Auto-generate invoice when deal is closed
+ */
+app.post('/api/invoices/auto-generate', async (req, res) => {
+  try {
+    const result = await invoicePayment.autoGenerateInvoice(pool, req.body);
+    logRequest('POST', '/api/invoices/auto-generate', 201);
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('Auto-generate invoice error:', error);
+    logRequest('POST', '/api/invoices/auto-generate', 500, { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 2. PHONEPE PAYMENT INITIATION
+// ============================================
+
+/**
+ * POST /api/invoices/:invoice_id/initiate-payment
+ * Initiate PhonePe payment for an invoice
+ */
+app.post('/api/invoices/:invoice_id/initiate-payment', async (req, res) => {
+  try {
+    const { invoice_id } = req.params;
+    const result = await invoicePayment.initiatePayment(pool, invoice_id);
+    logRequest('POST', `/api/invoices/${invoice_id}/initiate-payment`, 200);
+    res.json(result);
+  } catch (error) {
+    console.error('Payment initiation error:', error);
+    logRequest('POST', `/api/invoices/${req.params.invoice_id}/initiate-payment`, 500);
+    res.status(500).json({ 
+      error: 'Payment initiation failed', 
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
+// 3. PHONEPE PAYMENT CALLBACK
+// ============================================
+
+/**
+ * POST /api/payment-callback
+ * Handle PhonePe server-to-server callback
+ */
+app.post('/api/payment-callback', async (req, res) => {
+  try {
+    const { response } = req.body;
+    const result = await invoicePayment.handlePaymentCallback(pool, response);
+    res.json(result);
+  } catch (error) {
+    console.error('Payment callback error:', error);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+// ============================================
+// 4. PAYMENT RESULT PAGE
+// ============================================
+
+/**
+ * GET /payment-result
+ * Payment result page - Check status and redirect
+ */
+app.get('/payment-result', async (req, res) => {
+  try {
+    const { invoice_id, txn_id } = req.query;
+
+    if (!invoice_id || !txn_id) {
+      return res.redirect('/payment-failed.html?error=missing_params');
+    }
+
+    const result = await invoicePayment.checkPaymentStatus(pool, invoice_id, txn_id);
+
+    if (result.success && result.status === 'completed') {
+      res.redirect(`/payment-success.html?invoice_id=${invoice_id}&txn_id=${txn_id}`);
+    } else {
+      res.redirect(`/payment-failed.html?invoice_id=${invoice_id}&reason=${result.status}`);
+    }
+
+  } catch (error) {
+    console.error('Payment result error:', error);
+    res.redirect('/payment-failed.html?error=status_check_failed');
+  }
+});
+
+// ============================================
+// 5. SUBSCRIPTION RENEWAL CHECK
+// ============================================
+
+/**
+ * POST /api/subscriptions/check-renewals
+ * Check expiring subscriptions and send reminders
+ */
+app.post('/api/subscriptions/check-renewals', async (req, res) => {
+  try {
+    const result = await invoicePayment.checkRenewals(pool);
+    logRequest('POST', '/api/subscriptions/check-renewals', 200);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Check renewals error:', error);
+    logRequest('POST', '/api/subscriptions/check-renewals', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 6. OVERDUE INVOICE HANDLER
+// ============================================
+
+/**
+ * POST /api/invoices/handle-overdue
+ * Handle overdue invoices with escalating reminders
+ */
+app.post('/api/invoices/handle-overdue', async (req, res) => {
+  try {
+    const result = await invoicePayment.handleOverdueInvoices(pool);
+    logRequest('POST', '/api/invoices/handle-overdue', 200);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Handle overdue error:', error);
+    logRequest('POST', '/api/invoices/handle-overdue', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 7. ACCOUNTING SOFTWARE SYNC
+// ============================================
+
+/**
+ * POST /api/invoices/:invoice_id/sync-accounting
+ * Sync invoice to QuickBooks/Zoho/Tally
+ */
+app.post('/api/invoices/:invoice_id/sync-accounting', async (req, res) => {
+  try {
+    const { invoice_id } = req.params;
+    const { accounting_system } = req.body;
+
+    const result = await invoicePayment.syncInvoiceToAccounting(
+      pool, 
+      invoice_id, 
+      accounting_system
+    );
+
+    logRequest('POST', `/api/invoices/${invoice_id}/sync-accounting`, 200);
+    res.json(result);
+
+  } catch (error) {
+    console.error('Accounting sync error:', error);
+    logRequest('POST', `/api/invoices/${req.params.invoice_id}/sync-accounting`, 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 8. REVENUE DASHBOARD
+// ============================================
+
+/**
+ * GET /api/reports/revenue-dashboard
+ * Get revenue metrics and trends
+ */
+app.get('/api/reports/revenue-dashboard', async (req, res) => {
+  try {
+    const { company_id, start_date, end_date } = req.query;
+
+    const result = await invoicePayment.getRevenueDashboard(
+      pool, 
+      company_id, 
+      start_date, 
+      end_date
+    );
+
+    logRequest('GET', '/api/reports/revenue-dashboard', 200);
+    res.json({ success: true, data: result });
+
+  } catch (error) {
+    console.error('Revenue dashboard error:', error);
+    logRequest('GET', '/api/reports/revenue-dashboard', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 9. OVERDUE INVOICES REPORT
+// ============================================
+
+/**
+ * GET /api/reports/overdue-invoices
+ * Get overdue invoices with aging buckets
+ */
+app.get('/api/reports/overdue-invoices', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+
+    const result = await invoicePayment.getOverdueInvoicesReport(pool, company_id);
+
+    logRequest('GET', '/api/reports/overdue-invoices', 200);
+    res.json({ success: true, ...result });
+
+  } catch (error) {
+    console.error('Overdue report error:', error);
+    logRequest('GET', '/api/reports/overdue-invoices', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 10. CHURN ANALYSIS
+// ============================================
+
+/**
+ * GET /api/reports/churn-analysis
+ * Get churn analysis for expired subscriptions
+ */
+app.get('/api/reports/churn-analysis', async (req, res) => {
+  try {
+    const { company_id, months = 6 } = req.query;
+
+    const result = await invoicePayment.getChurnAnalysis(pool, company_id, months);
+
+    logRequest('GET', '/api/reports/churn-analysis', 200);
+    res.json({ success: true, ...result });
+
+  } catch (error) {
+    console.error('Churn analysis error:', error);
+    logRequest('GET', '/api/reports/churn-analysis', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 11. ACTIVE SUBSCRIPTIONS
+// ============================================
+
+/**
+ * GET /api/subscriptions/active
+ * Get all active subscriptions
+ */
+app.get('/api/subscriptions/active', async (req, res) => {
+  try {
+    const { company_id } = req.query;
+
+    const result = await invoicePayment.getActiveSubscriptions(pool, company_id);
+
+    logRequest('GET', '/api/subscriptions/active', 200);
+    res.json({ success: true, ...result });
+
+  } catch (error) {
+    console.error('Active subscriptions error:', error);
+    logRequest('GET', '/api/subscriptions/active', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 12. GET INVOICE BY ID
+// ============================================
+
+/**
+ * GET /api/invoices/:invoice_id
+ * Get invoice details by ID
+ */
+app.get('/api/invoices/:invoice_id', async (req, res) => {
+  try {
+    const { invoice_id } = req.params;
+
+    const invoice = await invoicePayment.getInvoiceById(pool, invoice_id);
+
+    logRequest('GET', `/api/invoices/${invoice_id}`, 200);
+    res.json({ success: true, invoice });
+
+  } catch (error) {
+    console.error('Get invoice error:', error);
+    logRequest('GET', `/api/invoices/${req.params.invoice_id}`, 500);
+    
+    if (error.message === 'Invoice not found') {
+      res.status(404).json({ error: error.message });
+    } else {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
+
+// ============================================
+// 13. LIST ALL INVOICES
+// ============================================
+
+/**
+ * GET /api/invoices
+ * List all invoices with filters
+ */
+app.get('/api/invoices', async (req, res) => {
+  try {
+    const result = await invoicePayment.listInvoices(pool, req.query);
+
+    logRequest('GET', '/api/invoices', 200);
+    res.json({ success: true, ...result });
+
+  } catch (error) {
+    console.error('List invoices error:', error);
+    logRequest('GET', '/api/invoices', 500);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
 
    
 
@@ -17389,7 +17669,6 @@ if (process.env.NODE_ENV === 'production') {
 
 // ============================================
 // AUTOMATED LEAD SYNC FROM AD PLATFORMS
-// Add this at the bottom before server.listen()
 // ============================================
 
 if (process.env.NODE_ENV === 'production') {
@@ -17448,6 +17727,36 @@ if (process.env.NODE_ENV === 'production') {
   console.log('✓ Drip campaign automation initialized (5min intervals)');
 }
 
+
+// ============================================
+// CRON JOB SETUP (For Production)
+// ============================================
+
+if (process.env.NODE_ENV === 'production') {
+  const cron = require('node-cron');
+
+  // Check renewals daily at 9 AM
+  cron.schedule('0 9 * * *', async () => {
+    console.log('🔄 Running daily renewal check...');
+    try {
+      await invoicePayment.checkRenewals(pool);
+    } catch (error) {
+      console.error('Renewal check cron error:', error);
+    }
+  });
+
+  // Handle overdue invoices daily at 10 AM
+  cron.schedule('0 10 * * *', async () => {
+    console.log('🔄 Running overdue invoice check...');
+    try {
+      await invoicePayment.handleOverdueInvoices(pool);
+    } catch (error) {
+      console.error('Overdue invoice cron error:', error);
+    }
+  });
+
+  console.log('✅ Invoice & Payment automation jobs initialized');
+}
 
 
 

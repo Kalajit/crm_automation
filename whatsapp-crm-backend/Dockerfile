@@ -11,6 +11,7 @@ RUN npm install --only=production
 
 # Copy application files
 COPY server.js .
+COPY invoicePayment.js .
 COPY .env .
 
 # Expose port

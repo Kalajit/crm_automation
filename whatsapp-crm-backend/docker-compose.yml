@@ -169,36 +169,40 @@ services:
 
 
 
-  # ========================================
-  # IndicTrans2 – separate file, no heredoc
-  # ========================================
-  indictrans:
-    build:
-      context: ../../call automation      # <-- folder that contains translate_api.py
-      dockerfile: Dockerfile-translate
-    container_name: whatsapp-crm-translate
-    restart: unless-stopped
-    ports:
-      - "5000:5000"
-    environment:
-      PYTHONUNBUFFERED: "1"
-      PORT: "5000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 512M  
-          cpus: '1'
-        reservations:
-          memory: 256M  
-          cpus: '0.5'
-    networks:
-      - whatsapp-crm-network
+  # # ========================================
+  # # IndicTrans2 – separate file, no heredoc
+  # # ========================================
+  # indictrans:
+  #   build:
+  #     context: ../../call automation      # <-- folder that contains translate_api.py
+  #     dockerfile: Dockerfile-translate
+  #   container_name: whatsapp-crm-translate
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5000:5000"
+  #   environment:
+  #     PYTHONUNBUFFERED: "1"
+  #     PORT: "5000"
+  #     HF_TOKEN: ${HF_TOKEN:-}  # Add your HuggingFace token here
+  #     HF_HOME: /app/models/.cache
+  #   volumes:
+  #     - indictrans_models:/app/models  # Persist the downloaded models
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 120s
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 2G  
+  #         cpus: '2'
+  #       reservations:
+  #         memory: 1G  
+  #         cpus: '1'
+  #   networks:
+  #     - whatsapp-crm-network
 
 
 
@@ -233,8 +237,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      indictrans:
-        condition: service_healthy
+      # indictrans:
+      #   condition: service_healthy
     environment:
       NODE_ENV: production
       DB_USER: ajsal
@@ -245,7 +249,7 @@ services:
       PORT: 3000
       API_KEY: ${API_KEY:-your_secret_api_key_change_this}
       GROQ_API_KEY: ${GROQ_API_KEY:-your_groq_api_key}
-      INDICTRANS_URL: http://indictrans:5000
+      # INDICTRANS_URL: http://indictrans:5000
       DEEPL_API_KEY: ${DEEPL_API_KEY:-}
     ports:
       - "3000:3000"

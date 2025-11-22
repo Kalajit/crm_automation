@@ -190,6 +190,8 @@ CREATE TABLE invoices (
   pdf_url TEXT,
   reminder_count INTEGER DEFAULT 0,
   last_reminder_sent TIMESTAMP,
+  phonepe_transaction_id VARCHAR(255),
+  phonepe_reference_id VARCHAR(255),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -974,6 +976,84 @@ CREATE TABLE scheduled_reports (
 
 
 
+-- ============================================
+-- SUBSCRIPTION MANAGEMENT TABLE
+-- ============================================
+
+DROP TABLE IF EXISTS lead_subscriptions CASCADE;
+CREATE TABLE lead_subscriptions (
+  id SERIAL PRIMARY KEY,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'active', 'expired', 'cancelled'
+  renewal_reminder_sent BOOLEAN DEFAULT FALSE,
+  auto_renew BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ============================================
+-- PAYMENT TRANSACTIONS TABLE (Detailed tracking)
+-- ============================================
+
+DROP TABLE IF EXISTS payment_transactions CASCADE;
+CREATE TABLE payment_transactions (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  merchant_transaction_id VARCHAR(255) UNIQUE NOT NULL,
+  phonepe_transaction_id VARCHAR(255),
+  amount DECIMAL(10, 2) NOT NULL,
+  currency VARCHAR(10) DEFAULT 'INR',
+  status VARCHAR(50) DEFAULT 'initiated', -- 'initiated', 'pending', 'success', 'failed'
+  payment_method VARCHAR(50) DEFAULT 'PhonePe',
+  payment_mode VARCHAR(50), -- 'UPI', 'Card', 'NetBanking', 'Wallet'
+  callback_data JSONB,
+  error_message TEXT,
+  retry_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ============================================
+-- INVOICE REMINDERS TABLE (Track all reminders)
+-- ============================================
+
+DROP TABLE IF EXISTS invoice_reminders CASCADE;
+CREATE TABLE invoice_reminders (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  reminder_type VARCHAR(50) NOT NULL, -- 'gentle', 'strong', 'escalation', 'renewal'
+  reminder_date DATE DEFAULT CURRENT_DATE,
+  sent_via VARCHAR(50), -- 'whatsapp', 'email', 'sms'
+  status VARCHAR(50) DEFAULT 'sent', -- 'sent', 'failed', 'delivered'
+  message_body TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ============================================
+-- ACCOUNTING SYNC LOG TABLE
+-- ============================================
+
+DROP TABLE IF EXISTS accounting_sync_log CASCADE;
+CREATE TABLE accounting_sync_log (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  accounting_system VARCHAR(50) NOT NULL, -- 'quickbooks', 'zoho', 'tally'
+  external_id VARCHAR(255),
+  sync_status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'success', 'failed'
+  sync_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  error_message TEXT,
+  request_data JSONB,
+  response_data JSONB
+);
+
+
+
 
 
 -- ============================================
@@ -1161,7 +1241,29 @@ CREATE INDEX idx_scheduled_reports_company ON scheduled_reports(company_id, is_a
 CREATE INDEX idx_scheduled_reports_next_delivery ON scheduled_reports(next_delivery) WHERE is_active = TRUE;
 
 
+CREATE INDEX IF NOT EXISTS idx_invoices_phonepe_txn ON invoices(phonepe_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date) WHERE status = 'pending';
 
+
+CREATE INDEX idx_subscriptions_lead ON lead_subscriptions(lead_id);
+CREATE INDEX idx_subscriptions_status ON lead_subscriptions(status);
+CREATE INDEX idx_subscriptions_end_date ON lead_subscriptions(end_date) WHERE status = 'active';
+CREATE INDEX idx_subscriptions_renewal ON lead_subscriptions(end_date, renewal_reminder_sent) 
+  WHERE status = 'active' AND renewal_reminder_sent = FALSE;
+
+
+CREATE INDEX idx_payment_txn_invoice ON payment_transactions(invoice_id);
+CREATE INDEX idx_payment_txn_merchant ON payment_transactions(merchant_transaction_id);
+CREATE INDEX idx_payment_txn_phonepe ON payment_transactions(phonepe_transaction_id);
+CREATE INDEX idx_payment_txn_status ON payment_transactions(status);
+
+
+CREATE INDEX idx_reminders_invoice ON invoice_reminders(invoice_id);
+CREATE INDEX idx_reminders_date ON invoice_reminders(reminder_date DESC);
+
+
+CREATE INDEX idx_accounting_sync_invoice ON accounting_sync_log(invoice_id);
+CREATE INDEX idx_accounting_sync_system ON accounting_sync_log(accounting_system, sync_status);
 
 
 
@@ -1288,6 +1390,13 @@ DROP TRIGGER IF EXISTS update_scheduled_reports_timestamp ON scheduled_reports;
 CREATE TRIGGER update_scheduled_reports_timestamp BEFORE UPDATE ON scheduled_reports FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
+DROP TRIGGER IF EXISTS update_subscriptions_timestamp ON lead_subscriptions;
+CREATE TRIGGER update_subscriptions_timestamp BEFORE UPDATE ON lead_subscriptions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+DROP TRIGGER IF EXISTS update_payment_transactions_timestamp ON payment_transactions;
+CREATE TRIGGER update_payment_transactions_timestamp BEFORE UPDATE ON payment_transactions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
 
 -- ============================================
 -- SAMPLE DATA
@@ -1298,7 +1407,10 @@ INSERT INTO faq_templates (question, answer, category, keywords, is_active) VALU
   ('What is 4champz?', '4champz is Bangalore''s leading chess coaching platform connecting qualified coaches with schools for kids'' programs.', 'general', ARRAY['4champz', 'about'], TRUE),
   ('How much does coaching cost?', 'Coaching rates start at ₹500/hour based on your experience and location. Premium coaches earn more.', 'pricing', ARRAY['cost', 'price', 'rates', 'fees'], TRUE),
   ('What are the timings?', 'We typically offer sessions between 3-6 PM (school hours). Flexible schedules are available based on school needs.', 'timings', ARRAY['timing', 'hours', 'schedule', 'when'], TRUE),
-  ('Do I need experience?', 'While experience is valued, enthusiasm matters most. We provide training and curriculum support for all coaches.', 'services', ARRAY['experience', 'training', 'qualification'], TRUE)
+  ('Do I need experience?', 'While experience is valued, enthusiasm matters most. We provide training and curriculum support for all coaches.', 'services', ARRAY['experience', 'training', 'qualification'], TRUE),
+  ('How do I pay my invoice?', 'You can pay your invoice by clicking the payment link sent via WhatsApp or email. We accept all major payment methods through PhonePe.', 'payment', ARRAY['invoice', 'payment', 'pay'], 5),
+  ('When is my subscription expiring?', 'You can check your subscription expiry date in your account dashboard or contact us directly.', 'subscription', ARRAY['subscription', 'expire', 'renewal'], 5),
+  ('What happens if I miss a payment?', 'If a payment is missed, we will send you reminders via WhatsApp and email. Your service may be temporarily suspended if payment is not received within 14 days.', 'payment', ARRAY['payment', 'missed', 'late'], 4)
 ON CONFLICT DO NOTHING;
 
 
@@ -2080,6 +2192,78 @@ LEFT JOIN email_scan_logs esl ON ec.id = esl.email_config_id
 GROUP BY ec.id;
 
 
+-- Revenue Dashboard View
+CREATE OR REPLACE VIEW revenue_dashboard AS
+SELECT 
+  DATE_TRUNC('month', i.created_at) as month,
+  COUNT(*) as total_invoices,
+  COUNT(*) FILTER (WHERE i.status = 'paid') as paid_invoices,
+  COUNT(*) FILTER (WHERE i.status = 'pending') as pending_invoices,
+  SUM(i.amount) as total_billed,
+  SUM(i.amount) FILTER (WHERE i.status = 'paid') as total_revenue,
+  SUM(i.amount) FILTER (WHERE i.status = 'paid' AND i.invoice_type = 'subscription') as recurring_revenue,
+  SUM(i.amount) FILTER (WHERE i.status = 'paid' AND i.invoice_type = 'one_time') as one_time_revenue,
+  SUM(i.amount) FILTER (WHERE i.status = 'pending') as pending_amount,
+  SUM(i.amount) FILTER (WHERE i.status = 'pending' AND i.due_date < CURRENT_DATE) as overdue_amount
+FROM invoices i
+GROUP BY DATE_TRUNC('month', i.created_at)
+ORDER BY month DESC;
+
+-- Overdue Invoices Summary
+CREATE OR REPLACE VIEW overdue_invoices_summary AS
+SELECT 
+  i.id,
+  i.invoice_number,
+  i.lead_id,
+  l.name as lead_name,
+  l.phone_number,
+  l.email,
+  i.amount,
+  i.due_date,
+  EXTRACT(DAY FROM (CURRENT_DATE - i.due_date)) as days_overdue,
+  CASE 
+    WHEN EXTRACT(DAY FROM (CURRENT_DATE - i.due_date)) <= 7 THEN '1-7 days'
+    WHEN EXTRACT(DAY FROM (CURRENT_DATE - i.due_date)) <= 14 THEN '8-14 days'
+    WHEN EXTRACT(DAY FROM (CURRENT_DATE - i.due_date)) <= 30 THEN '15-30 days'
+    ELSE 'Over 30 days'
+  END as aging_bucket,
+  i.reminder_count,
+  i.last_reminder_sent
+FROM invoices i
+JOIN leads l ON i.lead_id = l.id
+WHERE i.status = 'pending' 
+AND i.due_date < CURRENT_DATE
+ORDER BY i.due_date ASC;
+
+-- Active Subscriptions View
+CREATE OR REPLACE VIEW active_subscriptions AS
+SELECT 
+  ls.id,
+  ls.lead_id,
+  l.name as lead_name,
+  l.phone_number,
+  l.email,
+  ls.start_date,
+  ls.end_date,
+  EXTRACT(DAY FROM (ls.end_date - CURRENT_DATE)) as days_until_expiry,
+  i.amount as subscription_amount,
+  i.invoice_number,
+  ls.renewal_reminder_sent,
+  ls.auto_renew
+FROM lead_subscriptions ls
+JOIN leads l ON ls.lead_id = l.id
+JOIN invoices i ON ls.invoice_id = i.id
+WHERE ls.status = 'active'
+ORDER BY ls.end_date ASC;
+
+-- Expiring Subscriptions (Next 30 Days)
+CREATE OR REPLACE VIEW expiring_subscriptions AS
+SELECT * FROM active_subscriptions
+WHERE days_until_expiry <= 30 AND days_until_expiry >= 0
+ORDER BY days_until_expiry ASC;
+
+
+
 CREATE OR REPLACE FUNCTION needs_token_refresh(config_id INTEGER)
 RETURNS BOOLEAN AS $$
   SELECT 
@@ -2142,9 +2326,110 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+- Function to check and update expired subscriptions
+CREATE OR REPLACE FUNCTION update_expired_subscriptions()
+RETURNS INTEGER AS $$
+DECLARE
+  updated_count INTEGER;
+BEGIN
+  UPDATE lead_subscriptions
+  SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+  WHERE status = 'active' 
+  AND end_date < CURRENT_DATE;
+  
+  GET DIAGNOSTICS updated_count = ROW_COUNT;
+  
+  RETURN updated_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get revenue summary for a date range
+CREATE OR REPLACE FUNCTION get_revenue_summary(
+  p_start_date DATE DEFAULT NULL,
+  p_end_date DATE DEFAULT NULL,
+  p_company_id INTEGER DEFAULT NULL
+)
+RETURNS TABLE (
+  total_revenue DECIMAL,
+  recurring_revenue DECIMAL,
+  one_time_revenue DECIMAL,
+  pending_revenue DECIMAL,
+  overdue_amount DECIMAL,
+  paid_invoices BIGINT,
+  pending_invoices BIGINT,
+  overdue_invoices BIGINT
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    COALESCE(SUM(i.amount) FILTER (WHERE i.status = 'paid'), 0) as total_revenue,
+    COALESCE(SUM(i.amount) FILTER (WHERE i.status = 'paid' AND i.invoice_type = 'subscription'), 0) as recurring_revenue,
+    COALESCE(SUM(i.amount) FILTER (WHERE i.status = 'paid' AND i.invoice_type = 'one_time'), 0) as one_time_revenue,
+    COALESCE(SUM(i.amount) FILTER (WHERE i.status = 'pending'), 0) as pending_revenue,
+    COALESCE(SUM(i.amount) FILTER (WHERE i.status = 'pending' AND i.due_date < CURRENT_DATE), 0) as overdue_amount,
+    COUNT(*) FILTER (WHERE i.status = 'paid') as paid_invoices,
+    COUNT(*) FILTER (WHERE i.status = 'pending') as pending_invoices,
+    COUNT(*) FILTER (WHERE i.status = 'pending' AND i.due_date < CURRENT_DATE) as overdue_invoices
+  FROM invoices i
+  LEFT JOIN leads l ON i.lead_id = l.id
+  WHERE 
+    (p_start_date IS NULL OR i.created_at >= p_start_date)
+    AND (p_end_date IS NULL OR i.created_at <= p_end_date)
+    AND (p_company_id IS NULL OR l.company_id = p_company_id);
+END;
+$$ LANGUAGE plpgsql;
+
+
+
 
 DROP TRIGGER IF EXISTS trigger_auto_score_lead ON leads;
 CREATE TRIGGER trigger_auto_score_lead BEFORE INSERT OR UPDATE ON leads FOR EACH ROW EXECUTE FUNCTION auto_score_lead();
+
+
+DO $$
+DECLARE
+  table_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO table_count
+  FROM information_schema.tables
+  WHERE table_schema = 'public'
+  AND table_name IN (
+    'lead_subscriptions',
+    'payment_transactions',
+    'invoice_reminders',
+    'accounting_sync_log'
+  );
+  
+  IF table_count = 4 THEN
+    RAISE NOTICE '✅ All Module 4 tables created successfully';
+  ELSE
+    RAISE NOTICE '⚠️ Some tables missing. Expected 4, found %', table_count;
+  END IF;
+END $$;
+
+-- Verify views
+DO $$
+DECLARE
+  view_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO view_count
+  FROM information_schema.views
+  WHERE table_schema = 'public'
+  AND table_name IN (
+    'revenue_dashboard',
+    'overdue_invoices_summary',
+    'active_subscriptions',
+    'expiring_subscriptions'
+  );
+  
+  IF view_count = 4 THEN
+    RAISE NOTICE '✅ All Module 4 views created successfully';
+  ELSE
+    RAISE NOTICE '⚠️ Some views missing. Expected 4, found %', view_count;
+  END IF;
+END $$;
+
+
 
 -- ============================================
 -- VERIFICATION
