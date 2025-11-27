@@ -26,4 +26,17 @@ router.get('/rate-check/:phone', analyticsController.rateCheck);
 // System status
 router.get('/system-status', analyticsController.systemStatus);
 
+
+
+router.get('/dashboard', analyticsController.getDashboard);
+router.get('/activity', analyticsController.getActivity);
+router.get('/pipeline', analyticsController.getPipeline);
+router.get('/velocity', analyticsController.getVelocity);
+router.get('/forecast', analyticsController.getForecast);
+router.get('/churn-prediction', analyticsController.getChurnPrediction);
+router.post('/custom-report', analyticsController.buildCustomReport);
+router.post('/compare', analyticsController.comparePeriods);
+router.post('/export/csv', analyticsController.exportCSV);
+router.post('/export/excel', analyticsController.exportExcel);
+
 module.exports = router;

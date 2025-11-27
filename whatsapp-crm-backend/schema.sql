@@ -1366,6 +1366,51 @@ CREATE TABLE social_media_messages (
 );
 
 
+-- ============================================
+-- HUMAN AGENT MANAGEMENT TABLES
+-- ============================================
+
+DROP TABLE IF EXISTS agent_shifts CASCADE;
+CREATE TABLE agent_shifts (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  shift_date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  shift_type VARCHAR(50) DEFAULT 'regular', -- 'regular', 'overtime', 'on_call'
+  status VARCHAR(50) DEFAULT 'scheduled', -- 'scheduled', 'active', 'completed', 'cancelled'
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+DROP TABLE IF EXISTS time_off_requests CASCADE;
+CREATE TABLE time_off_requests (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  reason TEXT,
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
+  reviewed_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+DROP TABLE IF EXISTS agent_breaks CASCADE;
+CREATE TABLE agent_breaks (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  break_type VARCHAR(50) DEFAULT 'regular', -- 'regular', 'lunch', 'emergency'
+  started_at TIMESTAMP NOT NULL,
+  ended_at TIMESTAMP,
+  duration_seconds INTEGER,
+  status VARCHAR(50) DEFAULT 'active', -- 'active', 'completed'
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 
 -- ============================================
 -- INDEXES FOR PERFORMANCE
@@ -1572,6 +1617,10 @@ CREATE INDEX idx_web_chat_messages_session ON web_chat_messages(session_id, crea
 CREATE INDEX idx_social_accounts_company ON social_media_accounts(company_id, is_active);
 CREATE INDEX idx_social_messages_account ON social_media_messages(account_id, created_at DESC);
 
+CREATE INDEX idx_agent_shifts_agent ON agent_shifts(agent_id, shift_date);
+CREATE INDEX idx_agent_shifts_date ON agent_shifts(shift_date, status);
+CREATE INDEX idx_time_off_requests_agent ON time_off_requests(agent_id, status);
+CREATE INDEX idx_agent_breaks_agent ON agent_breaks(agent_id, started_at DESC);
 
 
 
@@ -1703,6 +1752,9 @@ CREATE TRIGGER update_retention_policies_timestamp BEFORE UPDATE ON data_retenti
 
 DROP TRIGGER IF EXISTS update_social_accounts_timestamp ON social_media_accounts;
 CREATE TRIGGER update_social_accounts_timestamp BEFORE UPDATE ON social_media_accounts FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_agent_shifts_timestamp ON agent_shifts;
+CREATE TRIGGER update_agent_shifts_timestamp BEFORE UPDATE ON agent_shifts FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
 -- ============================================

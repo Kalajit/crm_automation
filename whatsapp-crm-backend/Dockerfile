@@ -61,7 +61,8 @@ COPY package*.json ./
 
 # Install dependencies
 RUN npm cache clean --force && \
-    npm install --production && \
+    # npm install --production && \
+        npm install && \
     npm install https://phonepe.mycloudrepo.io/public/repositories/phonepe-pg-sdk-node/releases/v2/phonepe-pg-sdk-node.tgz
 
 # Copy application files

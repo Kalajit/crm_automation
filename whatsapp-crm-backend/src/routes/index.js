@@ -57,6 +57,8 @@ router.use('/campaigns', campaignsRoutes);
 router.use('/custom-fields', customFieldsRoutes);
 router.use('/calendar', calendarRoutes);
 
+router.use('/whatsapp', require('./whatsapp.routes'));
+
 
 // Legacy endpoints for backward compatibility
 router.use('/search/leads', leadsRoutes);
