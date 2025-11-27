@@ -233,6 +233,8 @@ services:
     build: 
       context: .
       dockerfile: Dockerfile
+      args:
+        - NODE_ENV=production
     container_name: whatsapp-crm-api
     depends_on:
       postgres:
@@ -253,9 +255,11 @@ services:
       DEEPL_API_KEY: ${DEEPL_API_KEY:-}
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     volumes:
-      - ./server.js:/app/server.js:ro
-      - ./package.json:/app/package.json:ro
+      # - ./server.js:/app/server.js:ro
+      # - ./package.json:/app/package.json:ro
       - ./recordings:/app/recordings
     restart: unless-stopped
     healthcheck:

@@ -18,6 +18,8 @@ const PDFDocument = require('pdfkit');
 
 const { Translate } = require('@google-cloud/translate').v2;
 const invoicePayment = require('./invoicePayment.js');
+const { trackUsage, checkUsageLimit } = require('./middleware/usageTracking');
+const Redis = require('ioredis');
 
 
 
@@ -33,7 +35,7 @@ const translate = new Translate({
 });
 
 
-
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 
 // Language mappings
 const LANGUAGE_MAP = {
@@ -53,6 +55,27 @@ const LANGUAGE_KEYWORDS = {
     'te': ['telugu', 'telugu lo', 'తెలుగు', 'telugu cheppu', 'speak telugu', 'తెలుగులో'],
     'en': ['english', 'english mein', 'speak english', 'english please', 'talk in english']
   };
+
+
+const RATE_LIMITS = {
+  // Per company limits
+  company: {
+    messages_per_minute: 20,
+    messages_per_hour: 1000,
+    messages_per_day: 10000
+  },
+  // Per phone number limits (to avoid spam)
+  recipient: {
+    messages_per_hour: 10,
+    messages_per_day: 50
+  },
+  // Bulk message limits
+  bulk: {
+    batch_size: 50,
+    delay_between_batches_ms: 2000,
+    max_concurrent_batches: 3
+  }
+};
   
 
 // Create HTTP server for both Express and WebSocket
@@ -64,19 +87,6 @@ const activeConnections = new Map(); // call_sid -> Set of WebSocket clients
 
 
 
-// ============================================
-// ✅ UPDATED: Translation Function (LibreTranslate + DeepL Fallback)
-// ============================================
-
-
-
-/**
- * Translate text using Google Cloud Translation API
- * @param {string} text - Text to translate
- * @param {string} targetLang - Target language code
- * @param {string} sourceLang - Source language code (optional)
- * @returns {Promise<string>} - Translated text
- */
 async function translateText(text, targetLang, sourceLang = null) {
   if (!text || !text.trim()) {
     return text;
@@ -108,11 +118,7 @@ async function translateText(text, targetLang, sourceLang = null) {
 
 
 
-/**
- * Detect language using Google Cloud Translation API
- * @param {string} text - Text to detect language for
- * @returns {Promise<string>} - Language code
- */
+
 async function detectLanguage(text) {
   if (!text || text.trim().length < 3) {
     return 'en';
@@ -211,14 +217,14 @@ const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN;
 // PHONEPE CONFIGURATION
 // ============================================
 
-const PHONEPE_CONFIG = {
-  merchantId: process.env.PHONEPE_MERCHANT_ID || 'PGTESTPAYUAT',
-  saltKey: process.env.PHONEPE_SALT_KEY || '099eb0cd-02cf-4e2a-8aca-3e6c6aff0399',
-  saltIndex: parseInt(process.env.PHONEPE_SALT_INDEX || '1'),
-  baseUrl: process.env.PHONEPE_BASE_URL || 'https://api-preprod.phonepe.com/apis/pg-sandbox',
-  redirectUrl: process.env.PHONEPE_REDIRECT_URL || 'http://localhost:3000/payment-result',
-  callbackUrl: process.env.PHONEPE_CALLBACK_URL || 'http://localhost:3000/api/payment-callback'
-};
+// const PHONEPE_CONFIG = {
+//   merchantId: process.env.PHONEPE_MERCHANT_ID || 'PGTESTPAYUAT',
+//   saltKey: process.env.PHONEPE_SALT_KEY || '099eb0cd-02cf-4e2a-8aca-3e6c6aff0399',
+//   saltIndex: parseInt(process.env.PHONEPE_SALT_INDEX || '1'),
+//   baseUrl: process.env.PHONEPE_BASE_URL || 'https://api-preprod.phonepe.com/apis/pg-sandbox',
+//   redirectUrl: process.env.PHONEPE_REDIRECT_URL || 'http://localhost:3000/payment-result',
+//   callbackUrl: process.env.PHONEPE_CALLBACK_URL || 'http://localhost:3000/api/payment-callback'
+// };
 
 
 // ============================================
@@ -580,8 +586,6 @@ app.get('/api/health', async (req, res) => {
 // ============================================
 // 1. LEAD MANAGEMENT ENDPOINTS
 // ============================================
-
-
 app.get('/api/leads', async (req, res) => {
   try {
     const { status, limit } = req.query;
@@ -810,7 +814,7 @@ app.get('/api/leads/:lead_id(\\d+)', async (req, res) => {
 
 
 
-// GET LEAD BY ID (must come before /api/leads/:phone)
+// GET LEAD BY ID 
 app.get('/api/leads/id/:lead_id', async (req, res) => {
   try {
     const { lead_id } = req.params;
@@ -1015,9 +1019,9 @@ app.get('/api/search/leads', async (req, res) => {
 
 
 
-// ============================================
+// =========================
 // 2. CONVERSATION ENDPOINTS
-// ============================================
+// =========================
 
 // Get or create conversation
 app.post('/api/conversations', async (req, res) => {
@@ -1099,9 +1103,9 @@ app.get('/api/conversations/:phone', async (req, res) => {
   }
 });
 
-// ============================================
+// ====================
 // 3. MESSAGE ENDPOINTS
-// ============================================
+// ====================
 
 // Store incoming WhatsApp message
 app.post('/api/messages', async (req, res) => {
@@ -1169,10 +1173,9 @@ app.get('/api/messages/:phone', async (req, res) => {
   }
 });
 
-// ============================================
+// ================
 // 4. FAQ ENDPOINTS
-// ============================================
-
+// ================
 // Get all active FAQs
 app.get('/api/faqs', async (req, res) => {
   try {
@@ -1969,9 +1972,9 @@ app.post('/api/webhook/call-completed', async (req, res) => {
   }
 });
 
-// ============================================
-// 5. WEBHOOK: CALL FAILED (from Python)
-// ============================================
+// =======================
+// 5. WEBHOOK: CALL FAILED
+// =======================
 app.post('/api/webhook/call-failed', async (req, res) => {
   try {
     const { lead_id, call_sid, error, company_id, call_type } = req.body;
@@ -2018,9 +2021,9 @@ app.post('/api/webhook/call-failed', async (req, res) => {
 
 
 
-// ============================================
+// =========================
 // 8. NOTIFICATION ENDPOINTS
-// ============================================
+// =========================
 
 // Create notification
 app.post('/api/notifications', async (req, res) => {
@@ -2124,9 +2127,9 @@ app.patch('/api/notifications/:id/sent', async (req, res) => {
 
 
 
-// ============================================
+// ============================
 // 9. DASHBOARD STATS ENDPOINTS
-// ============================================
+// ============================
 
 // Get dashboard metrics
 app.get('/api/stats/dashboard', async (req, res) => {
@@ -2299,13 +2302,6 @@ app.get('/api/metrics/dashboard', async (req, res) => {
 });
 
 
-
-
-
-
-
-
-// Add to server.js
 app.patch('/api/leads/:phone/last-contacted', async (req, res) => {
   try {
     const { phone } = req.params;
@@ -2333,9 +2329,9 @@ app.patch('/api/leads/:phone/last-contacted', async (req, res) => {
 
 
 
-// ============================================
+// =============================
 // LANGUAGE PREFERENCE ENDPOINTS
-// ============================================
+// =============================
 
 // Get lead's language preference
 app.get('/api/leads/:phone/language', async (req, res) => {
@@ -2396,10 +2392,9 @@ app.patch('/api/leads/:phone/language', async (req, res) => {
 
 
 
-// ============================================
+// =======================
 // 10. AUDIT LOG ENDPOINTS
-// ============================================
-
+// =======================
 // Create audit log
 app.post('/api/audit-log', async (req, res) => {
   try {
@@ -2430,9 +2425,9 @@ app.post('/api/audit-log', async (req, res) => {
   }
 });
 
-// ============================================
+// ===================
 // 11. BULK OPERATIONS
-// ============================================
+// ===================
 
 // Bulk update lead interest
 app.post('/api/leads/bulk-update-interest', async (req, res) => {
@@ -2468,9 +2463,9 @@ app.post('/api/leads/bulk-update-interest', async (req, res) => {
   }
 });
 
-// ============================================
+// =====================
 // 12. SEARCH ENDPOINTS
-// ============================================
+// =====================
 
 // Search leads
 // app.get('/api/search/leads', async (req, res) => {
@@ -2519,11 +2514,11 @@ app.post('/api/leads/bulk-update-interest', async (req, res) => {
 
 
 
-// ============================================
+// ====================
 // AI CALLING ENDPOINTS
-// ============================================
+// ====================
 
-// 1. Create Company (for multi-tenant)
+// 1. Create Company 
 app.post('/api/companies', async (req, res) => {
   try {
     const { name, phone_number } = req.body;
@@ -2554,9 +2549,9 @@ app.get('/api/companies', async (req, res) => {
   }
 });
 
-// ============================================
+// ====================
 // 7. GET COMPANY BY ID
-// ============================================
+// ====================
 app.get('/api/companies/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -2613,9 +2608,9 @@ app.get('/api/agent-configs/:company_id', async (req, res) => {
 
 
 
-// ============================================
-// AGENT INSTANCES ENDPOINTS (CLOSERX-LIKE)
-// ============================================
+// ========================
+// AGENT INSTANCES ENDPOINTS 
+// ========================
 
 // Create Agent Instance
 app.post('/api/agent-instances', async (req, res) => {
@@ -3065,9 +3060,9 @@ app.get('/api/call-logs/:call_sid', async (req, res) => {
 
 
 
-// ============================================
+// ===========================
 // 10. GET CALL LOG BY CALL_SID
-// ============================================
+// ===========================
 app.get('/api/call-logs/sid/:call_sid', async (req, res) => {
   try {
     const { call_sid } = req.params;
@@ -3272,9 +3267,9 @@ app.patch('/api/system-notifications/:id/read', async (req, res) => {
   }
 });
 
-// ============================================
-// SIMPLE ANALYTICS SYSTEM (Replaces External Analytics)
-// ============================================
+// =======================
+// SIMPLE ANALYTICS SYSTEM 
+// =======================
 
 // Track events internally
 app.post('/api/analytics/events', async (req, res) => {
@@ -3439,9 +3434,9 @@ app.get('/api/alerts', async (req, res) => {
 
 
 
-// ============================================
+// ========================
 // CALL RECORDINGS ENDPOINT
-// ============================================
+// ========================
 
 // Get recording by call_sid
 app.get('/api/recordings/:call_sid', async (req, res) => {
@@ -3468,9 +3463,9 @@ app.get('/api/recordings/:call_sid', async (req, res) => {
   }
 });
 
-// ============================================
-// SUMMARY REPORTS ENDPOINT (Replaces metrics reports)
-// ============================================
+// ========================
+// SUMMARY REPORTS ENDPOINT
+// ========================
 
 app.get('/api/reports/daily-summary', async (req, res) => {
   try {
@@ -3544,9 +3539,9 @@ app.get('/api/reports/daily-summary', async (req, res) => {
   }
 });
 
-// ============================================
-// SIMPLE EMAIL NOTIFICATION (No external SMTP)
-// ============================================
+// ==========================
+// SIMPLE EMAIL NOTIFICATION 
+// ==========================
 
 // Store email notifications in database (to be sent by a cron job)
 app.post('/api/email-queue', async (req, res) => {
@@ -3599,9 +3594,9 @@ app.get('/api/email-queue/pending', async (req, res) => {
   }
 });
 
-// ============================================
-// HOT LEADS ENDPOINT (Simple replacement for Slack alerts)
-// ============================================
+// ==================
+// HOT LEADS ENDPOINT 
+// ==================
 
 app.get('/api/hot-leads', async (req, res) => {
   try {
@@ -4812,9 +4807,7 @@ app.patch('/api/companies/:company_id/calling-hours', async (req, res) => {
   }
 });
 
-// ============================================
 // CLEANUP: Remove old rate limit entries every 5 minutes
-// ============================================
 setInterval(() => {
   const now = Date.now();
   for (const [phone, data] of conversationRateLimits.entries()) {
@@ -5392,9 +5385,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     const { company_id, agent_instance_id } = stateData;
     console.log('📞 Processing OAuth callback for:', { company_id, agent_instance_id });
     
-    // ============================================
+
     // STEP 1: Exchange code for access token
-    // ============================================
     const redirectUri = `${process.env.BASE_URL}/api/whatsapp/oauth/callback`;
     
     const tokenResponse = await axios.post(
@@ -5413,10 +5405,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     
     const accessToken = tokenResponse.data.access_token;
     console.log('✅ Access token obtained');
-    
-    // ============================================
-    // STEP 2: Get token debug info (contains WABA in scopes)
-    // ============================================
+
+    // STEP 2: Get token debug info 
     const debugResponse = await axios.get(
       'https://graph.facebook.com/v21.0/debug_token',
       {
@@ -5432,9 +5422,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     const grantedScopes = tokenData.granular_scopes || [];
     console.log('✅ Granted scopes:', grantedScopes.map(s => s.scope));
     
-    // ============================================
+
     // STEP 3: Extract WABA ID from granted scopes
-    // ============================================
     let wabaId = null;
     
     // Method 1: From granular_scopes.target_ids (most reliable)
@@ -5517,10 +5506,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
         </html>
       `);
     }
-    
-    // ============================================
+
     // STEP 4: Get phone numbers from WABA
-    // ============================================
     const phoneResponse = await axios.get(
       `https://graph.facebook.com/v21.0/${wabaId}/phone_numbers`,
       {
@@ -5545,9 +5532,8 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     
     console.log('✅ Phone Number:', displayPhoneNumber, 'ID:', phoneNumberId);
     
-    // ============================================
-    // STEP 5: Get Business Account ID (optional, for reference)
-    // ============================================
+
+    // STEP 5: Get Business Account ID 
     let businessAccountId = null;
     try {
       const businessResponse = await axios.get(
@@ -5566,9 +5552,7 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
       console.log('⚠️ Could not fetch business account (non-critical):', err.message);
     }
     
-    // ============================================
     // STEP 6: Save to database
-    // ============================================
     const verifyToken = `verify_${Date.now()}_${Math.random().toString(36).substr(2, 12)}`;
     
     const updateResult = await pool.query(`
@@ -5606,9 +5590,7 @@ app.get('/api/whatsapp/oauth/callback', async (req, res) => {
     console.log('✅ Credentials saved to database');
     logRequest('GET', '/api/whatsapp/oauth/callback', 200);
     
-    // ============================================
     // STEP 7: Success page with webhook instructions
-    // ============================================
     const webhookUrl = `${process.env.BASE_URL}/api/webhooks/whatsapp-universal`;
     const agentName = updateResult.rows[0].agent_name;
     
@@ -6133,10 +6115,7 @@ app.post('/api/webhooks/whatsapp-universal', async (req, res) => {
         normalizedFromPhone
       );
 
-      // ============================================
       // ✅ Store incoming user message in database
-      // ============================================
-
       try {
         // 1. Get or create lead
         const phone = '+' + fromPhone;
@@ -6303,51 +6282,337 @@ app.get('/api/webhooks/whatsapp-universal', async (req, res) => {
 // SEND WHATSAPP MESSAGE (DYNAMIC CREDENTIALS)
 // ============================================
 
-app.post('/api/whatsapp/send', async (req, res) => {
-  try {
-    const { to, message, agent_instance_id } = req.body;
+// app.post('/api/whatsapp/send', async (req, res) => {
+//   try {
+//     const { to, message, agent_instance_id } = req.body;
 
-    if (!to || !message || !agent_instance_id) {
-      return res.status(400).json({ error: 'to, message, and agent_instance_id required' });
+//     if (!to || !message || !agent_instance_id) {
+//       return res.status(400).json({ error: 'to, message, and agent_instance_id required' });
+//     }
+
+//     // Get agent credentials
+//     const agent = await pool.query(
+//       'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+//       [agent_instance_id]
+//     );
+
+//     if (agent.rows.length === 0) {
+//       return res.status(404).json({ error: 'Agent instance not found' });
+//     }
+
+//     const credentials = agent.rows[0].whatsapp_credentials;
+
+//     // Send via Meta API
+//     const response = await axios.post(
+//       `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+//       {
+//         messaging_product: 'whatsapp',
+//         to: to,
+//         type: 'text',
+//         text: { body: message }
+//       },
+//       {
+//         headers: {
+//           'Authorization': `Bearer ${credentials.access_token}`,
+//           'Content-Type': 'application/json'
+//         }
+//       }
+//     );
+
+//     logRequest('POST', '/api/whatsapp/send', 200);
+//     res.json({ success: true, data: response.data });
+//   } catch (error) {
+//     console.error('WhatsApp send error:', error.response?.data || error);
+//     logRequest('POST', '/api/whatsapp/send', 500);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
+
+
+
+
+async function checkRateLimit(companyId, recipientNumber = null) {
+  const now = Date.now();
+  const results = {
+    allowed: true,
+    limits: {},
+    retry_after: null
+  };
+
+  // Check company-level limits
+  const companyKey = `ratelimit:company:${companyId}`;
+  
+  // Minute limit
+  const minuteKey = `${companyKey}:minute:${Math.floor(now / 60000)}`;
+  const minuteCount = await redis.incr(minuteKey);
+  await redis.expire(minuteKey, 60);
+  
+  if (minuteCount > RATE_LIMITS.company.messages_per_minute) {
+    results.allowed = false;
+    results.limits.minute_exceeded = true;
+    results.retry_after = 60 - (now % 60000) / 1000;
+  }
+
+  // Hour limit
+  const hourKey = `${companyKey}:hour:${Math.floor(now / 3600000)}`;
+  const hourCount = await redis.incr(hourKey);
+  await redis.expire(hourKey, 3600);
+  
+  if (hourCount > RATE_LIMITS.company.messages_per_hour) {
+    results.allowed = false;
+    results.limits.hour_exceeded = true;
+    results.retry_after = Math.max(results.retry_after || 0, 3600 - (now % 3600000) / 1000);
+  }
+
+  // Day limit
+  const dayKey = `${companyKey}:day:${Math.floor(now / 86400000)}`;
+  const dayCount = await redis.incr(dayKey);
+  await redis.expire(dayKey, 86400);
+  
+  if (dayCount > RATE_LIMITS.company.messages_per_day) {
+    results.allowed = false;
+    results.limits.day_exceeded = true;
+    results.retry_after = Math.max(results.retry_after || 0, 86400 - (now % 86400000) / 1000);
+  }
+
+  // Check recipient-level limits if provided
+  if (recipientNumber) {
+    const recipientKey = `ratelimit:recipient:${recipientNumber}`;
+    
+    const recipientHourKey = `${recipientKey}:hour:${Math.floor(now / 3600000)}`;
+    const recipientHourCount = await redis.incr(recipientHourKey);
+    await redis.expire(recipientHourKey, 3600);
+    
+    if (recipientHourCount > RATE_LIMITS.recipient.messages_per_hour) {
+      results.allowed = false;
+      results.limits.recipient_hour_exceeded = true;
     }
 
-    // Get agent credentials
-    const agent = await pool.query(
-      'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+    const recipientDayKey = `${recipientKey}:day:${Math.floor(now / 86400000)}`;
+    const recipientDayCount = await redis.incr(recipientDayKey);
+    await redis.expire(recipientDayKey, 86400);
+    
+    if (recipientDayCount > RATE_LIMITS.recipient.messages_per_day) {
+      results.allowed = false;
+      results.limits.recipient_day_exceeded = true;
+    }
+  }
+
+  return results;
+}
+
+
+app.post('/api/whatsapp/send', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { to, message, agent_instance_id, priority = 'normal' } = req.body;
+
+    // Validate required fields
+    if (!to || !message || !agent_instance_id) {
+      logRequest('POST', '/api/whatsapp/send', 400, Date.now() - startTime);
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        required: ['to', 'message', 'agent_instance_id'],
+        received: { to: !!to, message: !!message, agent_instance_id: !!agent_instance_id }
+      });
+    }
+
+    // Validate phone number format (basic validation)
+    const phoneRegex = /^\+?[1-9]\d{1,14}$/;
+    if (!phoneRegex.test(to)) {
+      logRequest('POST', '/api/whatsapp/send', 400, Date.now() - startTime);
+      return res.status(400).json({ 
+        error: 'Invalid phone number format',
+        message: 'Phone number must be in E.164 format (e.g., +919876543210)'
+      });
+    }
+
+    // Validate message length
+    if (message.length > 4096) {
+      logRequest('POST', '/api/whatsapp/send', 400, Date.now() - startTime);
+      return res.status(400).json({ 
+        error: 'Message too long',
+        message: 'Message must be 4096 characters or less',
+        currentLength: message.length,
+        max_length: 4096
+      });
+    }
+
+    // Fetch agent credentials from database
+    // const agentResult = await pool.query(
+    //   'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+    //   [agent_instance_id]
+    // );
+    const agentResult = await pool.query(
+      `SELECT ai.*, c.id as company_id 
+       FROM agent_instances ai
+       JOIN companies c ON ai.company_id = c.id
+       WHERE ai.id = $1`,
       [agent_instance_id]
     );
 
-    if (agent.rows.length === 0) {
-      return res.status(404).json({ error: 'Agent instance not found' });
+
+    if (agentResult.rows.length === 0) {
+      logRequest('POST', '/api/whatsapp/send', 404, Date.now() - startTime);
+      return res.status(404).json({ 
+        error: 'Agent instance not found',
+        agent_instance_id 
+      });
     }
 
-    const credentials = agent.rows[0].whatsapp_credentials;
+    const agent = agentResult.rows[0];
+    const credentials = agentResult.rows[0].whatsapp_credentials;
 
-    // Send via Meta API
-    const response = await axios.post(
+    // Validate credentials
+    if (!credentials || !credentials.phone_number_id || !credentials.access_token) {
+      logRequest('POST', '/api/whatsapp/send', 500, Date.now() - startTime);
+      return res.status(500).json({ 
+        error: 'Invalid WhatsApp credentials configured for this agent'
+      });
+    }
+
+    // Check rate limits (skip for high priority)
+    if (priority !== 'high') {
+      const rateLimitCheck = await checkRateLimit(agent.company_id, to);
+      
+      if (!rateLimitCheck.allowed) {
+        return res.status(429).json({
+          error: 'Rate limit exceeded',
+          limits: rateLimitCheck.limits,
+          retry_after: rateLimitCheck.retry_after
+        });
+      }
+    }
+
+    // Get or create lead
+    let lead = await pool.query(
+      'SELECT id FROM leads WHERE phone_number = $1 AND company_id = $2',
+      [to, agent.company_id]
+    );
+
+    let leadId = lead.rows[0]?.id;
+    if (!leadId) {
+      const newLead = await pool.query(
+        `INSERT INTO leads (company_id, phone_number, lead_source) 
+         VALUES ($1, $2, 'whatsapp') 
+         RETURNING id`,
+        [agent.company_id, to]
+      );
+      leadId = newLead.rows[0].id;
+    }
+
+    // Get or create conversation
+    let conversation = await pool.query(
+      'SELECT id FROM conversations WHERE lead_id = $1',
+      [leadId]
+    );
+
+    let conversationId = conversation.rows[0]?.id;
+    if (!conversationId) {
+      const newConv = await pool.query(
+        `INSERT INTO conversations (lead_id, phone_number) 
+         VALUES ($1, $2) 
+         RETURNING id`,
+        [leadId, to]
+      );
+      conversationId = newConv.rows[0].id;
+    }
+
+    // Send message via Meta WhatsApp Business API
+    const whatsappResponse = await axios.post(
       `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
       {
         messaging_product: 'whatsapp',
+        recipient_type: 'individual',
         to: to,
         type: 'text',
-        text: { body: message }
+        text: { 
+          preview_url: true, // Enable link previews
+          body: message 
+        }
       },
       {
         headers: {
           'Authorization': `Bearer ${credentials.access_token}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 10000 // 10 second timeout
       }
     );
 
-    logRequest('POST', '/api/whatsapp/send', 200);
-    res.json({ success: true, data: response.data });
+    // Log successful message
+    await pool.query(
+      `INSERT INTO whatsapp_messages 
+       (lead_id, conversation_id, phone_number, message_body, sender, is_from_user, message_id, delivery_status)
+       VALUES ($1, $2, $3, $4, 'agent', false, $5, 'sent')`,
+      [leadId, conversationId, to, message, messageId]
+    );
+
+    // Update conversation
+    await pool.query(
+      `UPDATE conversations 
+       SET last_message = $1, 
+           last_message_timestamp = NOW(),
+           message_count = message_count + 1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [message, conversationId]
+    );
+
+    const duration = Date.now() - startTime;
+    logRequest('POST', '/api/whatsapp/send', 200, duration);
+    
+    res.json({ 
+      success: true, 
+      message_id: whatsappResponse.data.messages?.[0]?.id,
+      data: whatsappResponse.data,
+      duration_ms: duration
+    });
+
   } catch (error) {
-    console.error('WhatsApp send error:', error.response?.data || error);
-    logRequest('POST', '/api/whatsapp/send', 500);
-    res.status(500).json({ error: error.message });
+    const duration = Date.now() - startTime;
+    console.error('WhatsApp send error:', {
+      message: error.message,
+      response: error.response?.data,
+      status: error.response?.status,
+      agent_instance_id: req.body.agent_instance_id
+    });
+
+    // Log failed message
+    if (req.body.agent_instance_id) {
+      try {
+        await pool.query(
+          `INSERT INTO whatsapp_messages 
+           (lead_id, conversation_id, phone_number, message_body, sender, is_from_user, delivery_status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            null, // lead_id
+            null, // conversation_id
+            req.body.to, 
+            req.body.message, 
+            'agent', 
+            false,
+            'failed'
+          ]
+        );
+      } catch (logError) {
+        console.error('Failed to log error:', logError);
+      }
+    }
+
+    logRequest('POST', '/api/whatsapp/send', error.response?.status || 500, duration);
+    
+    res.status(error.response?.status || 500).json({ 
+      error: error.message,
+      details: error.response?.data || 'Internal server error',
+      code: error.code
+    });
   }
 });
+
+
+
 
 // ============================================
 // CLIENT ONBOARDING: SAVE WHATSAPP CREDENTIALS
@@ -6440,9 +6705,9 @@ app.get('/callback', async (req, res) => {
 
 
 
-// ============================================
-// CAMPAIGNS ENDPOINTS (Add after existing campaign endpoints)
-// ============================================
+// ===================
+// CAMPAIGNS ENDPOINTS
+// ===================
 
 // Get campaigns for company
 app.get('/api/campaigns', async (req, res) => {
@@ -6473,84 +6738,360 @@ app.get('/api/campaigns', async (req, res) => {
 // BULK SEND WHATSAPP MESSAGE
 // ============================================
 
+// app.post('/api/whatsapp/send-bulk', async (req, res) => {
+//   try {
+//     const { agent_instance_id, messages } = req.body;
+    
+//     if (!agent_instance_id || !messages || !Array.isArray(messages)) {
+//       return res.status(400).json({ 
+//         error: 'agent_instance_id and messages array required' 
+//       });
+//     }
+    
+//     // Get agent credentials
+//     const agent = await pool.query(
+//       'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+//       [agent_instance_id]
+//     );
+    
+//     if (agent.rows.length === 0) {
+//       return res.status(404).json({ error: 'Agent not found' });
+//     }
+    
+//     const credentials = agent.rows[0].whatsapp_credentials;
+//     const results = [];
+//     const errors = [];
+    
+//     // Send messages with rate limiting
+//     for (const msg of messages) {
+//       try {
+//         const response = await axios.post(
+//           `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+//           {
+//             messaging_product: 'whatsapp',
+//             to: msg.to,
+//             type: 'text',
+//             text: { body: msg.message }
+//           },
+//           {
+//             headers: {
+//               'Authorization': `Bearer ${credentials.access_token}`,
+//               'Content-Type': 'application/json'
+//             }
+//           }
+//         );
+        
+//         results.push({ to: msg.to, success: true, message_id: response.data.messages[0].id });
+        
+//         // Rate limit: 1 message per second
+//         await new Promise(resolve => setTimeout(resolve, 1000));
+        
+//       } catch (error) {
+//         errors.push({ to: msg.to, error: error.message });
+//       }
+//     }
+    
+//     logRequest('POST', '/api/whatsapp/send-bulk', 200);
+//     res.json({ 
+//       success: true, 
+//       sent: results.length,
+//       failed: errors.length,
+//       results,
+//       errors 
+//     });
+    
+//   } catch (error) {
+//     logRequest('POST', '/api/whatsapp/send-bulk', 500);
+//     handleError(res, error);
+//   }
+// });
+
+
+
 app.post('/api/whatsapp/send-bulk', async (req, res) => {
   try {
-    const { agent_instance_id, messages } = req.body;
-    
-    if (!agent_instance_id || !messages || !Array.isArray(messages)) {
-      return res.status(400).json({ 
-        error: 'agent_instance_id and messages array required' 
-      });
+    const { recipients, message, agent_instance_id, schedule_time } = req.body;
+
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ error: 'Recipients array required' });
     }
-    
-    // Get agent credentials
-    const agent = await pool.query(
-      'SELECT whatsapp_credentials FROM agent_instances WHERE id = $1',
+
+    if (!message || !agent_instance_id) {
+      return res.status(400).json({ error: 'Message and agent_instance_id required' });
+    }
+
+    // Get agent info
+    const agentResult = await pool.query(
+      `SELECT ai.*, c.id as company_id 
+       FROM agent_instances ai
+       JOIN companies c ON ai.company_id = c.id
+       WHERE ai.id = $1`,
       [agent_instance_id]
     );
-    
-    if (agent.rows.length === 0) {
-      return res.status(404).json({ error: 'Agent not found' });
+
+    if (agentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent instance not found' });
     }
-    
-    const credentials = agent.rows[0].whatsapp_credentials;
-    const results = [];
-    const errors = [];
-    
-    // Send messages with rate limiting
-    for (const msg of messages) {
-      try {
-        const response = await axios.post(
-          `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
-          {
-            messaging_product: 'whatsapp',
-            to: msg.to,
-            type: 'text',
-            text: { body: msg.message }
-          },
-          {
-            headers: {
-              'Authorization': `Bearer ${credentials.access_token}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        
-        results.push({ to: msg.to, success: true, message_id: response.data.messages[0].id });
-        
-        // Rate limit: 1 message per second
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-      } catch (error) {
-        errors.push({ to: msg.to, error: error.message });
+
+    const agent = agentResult.rows[0];
+
+    // Check if scheduling is requested
+    if (schedule_time) {
+      const scheduledTime = new Date(schedule_time);
+      if (scheduledTime <= new Date()) {
+        return res.status(400).json({ error: 'Schedule time must be in the future' });
       }
+
+      // Create scheduled bulk job
+      const bulkJobResult = await pool.query(
+        `INSERT INTO bulk_message_jobs 
+         (company_id, agent_instance_id, message, recipients, total_count, status, scheduled_time)
+         VALUES ($1, $2, $3, $4, $5, 'scheduled', $6)
+         RETURNING id`,
+        [agent.company_id, agent_instance_id, message, JSON.stringify(recipients), recipients.length, scheduledTime]
+      );
+
+      return res.json({
+        success: true,
+        job_id: bulkJobResult.rows[0].id,
+        scheduled_for: scheduledTime,
+        total_recipients: recipients.length
+      });
     }
-    
-    logRequest('POST', '/api/whatsapp/send-bulk', 200);
-    res.json({ 
-      success: true, 
-      sent: results.length,
-      failed: errors.length,
-      results,
-      errors 
+
+    // Process immediately
+    const jobResult = await pool.query(
+      `INSERT INTO bulk_message_jobs 
+       (company_id, agent_instance_id, message, recipients, total_count, status)
+       VALUES ($1, $2, $3, $4, $5, 'processing')
+       RETURNING id`,
+      [agent.company_id, agent_instance_id, message, JSON.stringify(recipients), recipients.length]
+    );
+
+    const jobId = jobResult.rows[0].id;
+
+    // Process in background
+    processBulkMessages(jobId, recipients, message, agent).catch(err => {
+      console.error('Bulk message processing error:', err);
     });
-    
+
+    res.json({
+      success: true,
+      job_id: jobId,
+      total_recipients: recipients.length,
+      status: 'processing'
+    });
+
   } catch (error) {
-    logRequest('POST', '/api/whatsapp/send-bulk', 500);
-    handleError(res, error);
+    console.error('Bulk send error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 
 
+async function processBulkMessages(jobId, recipients, message, agent) {
+  const batchSize = RATE_LIMITS.bulk.batch_size;
+  const delayBetweenBatches = RATE_LIMITS.bulk.delay_between_batches_ms;
+  
+  let successCount = 0;
+  let failedCount = 0;
+  const failedRecipients = [];
+
+  try {
+    // Process in batches
+    for (let i = 0; i < recipients.length; i += batchSize) {
+      const batch = recipients.slice(i, i + batchSize);
+      
+      // Check rate limits before each batch
+      const rateLimitCheck = await checkRateLimit(agent.company_id);
+      if (!rateLimitCheck.allowed) {
+        const waitTime = rateLimitCheck.retry_after * 1000;
+        console.log(`Rate limit hit, waiting ${waitTime}ms`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+
+      // Send batch concurrently
+      const batchPromises = batch.map(async (recipient) => {
+        try {
+          await sendSingleWhatsAppMessage(agent, recipient, message);
+          successCount++;
+          
+          // Update job progress
+          await pool.query(
+            `UPDATE bulk_message_jobs 
+             SET sent_count = $1, updated_at = NOW()
+             WHERE id = $2`,
+            [successCount, jobId]
+          );
+        } catch (error) {
+          failedCount++;
+          failedRecipients.push({ phone: recipient, error: error.message });
+          
+          await pool.query(
+            `UPDATE bulk_message_jobs 
+             SET failed_count = $1, updated_at = NOW()
+             WHERE id = $2`,
+            [failedCount, jobId]
+          );
+        }
+      });
+
+      await Promise.all(batchPromises);
+
+      // Delay between batches (except for last batch)
+      if (i + batchSize < recipients.length) {
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+      }
+    }
+
+    // Mark job as completed
+    await pool.query(
+      `UPDATE bulk_message_jobs 
+       SET status = 'completed',
+           sent_count = $1,
+           failed_count = $2,
+           failed_recipients = $3,
+           completed_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $4`,
+      [successCount, failedCount, JSON.stringify(failedRecipients), jobId]
+    );
+
+    console.log(`Bulk job ${jobId} completed: ${successCount} sent, ${failedCount} failed`);
+
+  } catch (error) {
+    console.error(`Bulk job ${jobId} error:`, error);
+    
+    await pool.query(
+      `UPDATE bulk_message_jobs 
+       SET status = 'failed',
+           error_message = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [error.message, jobId]
+    );
+  }
+}
+
+
+async function sendSingleWhatsAppMessage(agent, recipient, message) {
+  const credentials = agent.whatsapp_credentials;
+  
+  const response = await axios.post(
+    `https://graph.facebook.com/v21.0/${credentials.phone_number_id}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipient,
+      type: 'text',
+      text: { 
+        preview_url: true,
+        body: message 
+      }
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${credentials.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    }
+  );
+
+  return response.data;
+}
+
+
+
+app.get('/api/whatsapp/bulk-job/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    const result = await pool.query(
+      `SELECT * FROM bulk_message_jobs WHERE id = $1`,
+      [jobId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const job = result.rows[0];
+    
+    res.json({
+      job_id: job.id,
+      status: job.status,
+      total_recipients: job.total_count,
+      sent: job.sent_count,
+      failed: job.failed_count,
+      failed_recipients: job.failed_recipients,
+      scheduled_time: job.scheduled_time,
+      created_at: job.created_at,
+      completed_at: job.completed_at
+    });
+
+  } catch (error) {
+    console.error('Job status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// RATE LIMIT STATS
+// ============================================
+
+app.get('/api/whatsapp/rate-limit-stats/:companyId', async (req, res) => {
+  try {
+    const { companyId } = req.params;
+    const now = Date.now();
+
+    const companyKey = `ratelimit:company:${companyId}`;
+    
+    const minuteKey = `${companyKey}:minute:${Math.floor(now / 60000)}`;
+    const hourKey = `${companyKey}:hour:${Math.floor(now / 3600000)}`;
+    const dayKey = `${companyKey}:day:${Math.floor(now / 86400000)}`;
+
+    const [minuteCount, hourCount, dayCount] = await Promise.all([
+      redis.get(minuteKey),
+      redis.get(hourKey),
+      redis.get(dayKey)
+    ]);
+
+    res.json({
+      company_id: companyId,
+      current_usage: {
+        minute: parseInt(minuteCount) || 0,
+        hour: parseInt(hourCount) || 0,
+        day: parseInt(dayCount) || 0
+      },
+      limits: {
+        minute: RATE_LIMITS.company.messages_per_minute,
+        hour: RATE_LIMITS.company.messages_per_hour,
+        day: RATE_LIMITS.company.messages_per_day
+      },
+      remaining: {
+        minute: RATE_LIMITS.company.messages_per_minute - (parseInt(minuteCount) || 0),
+        hour: RATE_LIMITS.company.messages_per_hour - (parseInt(hourCount) || 0),
+        day: RATE_LIMITS.company.messages_per_day - (parseInt(dayCount) || 0)
+      }
+    });
+
+  } catch (error) {
+    console.error('Rate limit stats error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function logRequest(method, path, status, duration = 0) {
+  console.log(`[${new Date().toISOString()}] ${method} ${path} - ${status} (${duration}ms)`);
+}
 
 
 
 // ==================== TWILIO OAUTH SETUP ====================
 
-/**
- * Start Twilio OAuth Flow
- */
+// Start Twilio OAuth Flow
 app.get('/api/twilio/oauth/start', async (req, res) => {
   try {
     const { company_id, agent_instance_id } = req.query;
@@ -6584,9 +7125,7 @@ app.get('/api/twilio/oauth/start', async (req, res) => {
   }
 });
 
-/**
- * Twilio OAuth Callback
- */
+// Twilio OAuth Callback
 app.get('/api/twilio/oauth/callback', async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -6690,9 +7229,7 @@ app.get('/api/twilio/oauth/callback', async (req, res) => {
   }
 });
 
-/**
- * Check Twilio Connection Status
- */
+// Check Twilio Connection Status
 app.get('/api/twilio/oauth/status/:agent_instance_id', async (req, res) => {
   try {
     const { agent_instance_id } = req.params;
@@ -6730,9 +7267,7 @@ app.get('/api/twilio/oauth/status/:agent_instance_id', async (req, res) => {
   }
 });
 
-/**
- * Disconnect Twilio Account
- */
+// Disconnect Twilio Account
 app.delete('/api/twilio/oauth/disconnect/:agent_instance_id', async (req, res) => {
   try {
     const { agent_instance_id } = req.params;
@@ -6758,10 +7293,7 @@ app.delete('/api/twilio/oauth/disconnect/:agent_instance_id', async (req, res) =
 
 // ==================== TWILIO VOICE WEBHOOK ====================
 
-/**
- * Universal Twilio Voice Webhook
- * Handles ALL inbound calls for ALL agent instances
- */
+// Handles ALL inbound calls for ALL agent instances
 app.post('/twilio/voice-webhook', async (req, res) => {
   try {
     const { To, From, CallSid } = req.body;
@@ -6840,9 +7372,7 @@ app.post('/twilio/voice-webhook', async (req, res) => {
 
 // ==================== AIRTEL SIP SETUP ====================
 
-/**
- * Configure Airtel SIP Credentials (Manual Setup)
- */
+// Configure Airtel SIP Credentials (Manual Setup)
 app.post('/api/airtel-sip/configure', async (req, res) => {
   try {
     const { 
@@ -6894,9 +7424,7 @@ app.post('/api/airtel-sip/configure', async (req, res) => {
   }
 });
 
-/**
- * Get SIP Configuration Status
- */
+// Get SIP Configuration Status
 app.get('/api/sip/status/:agent_instance_id', async (req, res) => {
   try {
     const { agent_instance_id } = req.params;
@@ -7622,7 +8150,6 @@ async function checkAndRefreshToken(company_id, platform) {
 // ============================================
 // OAUTH & LEAD INTEGRATION ENDPOINTS
 // ============================================
-
 // 1. START OAUTH FLOW (Meta/Facebook)
 app.get('/api/oauth/meta/start', async (req, res) => {
   try {
@@ -7818,9 +8345,7 @@ app.get('/api/oauth/meta/callback', async (req, res) => {
 
 
 
-/**
- * Auto-configure webhook for Meta form
- */
+// Auto-configure webhook for Meta form
 async function configureMetaFormWebhook(company_id, form_id, form_name, access_token) {
   try {
     const webhookToken = `meta_${company_id}_${form_id}_${Date.now()}`;
@@ -7869,9 +8394,7 @@ async function configureMetaFormWebhook(company_id, form_id, form_name, access_t
   }
 }
 
-/**
- * Meta Webhook for lead capture
- */
+// Meta Webhook for lead capture
 app.post('/api/webhooks/meta-leads/:token', async (req, res) => {
   try {
     const { token } = req.params;
@@ -8031,9 +8554,7 @@ app.post('/api/webhooks/meta-leads/:token', async (req, res) => {
   }
 });
 
-/**
- * Get Meta forms for configuration
- */
+// Get Meta forms for configuration
 app.get('/api/oauth/meta/forms/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -8072,9 +8593,7 @@ app.get('/api/oauth/meta/forms/:company_id', async (req, res) => {
   }
 });
 
-/**
- * Sync Meta leads manually
- */
+// Sync Meta leads manually
 app.post('/api/oauth/meta/sync-leads', async (req, res) => {
   try {
     const { company_id, form_id, limit = 50 } = req.body;
@@ -8206,8 +8725,6 @@ function generateErrorPage(title, message) {
 }
 
 
-
-
 // 3. START OAUTH FLOW (Google Ads)
 app.get('/api/oauth/google-ads/start', async (req, res) => {
   try {
@@ -8333,9 +8850,6 @@ app.get('/api/oauth/google-ads/callback', async (req, res) => {
     res.status(500).send(`Error: ${error.message}`);
   }
 });
-
-
-
 
 
 
@@ -8468,9 +8982,6 @@ app.get('/api/oauth/linkedin/callback', async (req, res) => {
 
 
 
-
-
-
 // 7. GET LEAD FORMS (Meta)
 app.get('/api/lead-sources/meta/forms/:company_id', async (req, res) => {
   try {
@@ -8549,9 +9060,7 @@ app.post('/api/lead-sources/configure', async (req, res) => {
 
 
 
-// -------------------------------
 // 9. UNIFIED WEBHOOK FOR ALL PLATFORMS
-// -------------------------------
 app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
   const client = await pool.connect();
 
@@ -8679,9 +9188,8 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
     let leadId;
 
     if (existingLead.rows.length > 0) {
-      // ------------------------------
+
       // ✅ Update existing lead
-      // ------------------------------
       console.log('🔄 Updating existing lead:', existingLead.rows[0].id);
       const lead = existingLead.rows[0];
       const newTags = Array.from(
@@ -8735,9 +9243,8 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
       console.log('✅ Lead updated:', leadId);
 
     } else {
-      // ------------------------------
+
       // ✅ Create new lead
-      // ------------------------------
       console.log('➕ Creating new lead');
       const insertResult = await client.query(
         `
@@ -8876,9 +9383,7 @@ app.post('/api/webhooks/lead-capture/:token', async (req, res) => {
 
 
 
-// -------------------------------
 // 10. GET OAUTH STATUS
-// -------------------------------
 app.get('/api/oauth/status/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -8903,9 +9408,7 @@ app.get('/api/oauth/status/:company_id', async (req, res) => {
 });
 
 
-// -------------------------------
 // 11. DISCONNECT PLATFORM
-// -------------------------------
 app.delete('/api/oauth/:company_id/:platform', async (req, res) => {
   try {
     const { company_id, platform } = req.params;
@@ -8928,9 +9431,7 @@ app.delete('/api/oauth/:company_id/:platform', async (req, res) => {
 });
 
 
-// -------------------------------
 // 12. GET LEAD IMPORT STATS
-// -------------------------------
 app.get('/api/lead-imports/stats/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -8968,9 +9469,7 @@ app.get('/api/lead-imports/stats/:company_id', async (req, res) => {
 });
 
 
-// -------------------------------
 // 13. RETRY FAILED IMPORT
-// -------------------------------
 app.post('/api/lead-imports/retry/:log_id', async (req, res) => {
   const client = await pool.connect();
 
@@ -9056,9 +9555,7 @@ app.post('/api/lead-imports/retry/:log_id', async (req, res) => {
 });
 
 
-// -------------------------------
 // 14. GET LEAD SOURCE CONFIGS
-// -------------------------------
 app.get('/api/lead-sources/configs/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -9446,8 +9943,6 @@ app.get('/api/lead-sources/config-by-token/:token', async (req, res) => {
 // ============================================
 
 // 1. PIPELINE OVERVIEW
-// ============================================
-
 app.get('/api/dashboard/pipeline', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -9527,8 +10022,6 @@ app.get('/api/dashboard/pipeline', async (req, res) => {
 });
 
 // 2. SALES PERFORMANCE METRICS
-// ============================================
-
 app.get('/api/dashboard/sales-performance', async (req, res) => {
   try {
     const { company_id, start_date, end_date, agent_id } = req.query;
@@ -9644,8 +10137,6 @@ app.get('/api/dashboard/sales-performance', async (req, res) => {
 });
 
 // 3. LEAD SOURCE ANALYSIS
-// ============================================
-
 app.get('/api/dashboard/lead-sources', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -9719,8 +10210,6 @@ app.get('/api/dashboard/lead-sources', async (req, res) => {
 });
 
 // 4. AGENT PERFORMANCE LEADERBOARD
-// ============================================
-
 app.get('/api/dashboard/agent-leaderboard', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -9772,8 +10261,6 @@ app.get('/api/dashboard/agent-leaderboard', async (req, res) => {
 
 
 // 5. TIME-SERIES ANALYTICS
-// ============================================
-
 app.get('/api/dashboard/trends', async (req, res) => {
   try {
     const { company_id, start_date, end_date, interval } = req.query;
@@ -9838,8 +10325,6 @@ app.get('/api/dashboard/trends', async (req, res) => {
 });
 
 // 6. REVENUE ANALYTICS
-// ============================================
-
 app.get('/api/dashboard/revenue', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -9900,8 +10385,6 @@ app.get('/api/dashboard/revenue', async (req, res) => {
 });
 
 // 7. REAL-TIME DASHBOARD OVERVIEW
-// ============================================
-
 app.get('/api/dashboard/pipeline-overview', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -9989,8 +10472,6 @@ app.get('/api/dashboard/pipeline-overview', async (req, res) => {
 // ============================================
 
 // 1. EMAIL CONFIGURATION MANAGEMENT
-// ============================================
-
 app.post('/api/email-config', async (req, res) => {
   try {
     const {
@@ -10069,8 +10550,6 @@ app.post('/api/email-config', async (req, res) => {
 });
 
 // 2. GET EMAIL CONFIGURATIONS
-// ============================================
-
 app.get('/api/email-config/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -10101,8 +10580,6 @@ app.get('/api/email-config/:company_id', async (req, res) => {
 });
 
 // 3. PROCESS EMAIL FOR LEAD EXTRACTION
-// ============================================
-
 app.post('/api/email/process', async (req, res) => {
   try {
     const {
@@ -10244,8 +10721,6 @@ app.post('/api/email/process', async (req, res) => {
 });
 
 // 4. AI LEAD EXTRACTION FUNCTION
-// ============================================
-
 async function extractLeadFromEmail(emailData) {
   const { from, subject, body, company_id } = emailData;
 
@@ -10407,8 +10882,6 @@ function extractEmailFromText(text) {
 }
 
 // 5. GET EMAIL SCAN LOGS
-// ============================================
-
 app.get('/api/email/scan-logs/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -10458,8 +10931,6 @@ app.get('/api/email/scan-logs/:company_id', async (req, res) => {
 });
 
 // 6. TOGGLE EMAIL SCANNING
-// ============================================
-
 app.patch('/api/email-config/:id/toggle', async (req, res) => {
   try {
     const { id } = req.params;
@@ -10489,8 +10960,6 @@ app.patch('/api/email-config/:id/toggle', async (req, res) => {
 });
 
 // 7. DELETE EMAIL CONFIGURATION
-// ============================================
-
 app.delete('/api/email-config/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -10518,8 +10987,6 @@ app.delete('/api/email-config/:id', async (req, res) => {
 // ============================================
 
 // 1. GMAIL OAUTH SETUP (Per Company)
-// ============================================
-
 app.get('/api/email/oauth/gmail/start', async (req, res) => {
   try {
     const { company_id } = req.query;
@@ -10907,7 +11374,6 @@ app.delete('/api/email/disconnect/:email_config_id', async (req, res) => {
 
 // 5. SCAN EMAILS FOR SPECIFIC COMPANY (Called by n8n or cron)
 // ============================================
-
 app.post('/api/email/scan/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -11641,9 +12107,6 @@ app.get('/api/calendar/oauth/google/callback', async (req, res) => {
 // ============================================
 
 async function getValidCalendarToken(calendar_config) {
-  /**
-   * Refresh Google Calendar token if expired
-   */
   const now = new Date();
   const expiresAt = new Date(calendar_config.oauth_token_expires_at);
   
@@ -11656,9 +12119,6 @@ async function getValidCalendarToken(calendar_config) {
 }
 
 async function refreshCalendarToken(calendar_config) {
-  /**
-   * Refresh expired Google Calendar token
-   */
   try {
     const refreshToken = decryptToken(calendar_config.oauth_refresh_token);
     
@@ -11707,10 +12167,6 @@ async function refreshCalendarToken(calendar_config) {
 
 
 async function createGoogleCalendarEvent(calendar_config_id, eventData) {
-  /**
-   * Create event in Google Calendar
-   * eventData: { title, description, start_time, end_time, attendees, lead_id, booking_id }
-   */
   try {
     const config = await pool.query(
       'SELECT * FROM calendar_configs WHERE id = $1 AND is_active = TRUE',
@@ -11825,9 +12281,7 @@ async function createGoogleCalendarEvent(calendar_config_id, eventData) {
 }
 
 async function checkCalendarAvailability(calendar_config_id, start_time, end_time) {
-  /**
-   * Check if time slot is available in calendar
-   */
+// Check if time slot is available in calendar
   try {
     const config = await pool.query(
       'SELECT * FROM calendar_configs WHERE id = $1 AND is_active = TRUE',
@@ -12522,9 +12976,7 @@ function generateConfirmationEmailHTML(data) {
 
 
 
-/**
- * Send confirmation email after calendar event creation
- */
+// Send confirmation email after calendar event creation
 async function sendCalendarConfirmationEmail(calendar_event_id, company_id, lead_id = null) {
   try {
     console.log(`📧 Attempting to send confirmation email for event ${calendar_event_id}...`);
@@ -12684,9 +13136,7 @@ async function sendCalendarConfirmationEmail(calendar_event_id, company_id, lead
 
 
 
-/**
- * Send confirmation email for an existing calendar event
- */
+// Send confirmation email for an existing calendar event
 app.post('/api/calendar/send-confirmation', async (req, res) => {
   try {
     const {
@@ -12737,9 +13187,7 @@ app.post('/api/calendar/send-confirmation', async (req, res) => {
 
 
 
-/**
- * Resend confirmation email for existing event
- */
+// Resend confirmation email for existing event
 app.post('/api/calendar/resend-confirmation/:event_id', async (req, res) => {
   try {
     const { event_id } = req.params;
@@ -12796,10 +13244,7 @@ app.post('/api/calendar/resend-confirmation/:event_id', async (req, res) => {
 
 
 
-
-/**
- * Get email sending status for a calendar event
- */
+// Get email sending status for a calendar event
 app.get('/api/calendar/email-status/:event_id', async (req, res) => {
   try {
     const { event_id } = req.params;
@@ -14802,9 +15247,7 @@ app.get('/api/analytics/leads-complete/:company_id', async (req, res) => {
 // AUTOMATED CALL SUMMARY DELIVERY
 // ============================================
 
-/**
- * Generate customer-friendly call summary
- */
+// Generate customer-friendly call summary
 async function generateCustomerSummary(call_sid) {
   try {
     const callResult = await pool.query(`
@@ -14891,9 +15334,7 @@ Format as plain text, no markdown.
 }
 
 
-/**
- * Send call summary via email
- */
+// Send call summary via email
 async function sendCallSummaryEmail(call_sid) {
   try {
     const summaryData = await generateCustomerSummary(call_sid);
@@ -14969,9 +15410,7 @@ async function sendCallSummaryEmail(call_sid) {
   }
 }
 
-/**
- * Send call summary via WhatsApp
- */
+// Send call summary via WhatsApp
 async function sendCallSummaryWhatsApp(call_sid) {
   try {
     const summaryData = await generateCustomerSummary(call_sid);
@@ -15033,9 +15472,7 @@ async function sendCallSummaryWhatsApp(call_sid) {
   }
 }
 
-/**
- * Automatically send summaries after call completion
- */
+// Automatically send summaries after call completion
 async function autoSendCallSummaries(call_sid) {
   try {
     const callResult = await pool.query(`
@@ -15173,9 +15610,7 @@ app.post('/api/call-summaries/regenerate', async (req, res) => {
 // WHATSAPP CHAT SUMMARIZATION
 // ============================================
 
-/**
- * Generate summary of WhatsApp conversation
- */
+// Generate summary of WhatsApp conversation
 async function summarizeWhatsAppConversation(conversation_id) {
   try {
     const messagesResult = await pool.query(`
@@ -15265,9 +15700,7 @@ JSON:
   }
 }
 
-/**
- * Auto-summarize conversations after N messages
- */
+// Auto-summarize conversations after N messages
 async function autoSummarizeIfNeeded(conversation_id) {
   try {
     const convResult = await pool.query(`
@@ -15607,9 +16040,7 @@ app.get('/api/whatsapp/search', async (req, res) => {
   }
 });
 
-/**
- * Extract relevant excerpt around search term
- */
+// Extract relevant excerpt around search term
 function extractRelevantExcerpt(text, query, contextLength = 150) {
   if (!text) return '';
   
@@ -15679,10 +16110,7 @@ app.get('/api/search/combined', async (req, res) => {
 // ============================================
 // MODULE 7: DRIP CAMPAIGN ENDPOINTS
 // ============================================
-
-/**
- * Create a new drip campaign
- */
+// Create a new drip campaign
 app.post('/api/drip-campaigns', async (req, res) => {
   const client = await pool.connect();
   
@@ -15771,9 +16199,7 @@ app.post('/api/drip-campaigns', async (req, res) => {
 
 
 
-/**
- * Get all drip campaigns for a company
- */
+// Get all drip campaigns for a company
 app.get('/api/drip-campaigns/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -15825,9 +16251,7 @@ app.get('/api/drip-campaigns/:company_id', async (req, res) => {
 
 
 
-/**
- * Get all subscribers of a campaign
- */
+// Get all subscribers of a campaign
 app.get('/api/drip-campaigns/subscribers/:campaign_id', async (req, res) => {
   try {
     const { campaign_id } = req.params;
@@ -15875,9 +16299,7 @@ app.get('/api/drip-campaigns/subscribers/:campaign_id', async (req, res) => {
 
 
 
-/**
- * Get execution history of a lead
- */
+// Get execution history of a lead
 app.get('/api/drip-campaigns/executions/:lead_id', async (req, res) => {
   try {
     const { lead_id } = req.params;
@@ -15929,9 +16351,7 @@ app.get('/api/drip-campaigns/executions/:lead_id', async (req, res) => {
 
 
 
-/**
- * Get campaign details with steps
- */
+// Get campaign details with steps
 app.get('/api/drip-campaigns/:company_id/:campaign_id', async (req, res) => {
   try {
     const { company_id, campaign_id } = req.params;
@@ -15973,10 +16393,7 @@ app.get('/api/drip-campaigns/:company_id/:campaign_id', async (req, res) => {
 
 
 
-
-/**
- * Update drip campaign
- */
+// Update drip campaign
 app.patch('/api/drip-campaigns/:campaign_id', async (req, res) => {
   try {
     const { campaign_id } = req.params;
@@ -16048,10 +16465,7 @@ app.patch('/api/drip-campaigns/:campaign_id', async (req, res) => {
 });
 
 
-
-/**
- * Subscribe a lead to a drip campaign
- */
+// Subscribe a lead to a drip campaign
 app.post('/api/drip-campaigns/subscribe', async (req, res) => {
   try {
     const { campaign_id, lead_id } = req.body;
@@ -16118,9 +16532,7 @@ app.post('/api/drip-campaigns/subscribe', async (req, res) => {
 
 
 
-/**
- * Unsubscribe a lead from campaigns
- */
+// Unsubscribe a lead from campaigns
 app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
   const client = await pool.connect();
   
@@ -16228,9 +16640,7 @@ app.post('/api/drip-campaigns/unsubscribe', async (req, res) => {
 
 
 
-/**
- * Get campaign performance metrics
- */
+// Get campaign performance metrics
 app.get('/api/drip-campaigns/:campaign_id/performance', async (req, res) => {
   try {
     const { campaign_id } = req.params;
@@ -16645,10 +17055,7 @@ async function updateCampaignPerformance(campaign_id, metric, increment = 1) {
 // ============================================
 // MODULE 8: ADVANCED REPORTING ENDPOINTS
 // ============================================
-
-/**
- * Get comprehensive agent performance report
- */
+// Get comprehensive agent performance report
 app.get('/api/reports/agent-performance', async (req, res) => {
   try {
     const { company_id, start_date, end_date, agent_id } = req.query;
@@ -16756,10 +17163,7 @@ app.get('/api/reports/agent-performance', async (req, res) => {
 
 
 
-
-/**
- * Get revenue forecasting report
- */
+// Get revenue forecasting report
 app.get('/api/reports/revenue-forecast', async (req, res) => {
   try {
     const { company_id, months = 3 } = req.query;
@@ -16847,9 +17251,7 @@ app.get('/api/reports/revenue-forecast', async (req, res) => {
 
 
 
-/**
- * Get churn prediction report
- */
+// Get churn prediction report
 app.get('/api/reports/churn-prediction', async (req, res) => {
   try {
     const { company_id } = req.query;
@@ -16957,9 +17359,7 @@ app.get('/api/reports/churn-prediction', async (req, res) => {
 
 
 
-/**
- * Get campaign ROI analysis
- */
+// Get campaign ROI analysis
 app.get('/api/reports/campaign-roi', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -17071,10 +17471,7 @@ app.get('/api/reports/campaign-roi', async (req, res) => {
 
 
 
-/**
- * Schedule report delivery
- */
-
+// Schedule report delivery
 app.post('/api/reports/schedule', async (req, res) => {
   try {
     const {
@@ -17147,9 +17544,7 @@ app.post('/api/reports/schedule', async (req, res) => {
 
 
 
-/**
- * Get scheduled reports
- */
+// Get scheduled reports
 app.get('/api/reports/scheduled/:company_id', async (req, res) => {
   try {
     const { company_id } = req.params;
@@ -17196,10 +17591,7 @@ app.get('/api/reports/scheduled/:company_id', async (req, res) => {
 // 1. AUTO-INVOICE GENERATION
 // ============================================
 
-/**
- * POST /api/invoices/auto-generate
- * Auto-generate invoice when deal is closed
- */
+// Auto-generate invoice when deal is closed
 app.post('/api/invoices/auto-generate', async (req, res) => {
   try {
     const result = await invoicePayment.autoGenerateInvoice(pool, req.body);
@@ -17216,10 +17608,7 @@ app.post('/api/invoices/auto-generate', async (req, res) => {
 // 2. PHONEPE PAYMENT INITIATION
 // ============================================
 
-/**
- * POST /api/invoices/:invoice_id/initiate-payment
- * Initiate PhonePe payment for an invoice
- */
+// Initiate PhonePe payment for an invoice
 app.post('/api/invoices/:invoice_id/initiate-payment', async (req, res) => {
   try {
     const { invoice_id } = req.params;
@@ -17236,14 +17625,14 @@ app.post('/api/invoices/:invoice_id/initiate-payment', async (req, res) => {
   }
 });
 
+
+
+
 // ============================================
 // 3. PHONEPE PAYMENT CALLBACK
 // ============================================
 
-/**
- * POST /api/payment-callback
- * Handle PhonePe server-to-server callback
- */
+// Handle PhonePe server-to-server callback
 app.post('/api/payment-callback', async (req, res) => {
   try {
     const { response } = req.body;
@@ -17258,23 +17647,19 @@ app.post('/api/payment-callback', async (req, res) => {
 // ============================================
 // 4. PAYMENT RESULT PAGE
 // ============================================
-
-/**
- * GET /payment-result
- * Payment result page - Check status and redirect
- */
+// Payment result page - Check status and redirect
 app.get('/payment-result', async (req, res) => {
   try {
-    const { invoice_id, txn_id } = req.query;
+    const { invoice_id, orderId } = req.query;
 
-    if (!invoice_id || !txn_id) {
+    if (!invoice_id || !orderId) {
       return res.redirect('/payment-failed.html?error=missing_params');
     }
 
-    const result = await invoicePayment.checkPaymentStatus(pool, invoice_id, txn_id);
+    const result = await invoicePayment.checkPaymentStatus(pool, invoice_id, orderId);
 
     if (result.success && result.status === 'completed') {
-      res.redirect(`/payment-success.html?invoice_id=${invoice_id}&txn_id=${txn_id}`);
+      res.redirect(`/payment-success.html?invoice_id=${invoice_id}&txn_id=${orderId}`);
     } else {
       res.redirect(`/payment-failed.html?invoice_id=${invoice_id}&reason=${result.status}`);
     }
@@ -17289,10 +17674,7 @@ app.get('/payment-result', async (req, res) => {
 // 5. SUBSCRIPTION RENEWAL CHECK
 // ============================================
 
-/**
- * POST /api/subscriptions/check-renewals
- * Check expiring subscriptions and send reminders
- */
+// Check expiring subscriptions and send reminders
 app.post('/api/subscriptions/check-renewals', async (req, res) => {
   try {
     const result = await invoicePayment.checkRenewals(pool);
@@ -17309,10 +17691,7 @@ app.post('/api/subscriptions/check-renewals', async (req, res) => {
 // 6. OVERDUE INVOICE HANDLER
 // ============================================
 
-/**
- * POST /api/invoices/handle-overdue
- * Handle overdue invoices with escalating reminders
- */
+// Handle overdue invoices with escalating reminders
 app.post('/api/invoices/handle-overdue', async (req, res) => {
   try {
     const result = await invoicePayment.handleOverdueInvoices(pool);
@@ -17329,10 +17708,7 @@ app.post('/api/invoices/handle-overdue', async (req, res) => {
 // 7. ACCOUNTING SOFTWARE SYNC
 // ============================================
 
-/**
- * POST /api/invoices/:invoice_id/sync-accounting
- * Sync invoice to QuickBooks/Zoho/Tally
- */
+// Sync invoice to QuickBooks/Zoho/Tally
 app.post('/api/invoices/:invoice_id/sync-accounting', async (req, res) => {
   try {
     const { invoice_id } = req.params;
@@ -17358,10 +17734,7 @@ app.post('/api/invoices/:invoice_id/sync-accounting', async (req, res) => {
 // 8. REVENUE DASHBOARD
 // ============================================
 
-/**
- * GET /api/reports/revenue-dashboard
- * Get revenue metrics and trends
- */
+// Get revenue metrics and trends
 app.get('/api/reports/revenue-dashboard', async (req, res) => {
   try {
     const { company_id, start_date, end_date } = req.query;
@@ -17387,10 +17760,7 @@ app.get('/api/reports/revenue-dashboard', async (req, res) => {
 // 9. OVERDUE INVOICES REPORT
 // ============================================
 
-/**
- * GET /api/reports/overdue-invoices
- * Get overdue invoices with aging buckets
- */
+// Get overdue invoices with aging buckets
 app.get('/api/reports/overdue-invoices', async (req, res) => {
   try {
     const { company_id } = req.query;
@@ -17411,10 +17781,7 @@ app.get('/api/reports/overdue-invoices', async (req, res) => {
 // 10. CHURN ANALYSIS
 // ============================================
 
-/**
- * GET /api/reports/churn-analysis
- * Get churn analysis for expired subscriptions
- */
+// Get churn analysis for expired subscriptions
 app.get('/api/reports/churn-analysis', async (req, res) => {
   try {
     const { company_id, months = 6 } = req.query;
@@ -17435,10 +17802,7 @@ app.get('/api/reports/churn-analysis', async (req, res) => {
 // 11. ACTIVE SUBSCRIPTIONS
 // ============================================
 
-/**
- * GET /api/subscriptions/active
- * Get all active subscriptions
- */
+// Get all active subscriptions
 app.get('/api/subscriptions/active', async (req, res) => {
   try {
     const { company_id } = req.query;
@@ -17459,10 +17823,7 @@ app.get('/api/subscriptions/active', async (req, res) => {
 // 12. GET INVOICE BY ID
 // ============================================
 
-/**
- * GET /api/invoices/:invoice_id
- * Get invoice details by ID
- */
+// Get invoice details by ID
 app.get('/api/invoices/:invoice_id', async (req, res) => {
   try {
     const { invoice_id } = req.params;
@@ -17488,10 +17849,7 @@ app.get('/api/invoices/:invoice_id', async (req, res) => {
 // 13. LIST ALL INVOICES
 // ============================================
 
-/**
- * GET /api/invoices
- * List all invoices with filters
- */
+// List all invoices with filters
 app.get('/api/invoices', async (req, res) => {
   try {
     const result = await invoicePayment.listInvoices(pool, req.query);
@@ -17507,7 +17865,73 @@ app.get('/api/invoices', async (req, res) => {
 });
 
 
+// Payment success page
+app.get('/payment-success.html', (req, res) => {
+  const { invoice_id, txn_id } = req.query;
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Payment Successful</title>
+      <style>
+        body { font-family: Arial; text-align: center; padding: 50px; background: #f0f9ff; }
+        .success-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 500px; margin: 0 auto; }
+        .checkmark { color: #4CAF50; font-size: 80px; }
+        h1 { color: #333; }
+        p { color: #666; font-size: 16px; }
+        .details { background: #f9f9f9; padding: 15px; border-radius: 5px; margin: 20px 0; }
+      </style>
+    </head>
+    <body>
+      <div class="success-box">
+        <div class="checkmark">✓</div>
+        <h1>Payment Successful!</h1>
+        <p>Your payment has been processed successfully.</p>
+        <div class="details">
+          <p><strong>Invoice ID:</strong> ${invoice_id || 'N/A'}</p>
+          <p><strong>Transaction ID:</strong> ${txn_id || 'N/A'}</p>
+        </div>
+        <p>Thank you for your payment!</p>
+      </div>
+    </body>
+    </html>
+  `);
+});
 
+// Payment failed page
+app.get('/payment-failed.html', (req, res) => {
+  const { invoice_id, reason, error } = req.query;
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Payment Failed</title>
+      <style>
+        body { font-family: Arial; text-align: center; padding: 50px; background: #fff5f5; }
+        .error-box { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 500px; margin: 0 auto; }
+        .error-icon { color: #f44336; font-size: 80px; }
+        h1 { color: #333; }
+        p { color: #666; font-size: 16px; }
+        .details { background: #f9f9f9; padding: 15px; border-radius: 5px; margin: 20px 0; }
+        button { background: #2196F3; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; }
+      </style>
+    </head>
+    <body>
+      <div class="error-box">
+        <div class="error-icon">✗</div>
+        <h1>Payment Failed</h1>
+        <p>We couldn't process your payment.</p>
+        <div class="details">
+          <p><strong>Invoice ID:</strong> ${invoice_id || 'N/A'}</p>
+          ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
+          ${error ? `<p><strong>Error:</strong> ${error}</p>` : ''}
+        </div>
+        <button onclick="window.history.back()">Try Again</button>
+      </div>
+    </body>
+    </html>
+  `);
+});
 
 
    
@@ -17521,7 +17945,6 @@ app.get('/api/invoices', async (req, res) => {
 // ============================================
 // AUTOMATED BACKGROUND TASKS
 // ============================================
-
 // Auto-score leads every hour
 if (process.env.NODE_ENV === 'production') {
   setInterval(async () => {
@@ -17757,8 +18180,6 @@ if (process.env.NODE_ENV === 'production') {
 
   console.log('✅ Invoice & Payment automation jobs initialized');
 }
-
-
 
 
 // ============================================

@@ -5,7 +5,6 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================
 -- CORE TABLES
 -- ============================================
-
 -- 1. COMPANIES TABLE (MULTI-TENANT SUPPORT)
 DROP TABLE IF EXISTS companies CASCADE;
 CREATE TABLE companies (
@@ -26,7 +25,6 @@ CREATE TABLE leads (
   lead_source VARCHAR(100) DEFAULT 'whatsapp',
   lead_status VARCHAR(50) DEFAULT 'new',
   interest_level INTEGER DEFAULT 1,
-  
   -- CUSTOM FIELDS FOR CHESS COACHING
   chess_rating INTEGER,
   location VARCHAR(255),
@@ -35,9 +33,7 @@ CREATE TABLE leads (
   education_certs TEXT,
   availability TEXT,
   age_group_pref TEXT,
-
   preferred_language VARCHAR(10) DEFAULT 'en', -- ADDED FOR MULTILINGUAL SUPPORT
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   last_contacted TIMESTAMP,
@@ -46,7 +42,6 @@ CREATE TABLE leads (
   tags TEXT[],
   metadata JSONB DEFAULT '{}'::jsonb
 );
-
 
 -- OAuth Credentials Storage (Per Client/Company)
 DROP TABLE IF EXISTS oauth_credentials CASCADE;
@@ -67,7 +62,6 @@ CREATE TABLE oauth_credentials (
   UNIQUE(company_id, platform)
 );
 
-
 -- Lead Source Configurations (Field Mappings)
 DROP TABLE IF EXISTS lead_source_configs CASCADE;
 CREATE TABLE lead_source_configs (
@@ -84,8 +78,6 @@ CREATE TABLE lead_source_configs (
   UNIQUE(company_id, platform, form_id) 
 );
 
-
-
 -- Lead Import Logs (Track All Imports)
 DROP TABLE IF EXISTS lead_import_logs CASCADE;
 CREATE TABLE lead_import_logs (
@@ -100,9 +92,6 @@ CREATE TABLE lead_import_logs (
   error_message TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
-
-
 
 -- 3. CONVERSATIONS TABLE
 DROP TABLE IF EXISTS conversations CASCADE;
@@ -180,9 +169,11 @@ CREATE TABLE invoices (
   phone_number VARCHAR(20) NOT NULL,
   invoice_number VARCHAR(100) UNIQUE NOT NULL,
   amount DECIMAL(10, 2) NOT NULL,
+  amount_paid DECIMAL(10, 2) DEFAULT 0,
   currency VARCHAR(10) DEFAULT 'INR',
   invoice_type VARCHAR(50),
   status VARCHAR(50) DEFAULT 'pending',
+  payment_status VARCHAR(50),
   due_date TIMESTAMP,
   paid_date TIMESTAMP,
   payment_method VARCHAR(100),
@@ -195,6 +186,10 @@ CREATE TABLE invoices (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+UPDATE invoices 
+SET payment_status = status 
+WHERE payment_status IS NULL;
+COMMENT ON COLUMN invoices.payment_status IS 'paid, pending, partially_paid, refunded, partially_refunded';
 
 -- 8. NOTIFICATIONS TABLE
 DROP TABLE IF EXISTS notifications CASCADE;
@@ -257,7 +252,6 @@ CREATE TABLE audit_logs (
 -- ============================================
 -- AI CALLING SYSTEM TABLES
 -- ============================================
-
 -- 12. AI AGENT CONFIGURATIONS
 DROP TABLE IF EXISTS agent_configs CASCADE;
 CREATE TABLE agent_configs (
@@ -273,8 +267,6 @@ CREATE TABLE agent_configs (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, prompt_key)
 );
-
-
 
 DROP TABLE IF EXISTS agent_instances CASCADE;
 CREATE TABLE agent_instances (
@@ -302,17 +294,10 @@ CREATE TABLE agent_instances (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, agent_name)
 );
-
-
 COMMENT ON COLUMN agent_instances.twilio_credentials IS 'Stores Twilio Account SID, Auth Token, Phone Number';
 COMMENT ON COLUMN agent_instances.sip_credentials IS 'SIP credentials for Airtel/other providers';
 COMMENT ON COLUMN agent_instances.sip_provider IS 'SIP provider: twilio, airtel, or custom';
   
-
-
-
-
-
 -- 13. CALL LOGS
 DROP TABLE IF EXISTS call_logs CASCADE;
 CREATE TABLE call_logs (
@@ -332,6 +317,10 @@ CREATE TABLE call_logs (
   summary JSONB,
   conversation_history JSONB,
   customer_summary_sent BOOLEAN DEFAULT FALSE,
+  cloud_storage_url TEXT,
+  uploaded_to_cloud BOOLEAN DEFAULT FALSE,
+  cloud_storage_provider VARCHAR(50),
+  upload_error TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -354,7 +343,6 @@ CREATE TABLE scheduled_calls (
 -- ============================================
 -- NOTIFICATION & ANALYTICS TABLES
 -- ============================================
-
 -- 15. SYSTEM NOTIFICATIONS
 DROP TABLE IF EXISTS system_notifications CASCADE;
 CREATE TABLE system_notifications (
@@ -412,12 +400,9 @@ CREATE TABLE email_queue (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
 -- ============================================
 -- HUMAN TAKEOVER TABLES
 -- ============================================
-
 -- 1. HUMAN AGENTS TABLE (Sales Reps)
 DROP TABLE IF EXISTS human_agents CASCADE;
 CREATE TABLE human_agents (
@@ -475,10 +460,6 @@ CREATE TABLE human_sessions (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
-
-
 -- CAMPAIGNS TABLE
 DROP TABLE IF EXISTS campaigns CASCADE;
 CREATE TABLE campaigns (
@@ -493,22 +474,15 @@ CREATE TABLE campaigns (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 -- Add campaign_id to scheduled_calls
 ALTER TABLE scheduled_calls ADD COLUMN IF NOT EXISTS campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL;
-
-
-
 -- Add lead_source_config_id to leads table
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS lead_source_config_id INTEGER REFERENCES lead_source_configs(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_leads_source_config ON leads(lead_source_config_id);
 
-
-
 -- ============================================
 -- DYNAMIC CUSTOM FIELDS SYSTEM
 -- ============================================
-
 -- 1. CUSTOM FIELD DEFINITIONS (Per Company/Agent Instance)
 DROP TABLE IF EXISTS custom_field_definitions CASCADE;
 CREATE TABLE custom_field_definitions (
@@ -559,14 +533,9 @@ CREATE TABLE extraction_templates (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
-
 -- ============================================
 -- EMAIL SCANNING DATABASE SCHEMA
--- Add these tables to your schema.sql
 -- ============================================
-
 -- Email Configurations
 DROP TABLE IF EXISTS email_configs CASCADE;
 CREATE TABLE email_configs (
@@ -574,31 +543,24 @@ CREATE TABLE email_configs (
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   email_address VARCHAR(255) NOT NULL,
   provider VARCHAR(50) NOT NULL, -- 'gmail', 'outlook', 'imap'
-  
   -- IMAP Configuration
   imap_host VARCHAR(255),
   imap_port INTEGER DEFAULT 993,
   imap_username VARCHAR(255),
   imap_password_encrypted TEXT,
-  
   -- Scanning Settings
   scan_folders TEXT[] DEFAULT ARRAY['INBOX'],
   scan_interval_minutes INTEGER DEFAULT 15,
   ai_rules JSONB DEFAULT '{}'::jsonb,
-  
   -- Statistics
   is_active BOOLEAN DEFAULT TRUE,
   last_scan_at TIMESTAMP,
   total_scanned INTEGER DEFAULT 0,
   leads_extracted INTEGER DEFAULT 0,
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
   UNIQUE(company_id, email_address)
 );
-
-
 -- Sample AI Rules Configuration
 COMMENT ON COLUMN email_configs.ai_rules IS 'JSON structure: {
   "keywords": ["inquiry", "interested", "quote"],
@@ -615,30 +577,21 @@ CREATE TABLE email_scan_logs (
   email_config_id INTEGER REFERENCES email_configs(id) ON DELETE CASCADE,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
-  
   -- Email Details
   message_id VARCHAR(255),
   from_email VARCHAR(255),
   subject TEXT,
-  
   -- Extraction Results
   extracted_data JSONB,
   status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'success', 'skipped', 'failed'
   error_message TEXT,
   confidence_score FLOAT,
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
-
-
 -- ============================================
 -- MULTI-TENANT EMAIL SCANNING SCHEMA
--- Each company has their own OAuth credentials
 -- ============================================
-
 -- Email Configurations (Per Company)
 DROP TABLE IF EXISTS email_configs CASCADE;
 CREATE TABLE email_configs (
@@ -646,12 +599,10 @@ CREATE TABLE email_configs (
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   email_address VARCHAR(255) NOT NULL,
   provider VARCHAR(50) NOT NULL, -- 'gmail', 'outlook'
-  
   -- OAuth Tokens (Encrypted)
   oauth_access_token TEXT,
   oauth_refresh_token TEXT,
   oauth_token_expires_at TIMESTAMP,
-  
   -- Scanning Settings
   scan_folders TEXT[] DEFAULT ARRAY['INBOX'],
   scan_interval_minutes INTEGER DEFAULT 15,
@@ -662,27 +613,20 @@ CREATE TABLE email_configs (
     "extract_fields": ["phone", "email", "name", "company", "interest"],
     "auto_tag": ["email_lead", "inbound"]
   }'::jsonb,
-  
   -- Statistics
   is_active BOOLEAN DEFAULT TRUE,
   last_scan_at TIMESTAMP,
   total_scanned INTEGER DEFAULT 0,
   leads_extracted INTEGER DEFAULT 0,
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
   UNIQUE(company_id, email_address)
 );
-
-
 -- Comments
 COMMENT ON TABLE email_configs IS 'Stores OAuth credentials for each company email account';
 COMMENT ON TABLE email_scan_logs IS 'Logs all email scanning activity per company';
 COMMENT ON COLUMN email_configs.oauth_access_token IS 'AES-256 encrypted access token';
 COMMENT ON COLUMN email_configs.oauth_refresh_token IS 'AES-256 encrypted refresh token';
-
-
 
 
 -- Email Scan Logs (Per Company)
@@ -692,63 +636,48 @@ CREATE TABLE email_scan_logs (
   email_config_id INTEGER REFERENCES email_configs(id) ON DELETE CASCADE,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
-  
   -- Email Details
   message_id VARCHAR(255),
   from_email VARCHAR(255),
   subject TEXT,
-  
   -- Extraction Results
   extracted_data JSONB,
   status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'success', 'skipped', 'failed'
   error_message TEXT,
   confidence_score FLOAT,
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
   -- Prevent duplicate processing
   UNIQUE(email_config_id, message_id)
 );
 
-
-
-
-
 -- ============================================
 -- CALENDAR INTEGRATION TABLES
 -- ============================================
-
 DROP TABLE IF EXISTS calendar_configs CASCADE;
 CREATE TABLE calendar_configs (
   id SERIAL PRIMARY KEY,
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   user_email VARCHAR(255) NOT NULL,
   provider VARCHAR(50) NOT NULL, -- 'google', 'outlook'
-  
   -- OAuth credentials (encrypted)
   oauth_access_token TEXT,
   oauth_refresh_token TEXT,
   oauth_token_expires_at TIMESTAMP,
-  
   -- Google Calendar specific
   calendar_id VARCHAR(255) DEFAULT 'primary', -- Which calendar to use
   calendar_timezone VARCHAR(100) DEFAULT 'Asia/Kolkata',
-  
   -- Settings
   default_event_duration INTEGER DEFAULT 60, -- minutes
   buffer_time INTEGER DEFAULT 15, -- minutes between meetings
   working_hours JSONB DEFAULT '{"start": "09:00", "end": "18:00", "days": [1,2,3,4,5]}'::jsonb,
-
   is_default BOOLEAN DEFAULT FALSE,
-  
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
+  buffer_before_minutes INTEGER DEFAULT 0,
+  buffer_after_minutes INTEGER DEFAULT 15,
   UNIQUE(company_id, user_email, provider)
 );
-
-
 
 DROP TABLE IF EXISTS calendar_events CASCADE;
 CREATE TABLE calendar_events (
@@ -756,36 +685,27 @@ CREATE TABLE calendar_events (
   calendar_config_id INTEGER NOT NULL REFERENCES calendar_configs(id) ON DELETE CASCADE,
   lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
   booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL,
-  
   -- Event details
   event_id VARCHAR(255) NOT NULL, -- Google/Outlook event ID
   title VARCHAR(500) NOT NULL,
   description TEXT,
   start_time TIMESTAMP NOT NULL,
-  end_time TIMESTAMP NOT NULL,
-  
+  end_time TIMESTAMP NOT NULL, 
   -- Attendees
-  attendees JSONB, -- [{"email": "user@example.com", "status": "accepted"}]
-  
+  attendees JSONB, -- [{"email": "user@example.com", "status": "accepted"}] 
   -- Meeting links
   meeting_link TEXT, -- Google Meet link
-  
   -- Status
   status VARCHAR(50) DEFAULT 'confirmed', -- confirmed, cancelled, rescheduled
   reminder_sent BOOLEAN DEFAULT FALSE,
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  
   UNIQUE(calendar_config_id, event_id)
 );
-
-
 
 -- ============================================
 -- MISSING TABLES FOR MODULE 2 & 3
 -- ============================================
-
 -- Routing Rules Table
 DROP TABLE IF EXISTS routing_rules CASCADE;
 CREATE TABLE routing_rules (
@@ -823,14 +743,9 @@ CREATE TABLE tasks (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
-
 -- ============================================
 -- DRIP CAMPAIGN TABLES (Module 7)
 -- ============================================
-
--- Drip Campaign Templates
 DROP TABLE IF EXISTS drip_campaigns CASCADE;
 CREATE TABLE drip_campaigns (
   id SERIAL PRIMARY KEY,
@@ -846,8 +761,6 @@ CREATE TABLE drip_campaigns (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(company_id, campaign_name)
 );
-
-
 
 -- Drip Campaign Steps
 DROP TABLE IF EXISTS drip_campaign_steps CASCADE;
@@ -869,9 +782,6 @@ CREATE TABLE drip_campaign_steps (
   UNIQUE(campaign_id, step_number)
 );
 
-
-
-
 -- Drip Campaign Subscribers
 DROP TABLE IF EXISTS drip_campaign_subscribers CASCADE;
 CREATE TABLE drip_campaign_subscribers (
@@ -889,9 +799,6 @@ CREATE TABLE drip_campaign_subscribers (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(campaign_id, lead_id)
 );
-
-
-
 
 -- Drip Campaign Step Executions
 DROP TABLE IF EXISTS drip_step_executions CASCADE;
@@ -911,8 +818,6 @@ CREATE TABLE drip_step_executions (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
 -- Unsubscribe Management
 DROP TABLE IF EXISTS unsubscribes CASCADE;
 CREATE TABLE unsubscribes (
@@ -927,8 +832,6 @@ CREATE TABLE unsubscribes (
   user_agent TEXT,
   UNIQUE(lead_id, unsubscribe_type, campaign_id)
 );
-
-
 
 -- Campaign Performance Tracking
 DROP TABLE IF EXISTS campaign_performance CASCADE;
@@ -952,12 +855,9 @@ CREATE TABLE campaign_performance (
   UNIQUE(campaign_id, date)
 );
 
-
-
 -- ============================================
 -- SCHEDULED REPORTS TABLE (Module 8)
 -- ============================================
-
 DROP TABLE IF EXISTS scheduled_reports CASCADE;
 CREATE TABLE scheduled_reports (
   id SERIAL PRIMARY KEY,
@@ -974,12 +874,9 @@ CREATE TABLE scheduled_reports (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
-
 -- ============================================
 -- SUBSCRIPTION MANAGEMENT TABLE
 -- ============================================
-
 DROP TABLE IF EXISTS lead_subscriptions CASCADE;
 CREATE TABLE lead_subscriptions (
   id SERIAL PRIMARY KEY,
@@ -994,11 +891,9 @@ CREATE TABLE lead_subscriptions (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
 -- ============================================
 -- PAYMENT TRANSACTIONS TABLE (Detailed tracking)
 -- ============================================
-
 DROP TABLE IF EXISTS payment_transactions CASCADE;
 CREATE TABLE payment_transactions (
   id SERIAL PRIMARY KEY,
@@ -1017,11 +912,9 @@ CREATE TABLE payment_transactions (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
 -- ============================================
 -- INVOICE REMINDERS TABLE (Track all reminders)
 -- ============================================
-
 DROP TABLE IF EXISTS invoice_reminders CASCADE;
 CREATE TABLE invoice_reminders (
   id SERIAL PRIMARY KEY,
@@ -1034,11 +927,9 @@ CREATE TABLE invoice_reminders (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-
 -- ============================================
 -- ACCOUNTING SYNC LOG TABLE
 -- ============================================
-
 DROP TABLE IF EXISTS accounting_sync_log CASCADE;
 CREATE TABLE accounting_sync_log (
   id SERIAL PRIMARY KEY,
@@ -1052,7 +943,427 @@ CREATE TABLE accounting_sync_log (
   response_data JSONB
 );
 
+-- Add payment history table
+CREATE TABLE IF NOT EXISTS payment_history (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER REFERENCES invoices(id) ON DELETE CASCADE,
+  amount DECIMAL(10, 2) NOT NULL,
+  payment_method VARCHAR(50),
+  payment_date TIMESTAMP DEFAULT NOW(),
+  transaction_id VARCHAR(255),
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
 
+CREATE TABLE IF NOT EXISTS refunds (
+  id SERIAL PRIMARY KEY,
+  invoice_id INTEGER REFERENCES invoices(id) ON DELETE CASCADE,
+  refund_amount DECIMAL(10, 2) NOT NULL,
+  reason TEXT,
+  status VARCHAR(50) DEFAULT 'pending', -- pending, processed, failed
+  merchant_refund_id VARCHAR(255) UNIQUE,
+  phonepe_refund_id VARCHAR(255),
+  processed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Company billing plans
+CREATE TABLE IF NOT EXISTS company_billing_plans (
+  id SERIAL PRIMARY KEY,
+  plan_name VARCHAR(100) NOT NULL,
+  monthly_price DECIMAL(10, 2) NOT NULL,
+  -- Usage limits
+  max_whatsapp_messages INTEGER DEFAULT 1000,
+  max_voice_minutes INTEGER DEFAULT 500,
+  max_leads INTEGER DEFAULT 10000,
+  max_agents INTEGER DEFAULT 5,
+  max_ai_tokens INTEGER DEFAULT 100000,
+  -- Features
+  features JSONB DEFAULT '{}',
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Company subscriptions
+CREATE TABLE IF NOT EXISTS company_subscriptions (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+  plan_id INTEGER REFERENCES company_billing_plans(id),
+  status VARCHAR(50) DEFAULT 'active', -- active, suspended, cancelled
+  billing_cycle VARCHAR(20) DEFAULT 'monthly', -- monthly, annual
+  current_period_start TIMESTAMP NOT NULL,
+  current_period_end TIMESTAMP NOT NULL,
+  next_billing_date TIMESTAMP,
+  auto_renew BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Usage tracking
+CREATE TABLE IF NOT EXISTS company_usage (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+  -- Period tracking
+  period_start TIMESTAMP NOT NULL,
+  period_end TIMESTAMP NOT NULL,
+  -- Usage counters
+  whatsapp_messages_sent INTEGER DEFAULT 0,
+  voice_minutes_used INTEGER DEFAULT 0,
+  leads_created INTEGER DEFAULT 0,
+  ai_tokens_used INTEGER DEFAULT 0,
+  -- Cost tracking
+  overage_charges DECIMAL(10, 2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(company_id, period_start)
+);
+
+-- Real-time usage events
+CREATE TABLE IF NOT EXISTS usage_events (
+  id BIGSERIAL PRIMARY KEY,
+  company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+  
+  event_type VARCHAR(50) NOT NULL, -- whatsapp_message, voice_call, lead_created
+  quantity INTEGER DEFAULT 1,
+  
+  metadata JSONB DEFAULT '{}',
+  
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ============================================
+-- BULK MESSAGING TABLES
+-- ============================================
+DROP TABLE IF EXISTS bulk_message_jobs CASCADE;
+CREATE TABLE bulk_message_jobs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  agent_instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,
+  message TEXT NOT NULL,
+  recipients JSONB NOT NULL, -- Array of phone numbers
+  total_count INTEGER NOT NULL,
+  sent_count INTEGER DEFAULT 0,
+  failed_count INTEGER DEFAULT 0,
+  failed_recipients JSONB, -- Array of {phone, error}
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'scheduled', 'processing', 'completed', 'failed'
+  scheduled_time TIMESTAMP,
+  started_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- CALL QUEUE MANAGEMENT
+-- ============================================
+DROP TABLE IF EXISTS call_queue CASCADE;
+CREATE TABLE call_queue (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  agent_instance_id INTEGER REFERENCES agent_instances(id) ON DELETE SET NULL,
+  priority INTEGER DEFAULT 50, -- 1-100, higher = more urgent
+  call_type VARCHAR(50) DEFAULT 'outbound', -- 'outbound', 'callback', 'follow_up'
+  scheduled_time TIMESTAMP NOT NULL,
+  max_attempts INTEGER DEFAULT 3,
+  attempt_count INTEGER DEFAULT 0,
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'in_progress', 'completed', 'failed', 'cancelled'
+  last_attempt_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  call_sid VARCHAR(100),
+  notes TEXT,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- CONFERENCE CALLS
+-- ============================================
+DROP TABLE IF EXISTS conference_calls CASCADE;
+CREATE TABLE conference_calls (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  conference_sid VARCHAR(100) UNIQUE NOT NULL,
+  friendly_name VARCHAR(255),
+  status VARCHAR(50) DEFAULT 'active', -- 'active', 'completed'
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ended_at TIMESTAMP,
+  recording_url TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS conference_participants CASCADE;
+CREATE TABLE conference_participants (
+  id SERIAL PRIMARY KEY,
+  conference_id INTEGER NOT NULL REFERENCES conference_calls(id) ON DELETE CASCADE,
+  call_sid VARCHAR(100) NOT NULL,
+  participant_type VARCHAR(50) NOT NULL, -- 'agent', 'lead', 'human_agent', 'expert'
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  human_agent_id INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  phone_number VARCHAR(20) NOT NULL,
+  joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  left_at TIMESTAMP,
+  duration_seconds INTEGER,
+  is_muted BOOLEAN DEFAULT FALSE,
+  is_on_hold BOOLEAN DEFAULT FALSE
+);
+
+-- ============================================
+-- CALENDAR ENHANCEMENTS
+-- ============================================
+DROP TABLE IF EXISTS recurring_appointments CASCADE;
+CREATE TABLE recurring_appointments (
+  id SERIAL PRIMARY KEY,
+  booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+  recurrence_rule VARCHAR(255) NOT NULL, -- RRULE format (e.g., 'FREQ=WEEKLY;BYDAY=MO,WE,FR')
+  start_date DATE NOT NULL,
+  end_date DATE, -- NULL for indefinite
+  occurrences_count INTEGER, -- NULL for indefinite
+  created_occurrences INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS calendar_conflicts CASCADE;
+CREATE TABLE calendar_conflicts (
+  id SERIAL PRIMARY KEY,
+  calendar_config_id INTEGER NOT NULL REFERENCES calendar_configs(id) ON DELETE CASCADE,
+  conflicting_event_id_1 INTEGER REFERENCES calendar_events(id) ON DELETE CASCADE,
+  conflicting_event_id_2 INTEGER REFERENCES calendar_events(id) ON DELETE CASCADE,
+  conflict_type VARCHAR(50) NOT NULL, -- 'overlap', 'buffer_violation', 'double_booking'
+  detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  resolved BOOLEAN DEFAULT FALSE,
+  resolved_at TIMESTAMP,
+  resolution_action TEXT
+);
+
+-- ============================================
+-- CLOUD STORAGE FOR RECORDINGS
+-- ============================================
+DROP TABLE IF EXISTS cloud_storage_configs CASCADE;
+CREATE TABLE cloud_storage_configs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  provider VARCHAR(50) NOT NULL, -- 's3', 'gcs', 'azure'
+  bucket_name VARCHAR(255) NOT NULL,
+  region VARCHAR(100),
+  access_key_encrypted TEXT,
+  secret_key_encrypted TEXT,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, provider)
+);
+
+-- ============================================
+-- TEAM COLLABORATION
+-- ============================================
+DROP TABLE IF EXISTS team_chat_messages CASCADE;
+CREATE TABLE team_chat_messages (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  sender_agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE, -- NULL for general chat
+  message_text TEXT NOT NULL,
+  mentions JSONB, -- Array of agent IDs mentioned with @
+  attachments JSONB, -- Array of file URLs
+  parent_message_id INTEGER REFERENCES team_chat_messages(id) ON DELETE SET NULL, -- For threads
+  is_edited BOOLEAN DEFAULT FALSE,
+  edited_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS shared_notes CASCADE;
+CREATE TABLE shared_notes (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+  created_by_agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  note_title VARCHAR(500),
+  note_content TEXT NOT NULL,
+  is_pinned BOOLEAN DEFAULT FALSE,
+  tags TEXT[],
+  last_edited_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  last_edited_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS activity_feed CASCADE;
+CREATE TABLE activity_feed (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+  agent_id INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  activity_type VARCHAR(100) NOT NULL, -- 'call_completed', 'note_added', 'status_changed', etc.
+  activity_description TEXT NOT NULL,
+  metadata JSONB,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- MOBILE APP SUPPORT
+-- ============================================
+DROP TABLE IF EXISTS mobile_devices CASCADE;
+CREATE TABLE mobile_devices (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  device_id VARCHAR(255) UNIQUE NOT NULL,
+  device_type VARCHAR(50) NOT NULL, -- 'ios', 'android'
+  device_name VARCHAR(255),
+  fcm_token TEXT, -- Firebase Cloud Messaging token
+  apns_token TEXT, -- Apple Push Notification token
+  app_version VARCHAR(50),
+  os_version VARCHAR(50),
+  is_active BOOLEAN DEFAULT TRUE,
+  last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS push_notifications CASCADE;
+CREATE TABLE push_notifications (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  notification_type VARCHAR(100) NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  body TEXT NOT NULL,
+  data JSONB, -- Additional payload
+  status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'sent', 'failed', 'delivered', 'clicked'
+  sent_at TIMESTAMP,
+  delivered_at TIMESTAMP,
+  clicked_at TIMESTAMP,
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- ADVANCED SECURITY
+-- ============================================
+DROP TABLE IF EXISTS ip_whitelist CASCADE;
+CREATE TABLE ip_whitelist (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  ip_address VARCHAR(45) NOT NULL, -- Supports IPv4 and IPv6
+  description VARCHAR(255),
+  is_active BOOLEAN DEFAULT TRUE,
+  created_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, ip_address)
+);
+
+DROP TABLE IF EXISTS two_factor_auth CASCADE;
+CREATE TABLE two_factor_auth (
+  id SERIAL PRIMARY KEY,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  secret_encrypted TEXT NOT NULL,
+  backup_codes_encrypted TEXT, -- JSON array of backup codes
+  is_enabled BOOLEAN DEFAULT FALSE,
+  enabled_at TIMESTAMP,
+  last_used_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(agent_id)
+);
+
+DROP TABLE IF EXISTS audit_log_viewer CASCADE;
+CREATE TABLE audit_log_viewer (
+  id SERIAL PRIMARY KEY,
+  viewer_agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  viewed_log_id INTEGER NOT NULL REFERENCES audit_logs(id) ON DELETE CASCADE,
+  viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS data_retention_policies CASCADE;
+CREATE TABLE data_retention_policies (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  data_type VARCHAR(100) NOT NULL, -- 'call_recordings', 'messages', 'audit_logs', etc.
+  retention_days INTEGER NOT NULL,
+  auto_delete BOOLEAN DEFAULT FALSE,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, data_type)
+);
+
+-- ============================================
+-- MULTI-CHANNEL SUPPORT
+-- ============================================
+DROP TABLE IF EXISTS sms_messages CASCADE;
+CREATE TABLE sms_messages (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  phone_number VARCHAR(20) NOT NULL,
+  message_body TEXT NOT NULL,
+  direction VARCHAR(20) NOT NULL, -- 'inbound', 'outbound'
+  message_sid VARCHAR(100),
+  status VARCHAR(50) DEFAULT 'sent',
+  provider VARCHAR(50) DEFAULT 'twilio',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS web_chat_sessions CASCADE;
+CREATE TABLE web_chat_sessions (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  session_id UUID UNIQUE NOT NULL DEFAULT uuid_generate_v4(),
+  visitor_name VARCHAR(255),
+  visitor_email VARCHAR(255),
+  visitor_ip VARCHAR(45),
+  status VARCHAR(50) DEFAULT 'active', -- 'active', 'ended', 'transferred'
+  assigned_agent_id INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ended_at TIMESTAMP,
+  metadata JSONB
+);
+
+DROP TABLE IF EXISTS web_chat_messages CASCADE;
+CREATE TABLE web_chat_messages (
+  id SERIAL PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES web_chat_sessions(session_id) ON DELETE CASCADE,
+  sender_type VARCHAR(20) NOT NULL, -- 'visitor', 'agent', 'bot'
+  sender_id INTEGER, -- agent_id if agent, NULL if visitor
+  message_text TEXT NOT NULL,
+  attachments JSONB,
+  is_read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+DROP TABLE IF EXISTS social_media_accounts CASCADE;
+CREATE TABLE social_media_accounts (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  platform VARCHAR(50) NOT NULL, -- 'facebook', 'instagram', 'twitter', 'linkedin'
+  account_id VARCHAR(255) NOT NULL,
+  account_name VARCHAR(255),
+  access_token_encrypted TEXT,
+  page_id VARCHAR(255), -- For Facebook/Instagram pages
+  is_active BOOLEAN DEFAULT TRUE,
+  last_sync_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, platform, account_id)
+);
+
+DROP TABLE IF EXISTS social_media_messages CASCADE;
+CREATE TABLE social_media_messages (
+  id SERIAL PRIMARY KEY,
+  account_id INTEGER NOT NULL REFERENCES social_media_accounts(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  platform_message_id VARCHAR(255) NOT NULL,
+  sender_platform_id VARCHAR(255) NOT NULL,
+  sender_name VARCHAR(255),
+  message_text TEXT,
+  message_type VARCHAR(50), -- 'text', 'image', 'video', 'story_reply', etc.
+  attachments JSONB,
+  direction VARCHAR(20) NOT NULL, -- 'inbound', 'outbound'
+  is_read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(account_id, platform_message_id)
+);
 
 
 
@@ -1060,61 +1371,48 @@ CREATE TABLE accounting_sync_log (
 -- INDEXES FOR PERFORMANCE
 -- ============================================
 
--- Leads indexes
 CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone_number);
 CREATE INDEX IF NOT EXISTS idx_leads_company ON leads(company_id);
 CREATE INDEX IF NOT EXISTS idx_leads_source ON leads(lead_source);
 CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(lead_status);
 CREATE INDEX IF NOT EXISTS idx_leads_location ON leads(location);
 CREATE INDEX IF NOT EXISTS idx_leads_chess_rating ON leads(chess_rating);
-CREATE INDEX IF NOT EXISTS idx_leads_language ON leads(preferred_language); -- NEW: Add index for language queries
--- Missing indexes for frequent searches
+CREATE INDEX IF NOT EXISTS idx_leads_language ON leads(preferred_language); 
+
 CREATE INDEX idx_leads_last_contacted ON leads(last_contacted DESC);
 CREATE INDEX idx_conversations_phone ON conversations(phone_number);
-
 
 CREATE INDEX idx_oauth_credentials_company ON oauth_credentials(company_id, platform);
 CREATE INDEX idx_lead_source_configs_company ON lead_source_configs(company_id, platform);
 CREATE INDEX idx_lead_import_logs_company ON lead_import_logs(company_id, created_at DESC);
 CREATE INDEX idx_lead_import_logs_status ON lead_import_logs(status, created_at DESC);
 
-
--- Conversations indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_lead_id ON conversations(lead_id);
 
--- Messages indexes
 CREATE INDEX IF NOT EXISTS idx_messages_lead_id ON whatsapp_messages(lead_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON whatsapp_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON whatsapp_messages(timestamp);
 
--- Invoices indexes
 CREATE INDEX IF NOT EXISTS idx_invoices_lead_id ON invoices(lead_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 
--- Bookings indexes
 CREATE INDEX IF NOT EXISTS idx_bookings_lead_id ON bookings(lead_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(scheduled_date);
 
--- Notifications indexes
 CREATE INDEX IF NOT EXISTS idx_notifications_phone ON notifications(phone_number);
 CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status, scheduled_time);
 
--- FAQ indexes
 CREATE INDEX IF NOT EXISTS idx_faq_active ON faq_templates(is_active);
 
--- Call logs indexes
 CREATE INDEX IF NOT EXISTS idx_call_logs_company ON call_logs(company_id);
 CREATE INDEX IF NOT EXISTS idx_call_logs_lead ON call_logs(lead_id);
 CREATE INDEX IF NOT EXISTS idx_call_logs_call_sid ON call_logs(call_sid);
 CREATE INDEX IF NOT EXISTS idx_call_logs_status ON call_logs(call_status);
 
--- Scheduled calls indexes
 CREATE INDEX IF NOT EXISTS idx_scheduled_calls_company ON scheduled_calls(company_id);
 CREATE INDEX IF NOT EXISTS idx_scheduled_calls_status ON scheduled_calls(status, scheduled_time);
 
--- Agent configs indexes
 CREATE INDEX IF NOT EXISTS idx_agent_configs_company ON agent_configs(company_id);
-
 
 CREATE INDEX IF NOT EXISTS idx_agent_instances_company ON agent_instances(company_id);
 CREATE INDEX IF NOT EXISTS idx_agent_instances_phone ON agent_instances(phone_number);
@@ -1122,34 +1420,27 @@ CREATE INDEX IF NOT EXISTS idx_agent_instances_twilio_phone ON agent_instances(p
 
 CREATE INDEX IF NOT EXISTS idx_agent_instances_type ON agent_instances(agent_type);
 
-
--- System notifications indexes
 CREATE INDEX IF NOT EXISTS idx_system_notifications_type ON system_notifications(notification_type);
 CREATE INDEX IF NOT EXISTS idx_system_notifications_priority ON system_notifications(priority, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_system_notifications_is_read ON system_notifications(is_read);
 
--- Alerts indexes
 CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_lead ON alerts(lead_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_acknowledged ON alerts(is_acknowledged);
 
--- Analytics indexes
 CREATE INDEX IF NOT EXISTS idx_analytics_events_name ON analytics_events(event_name);
 CREATE INDEX IF NOT EXISTS idx_analytics_events_lead ON analytics_events(lead_id);
 CREATE INDEX IF NOT EXISTS idx_analytics_events_company ON analytics_events(company_id);
 CREATE INDEX IF NOT EXISTS idx_analytics_events_created ON analytics_events(created_at);
 
--- Email queue indexes
 CREATE INDEX IF NOT EXISTS idx_email_queue_status ON email_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_email_queue_priority ON email_queue(priority, status);
-
 
 CREATE INDEX IF NOT EXISTS idx_takeover_requests_status ON takeover_requests(status, priority, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_takeover_requests_agent ON takeover_requests(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_human_agents_status ON human_agents(status, assigned_leads);
 CREATE INDEX IF NOT EXISTS idx_human_sessions_agent ON human_sessions(agent_id, started_at DESC);
-
 
 CREATE INDEX IF NOT EXISTS idx_custom_field_defs_company ON custom_field_definitions(company_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_custom_field_defs_agent ON custom_field_definitions(agent_instance_id);
@@ -1157,31 +1448,21 @@ CREATE INDEX IF NOT EXISTS idx_lead_custom_data_lead ON lead_custom_data(lead_id
 CREATE INDEX IF NOT EXISTS idx_lead_custom_data_field ON lead_custom_data(field_key);
 CREATE INDEX IF NOT EXISTS idx_lead_custom_data_normalized ON lead_custom_data(field_value_normalized);
 
-
--- Add index for in-progress calls
 CREATE INDEX IF NOT EXISTS idx_call_logs_in_progress ON call_logs(call_sid, call_status) WHERE call_status = 'in-progress';
 
--- Add index for conversation turns
 CREATE INDEX IF NOT EXISTS idx_conversation_history ON call_logs USING GIN (conversation_history);
 
-
--- Add index for faster lookups
 CREATE INDEX IF NOT EXISTS idx_agent_instances_whatsapp_number ON agent_instances(whatsapp_number);
-
 
 CREATE INDEX IF NOT EXISTS idx_agent_instances_webhook_token ON agent_instances(webhook_verify_token);
 
-
--- Add index for faster lookups
 CREATE INDEX IF NOT EXISTS idx_lead_source_configs_company ON lead_source_configs(company_id, platform);
 CREATE INDEX IF NOT EXISTS idx_lead_source_configs_webhook ON lead_source_configs(webhook_url);
-
 
 CREATE INDEX idx_email_configs_company ON email_configs(company_id, is_active);
 CREATE INDEX idx_email_scan_logs_company ON email_scan_logs(company_id, created_at DESC);
 CREATE INDEX idx_email_scan_logs_status ON email_scan_logs(status, created_at DESC);
 CREATE INDEX idx_email_scan_logs_lead ON email_scan_logs(lead_id);
-
 
 CREATE INDEX IF NOT EXISTS idx_email_configs_company ON email_configs(company_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_email_configs_scan ON email_configs(is_active, last_scan_at);
@@ -1189,19 +1470,14 @@ CREATE INDEX IF NOT EXISTS idx_email_scan_logs_company ON email_scan_logs(compan
 CREATE INDEX IF NOT EXISTS idx_email_scan_logs_status ON email_scan_logs(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_email_scan_logs_lead ON email_scan_logs(lead_id);
 
-
--- Indexes
 CREATE INDEX idx_calendar_configs_company ON calendar_configs(company_id, is_active);
 CREATE INDEX idx_calendar_events_lead ON calendar_events(lead_id);
 CREATE INDEX idx_calendar_events_booking ON calendar_events(booking_id);
 CREATE INDEX idx_calendar_events_time ON calendar_events(start_time, end_time);
 
-
--- Add indexes for faster lookups
 CREATE INDEX IF NOT EXISTS idx_calendar_configs_company_active ON calendar_configs(company_id, is_active) WHERE is_active = TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_calendar_events_start_time ON calendar_events(start_time) WHERE status = 'confirmed';
-
 
 CREATE INDEX idx_routing_rules_company ON routing_rules(company_id, is_active);
 CREATE INDEX idx_routing_rules_priority ON routing_rules(priority DESC);
@@ -1210,21 +1486,16 @@ CREATE INDEX idx_tasks_lead ON tasks(lead_id);
 CREATE INDEX idx_tasks_due_date ON tasks(due_date) WHERE status NOT IN ('completed', 'cancelled');
 CREATE INDEX idx_tasks_priority ON tasks(priority, due_date);
 
-
 CREATE INDEX IF NOT EXISTS idx_audit_logs_lead ON audit_logs(lead_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 
-
--- Add full-text search indexes for transcript search
 CREATE INDEX IF NOT EXISTS idx_call_logs_transcript_fts ON call_logs USING GIN (to_tsvector('english', transcript));
 
 CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_fts ON whatsapp_messages USING GIN (to_tsvector('english', message_body));
 
--- Add indexes for lead import performance
 CREATE INDEX IF NOT EXISTS idx_lead_import_logs_created ON lead_import_logs(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_lead_import_logs_platform_status ON lead_import_logs(platform, status);
-
 
 CREATE INDEX idx_drip_campaigns_company ON drip_campaigns(company_id, is_active);
 CREATE INDEX idx_drip_campaign_steps_campaign ON drip_campaign_steps(campaign_id, step_number);
@@ -1235,35 +1506,73 @@ CREATE INDEX idx_drip_executions_scheduled ON drip_step_executions(scheduled_for
 CREATE INDEX idx_unsubscribes_lead ON unsubscribes(lead_id, unsubscribe_type);
 CREATE INDEX idx_campaign_performance_campaign ON campaign_performance(campaign_id, date);
 
-
-
 CREATE INDEX idx_scheduled_reports_company ON scheduled_reports(company_id, is_active);
 CREATE INDEX idx_scheduled_reports_next_delivery ON scheduled_reports(next_delivery) WHERE is_active = TRUE;
-
 
 CREATE INDEX IF NOT EXISTS idx_invoices_phonepe_txn ON invoices(phonepe_transaction_id);
 CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date) WHERE status = 'pending';
 
-
 CREATE INDEX idx_subscriptions_lead ON lead_subscriptions(lead_id);
 CREATE INDEX idx_subscriptions_status ON lead_subscriptions(status);
 CREATE INDEX idx_subscriptions_end_date ON lead_subscriptions(end_date) WHERE status = 'active';
-CREATE INDEX idx_subscriptions_renewal ON lead_subscriptions(end_date, renewal_reminder_sent) 
-  WHERE status = 'active' AND renewal_reminder_sent = FALSE;
-
+CREATE INDEX idx_subscriptions_renewal ON lead_subscriptions(end_date, renewal_reminder_sent) WHERE status = 'active' AND renewal_reminder_sent = FALSE;
 
 CREATE INDEX idx_payment_txn_invoice ON payment_transactions(invoice_id);
 CREATE INDEX idx_payment_txn_merchant ON payment_transactions(merchant_transaction_id);
 CREATE INDEX idx_payment_txn_phonepe ON payment_transactions(phonepe_transaction_id);
 CREATE INDEX idx_payment_txn_status ON payment_transactions(status);
 
-
 CREATE INDEX idx_reminders_invoice ON invoice_reminders(invoice_id);
 CREATE INDEX idx_reminders_date ON invoice_reminders(reminder_date DESC);
 
-
 CREATE INDEX idx_accounting_sync_invoice ON accounting_sync_log(invoice_id);
 CREATE INDEX idx_accounting_sync_system ON accounting_sync_log(accounting_system, sync_status);
+
+CREATE INDEX idx_payment_history_invoice ON payment_history(invoice_id);
+
+CREATE INDEX idx_refunds_invoice ON refunds(invoice_id);
+CREATE INDEX idx_refunds_status ON refunds(status);
+
+CREATE INDEX idx_company_usage_company ON company_usage(company_id);
+CREATE INDEX idx_company_usage_period ON company_usage(period_start, period_end);
+
+CREATE INDEX idx_usage_events_company ON usage_events(company_id);
+CREATE INDEX idx_usage_events_type ON usage_events(event_type);
+CREATE INDEX idx_usage_events_created ON usage_events(created_at);
+
+CREATE INDEX idx_bulk_jobs_company ON bulk_message_jobs(company_id, status);
+CREATE INDEX idx_bulk_jobs_scheduled ON bulk_message_jobs(scheduled_time) WHERE status = 'scheduled';
+
+CREATE INDEX idx_call_queue_company ON call_queue(company_id, status);
+CREATE INDEX idx_call_queue_scheduled ON call_queue(scheduled_time, status) WHERE status IN ('pending', 'in_progress');
+CREATE INDEX idx_call_queue_priority ON call_queue(priority DESC, scheduled_time ASC) WHERE status = 'pending';
+
+CREATE INDEX idx_conference_calls_company ON conference_calls(company_id, status);
+CREATE INDEX idx_conference_participants_conference ON conference_participants(conference_id);
+
+CREATE INDEX idx_calendar_conflicts_unresolved ON calendar_conflicts(calendar_config_id, resolved) WHERE resolved = FALSE;
+
+CREATE INDEX idx_call_logs_cloud_pending ON call_logs(id) WHERE recording_url IS NOT NULL AND uploaded_to_cloud = FALSE;
+
+CREATE INDEX idx_team_chat_company ON team_chat_messages(company_id, created_at DESC);
+CREATE INDEX idx_team_chat_lead ON team_chat_messages(lead_id, created_at DESC);
+CREATE INDEX idx_shared_notes_lead ON shared_notes(lead_id, is_pinned DESC);
+CREATE INDEX idx_activity_feed_lead ON activity_feed(lead_id, created_at DESC);
+CREATE INDEX idx_activity_feed_company ON activity_feed(company_id, created_at DESC);
+
+CREATE INDEX idx_mobile_devices_agent ON mobile_devices(agent_id, is_active);
+CREATE INDEX idx_push_notifications_agent ON push_notifications(agent_id, status);
+
+CREATE INDEX idx_ip_whitelist_company ON ip_whitelist(company_id, is_active);
+CREATE INDEX idx_2fa_agent ON two_factor_auth(agent_id, is_enabled);
+
+CREATE INDEX idx_sms_messages_lead ON sms_messages(lead_id, created_at DESC);
+CREATE INDEX idx_web_chat_sessions_company ON web_chat_sessions(company_id, status);
+CREATE INDEX idx_web_chat_messages_session ON web_chat_messages(session_id, created_at ASC);
+CREATE INDEX idx_social_accounts_company ON social_media_accounts(company_id, is_active);
+CREATE INDEX idx_social_messages_account ON social_media_messages(account_id, created_at DESC);
+
+
 
 
 
@@ -1284,11 +1593,9 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS update_leads_timestamp ON leads;
 CREATE TRIGGER update_leads_timestamp BEFORE UPDATE ON leads FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
--- Trigger for oauth_credentials timestamp
 DROP TRIGGER IF EXISTS update_oauth_credentials_timestamp ON oauth_credentials;
 CREATE TRIGGER update_oauth_credentials_timestamp BEFORE UPDATE ON oauth_credentials FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
--- Trigger for lead_source_configs timestamp
 DROP TRIGGER IF EXISTS update_lead_source_configs_timestamp ON lead_source_configs;
 CREATE TRIGGER update_lead_source_configs_timestamp BEFORE UPDATE ON lead_source_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
@@ -1319,14 +1626,11 @@ CREATE TRIGGER update_call_logs_timestamp BEFORE UPDATE ON call_logs FOR EACH RO
 DROP TRIGGER IF EXISTS update_agent_configs_timestamp ON agent_configs;
 CREATE TRIGGER update_agent_configs_timestamp BEFORE UPDATE ON agent_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_agent_instances_timestamp ON agent_instances;
 CREATE TRIGGER update_agent_instances_timestamp BEFORE UPDATE ON agent_instances FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_system_notifications_timestamp ON system_notifications;
 CREATE TRIGGER update_system_notifications_timestamp BEFORE UPDATE ON system_notifications FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
 
 DROP TRIGGER IF EXISTS update_human_agents_timestamp ON human_agents;
 CREATE TRIGGER update_human_agents_timestamp BEFORE UPDATE ON human_agents FOR EACH ROW EXECUTE FUNCTION update_timestamp();
@@ -1334,41 +1638,32 @@ CREATE TRIGGER update_human_agents_timestamp BEFORE UPDATE ON human_agents FOR E
 DROP TRIGGER IF EXISTS update_takeover_requests_timestamp ON takeover_requests;
 CREATE TRIGGER update_takeover_requests_timestamp BEFORE UPDATE ON takeover_requests FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_custom_field_definitions_timestamp ON custom_field_definitions;
 CREATE TRIGGER update_custom_field_definitions_timestamp BEFORE UPDATE ON custom_field_definitions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DROP TRIGGER IF EXISTS update_lead_custom_data_timestamp ON lead_custom_data;
 CREATE TRIGGER update_lead_custom_data_timestamp BEFORE UPDATE ON lead_custom_data FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
--- Add trigger for notifications updated_at
 DROP TRIGGER IF EXISTS update_notifications_timestamp ON notifications;
 CREATE TRIGGER update_notifications_timestamp BEFORE UPDATE ON notifications FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
+DROP TRIGGER IF EXISTS update_email_configs_timestamp ON email_configs;
+CREATE TRIGGER update_email_configs_timestamp BEFORE UPDATE ON email_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DROP TRIGGER IF EXISTS update_email_configs_timestamp ON email_configs;
 CREATE TRIGGER update_email_configs_timestamp BEFORE UPDATE ON email_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
-DROP TRIGGER IF EXISTS update_email_configs_timestamp ON email_configs;
-CREATE TRIGGER update_email_configs_timestamp BEFORE UPDATE ON email_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-
--- Triggers
 DROP TRIGGER IF EXISTS update_calendar_configs_timestamp ON calendar_configs;
 CREATE TRIGGER update_calendar_configs_timestamp BEFORE UPDATE ON calendar_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DROP TRIGGER IF EXISTS update_calendar_events_timestamp ON calendar_events;
 CREATE TRIGGER update_calendar_events_timestamp BEFORE UPDATE ON calendar_events FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_routing_rules_timestamp ON routing_rules;
 CREATE TRIGGER update_routing_rules_timestamp BEFORE UPDATE ON routing_rules FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DROP TRIGGER IF EXISTS update_tasks_timestamp ON tasks;
 CREATE TRIGGER update_tasks_timestamp BEFORE UPDATE ON tasks FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
 
 DROP TRIGGER IF EXISTS update_drip_campaigns_timestamp ON drip_campaigns;
 CREATE TRIGGER update_drip_campaigns_timestamp BEFORE UPDATE ON drip_campaigns FOR EACH ROW EXECUTE FUNCTION update_timestamp();
@@ -1385,24 +1680,35 @@ CREATE TRIGGER update_drip_executions_timestamp BEFORE UPDATE ON drip_step_execu
 DROP TRIGGER IF EXISTS update_campaign_performance_timestamp ON campaign_performance;
 CREATE TRIGGER update_campaign_performance_timestamp BEFORE UPDATE ON campaign_performance FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_scheduled_reports_timestamp ON scheduled_reports;
 CREATE TRIGGER update_scheduled_reports_timestamp BEFORE UPDATE ON scheduled_reports FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
 
 DROP TRIGGER IF EXISTS update_subscriptions_timestamp ON lead_subscriptions;
 CREATE TRIGGER update_subscriptions_timestamp BEFORE UPDATE ON lead_subscriptions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
-
 DROP TRIGGER IF EXISTS update_payment_transactions_timestamp ON payment_transactions;
 CREATE TRIGGER update_payment_transactions_timestamp BEFORE UPDATE ON payment_transactions FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_bulk_jobs_timestamp ON bulk_message_jobs;
+CREATE TRIGGER update_bulk_jobs_timestamp BEFORE UPDATE ON bulk_message_jobs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_call_queue_timestamp ON call_queue;
+CREATE TRIGGER update_call_queue_timestamp BEFORE UPDATE ON call_queue FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_cloud_storage_timestamp ON cloud_storage_configs;
+CREATE TRIGGER update_cloud_storage_timestamp BEFORE UPDATE ON cloud_storage_configs FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_retention_policies_timestamp ON data_retention_policies;
+CREATE TRIGGER update_retention_policies_timestamp BEFORE UPDATE ON data_retention_policies FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_social_accounts_timestamp ON social_media_accounts;
+CREATE TRIGGER update_social_accounts_timestamp BEFORE UPDATE ON social_media_accounts FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 
 -- ============================================
 -- SAMPLE DATA
 -- ============================================
 
--- Sample FAQ data
 INSERT INTO faq_templates (question, answer, category, keywords, is_active) VALUES
   ('What is 4champz?', '4champz is Bangalore''s leading chess coaching platform connecting qualified coaches with schools for kids'' programs.', 'general', ARRAY['4champz', 'about'], TRUE),
   ('How much does coaching cost?', 'Coaching rates start at ₹500/hour based on your experience and location. Premium coaches earn more.', 'pricing', ARRAY['cost', 'price', 'rates', 'fees'], TRUE),
@@ -1412,7 +1718,6 @@ INSERT INTO faq_templates (question, answer, category, keywords, is_active) VALU
   ('When is my subscription expiring?', 'You can check your subscription expiry date in your account dashboard or contact us directly.', 'subscription', ARRAY['subscription', 'expire', 'renewal'], 5),
   ('What happens if I miss a payment?', 'If a payment is missed, we will send you reminders via WhatsApp and email. Your service may be temporarily suspended if payment is not received within 14 days.', 'payment', ARRAY['payment', 'missed', 'late'], 4)
 ON CONFLICT DO NOTHING;
-
 
 
 INSERT INTO companies (name, phone_number) VALUES 
@@ -1842,10 +2147,6 @@ UPDATE leads
 SET company_id = (SELECT id FROM companies WHERE name = '4Champz Chess Coaching')
 WHERE company_id IS NULL;
 
--- ============================================
--- END SAMPLE DATA
--- ============================================
-
 
 INSERT INTO system_notifications (notification_type, title, message, priority) VALUES
 ('success', 'System Started', 'AI Calling System is now running', 'normal');
@@ -1860,7 +2161,6 @@ INSERT INTO human_agents (name, email, phone, role, expertise) VALUES
   ('Priya Singh', 'priya@4champz.com', '+919876543211', 'sales_rep', ARRAY['general_sales', 'follow_up']),
   ('Amit Patel', 'amit@4champz.com', '+919876543212', 'specialist', ARRAY['technical', 'confused_customer'])
 ON CONFLICT (email) DO NOTHING;
-
 
 
 INSERT INTO extraction_templates (template_name, industry, description, field_definitions, is_system_template) VALUES
@@ -2156,7 +2456,6 @@ SELECT
   (SELECT COUNT(*) FROM leads WHERE lead_status = 'qualified' AND DATE(updated_at) = CURRENT_DATE) as qualified_leads_today;
 
 
-
 CREATE OR REPLACE VIEW hot_leads_today AS
 SELECT 
   l.*,
@@ -2172,7 +2471,6 @@ WHERE (
 )
 AND cl.created_at >= CURRENT_DATE
 ORDER BY cl.created_at DESC;
-
 
 
 CREATE OR REPLACE VIEW email_scanning_dashboard AS
@@ -2263,7 +2561,6 @@ WHERE days_until_expiry <= 30 AND days_until_expiry >= 0
 ORDER BY days_until_expiry ASC;
 
 
-
 CREATE OR REPLACE FUNCTION needs_token_refresh(config_id INTEGER)
 RETURNS BOOLEAN AS $$
   SELECT 
@@ -2271,7 +2568,6 @@ RETURNS BOOLEAN AS $$
   FROM email_configs
   WHERE id = config_id;
 $$ LANGUAGE SQL;
-
 
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_configs_default 
@@ -2380,8 +2676,6 @@ END;
 $$ LANGUAGE plpgsql;
 
 
-
-
 DROP TRIGGER IF EXISTS trigger_auto_score_lead ON leads;
 CREATE TRIGGER trigger_auto_score_lead BEFORE INSERT OR UPDATE ON leads FOR EACH ROW EXECUTE FUNCTION auto_score_lead();
 
@@ -2429,6 +2723,44 @@ BEGIN
   END IF;
 END $$;
 
+
+DO $$
+DECLARE
+  new_tables_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO new_tables_count
+  FROM information_schema.tables
+  WHERE table_schema = 'public'
+  AND table_name IN (
+    'bulk_message_jobs',
+    'call_queue',
+    'conference_calls',
+    'conference_participants',
+    'recurring_appointments',
+    'calendar_conflicts',
+    'cloud_storage_configs',
+    'team_chat_messages',
+    'shared_notes',
+    'activity_feed',
+    'mobile_devices',
+    'push_notifications',
+    'ip_whitelist',
+    'two_factor_auth',
+    'audit_log_viewer',
+    'data_retention_policies',
+    'sms_messages',
+    'web_chat_sessions',
+    'web_chat_messages',
+    'social_media_accounts',
+    'social_media_messages'
+  );
+  
+  IF new_tables_count = 21 THEN
+    RAISE NOTICE '✅ All new tables created successfully for 100%% completion';
+  ELSE
+    RAISE NOTICE '⚠️ Some tables missing. Expected 21, found %', new_tables_count;
+  END IF;
+END $$;
 
 
 -- ============================================
