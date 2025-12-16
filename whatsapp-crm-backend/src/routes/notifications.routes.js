@@ -14,4 +14,8 @@ router.post('/', notificationsController.createNotification);
 // Mark notification as sent
 router.patch('/:id/sent', notificationsController.markNotificationSent);
 
+
+// New route for Part 8
+router.get('/pending', notificationsController.getPendingNotifications);
+
 module.exports = router;

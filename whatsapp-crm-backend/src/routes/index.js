@@ -1,7 +1,15 @@
 const express = require('express');
 const router = express.Router();
+const {authenticateToken } = require('../middleware/auth.middleware');
+const {apiRateLimiter} = require('../middleware/rateLimiter.middleware');
 
 // Import route modules
+// router.use('/auth', authRoutes);
+const authRoutes = require('./auth.routes');
+const healthRoutes = require('./health.routes');
+const webhooksRoutes = require('./webhooks.routes');
+
+
 const leadsRoutes = require('./leads.routes');
 const conversationsRoutes = require('./conversations.routes');
 const messagesRoutes = require('./messages.routes');
@@ -11,11 +19,9 @@ const invoicesRoutes = require('./invoices.routes');
 const paymentsRoutes = require('./payments.routes');
 const subscriptionsRoutes = require('./subscriptions.routes');
 const reportsRoutes = require('./reports.routes');
-const webhooksRoutes = require('./webhooks.routes');
 const callsRoutes = require('./calls.routes');
 const recordingsRoutes = require('./recordings.routes');
 const wsRoutes = require('./websocket.routes');
-const healthRoutes = require('./health.routes');
 const notificationsRoutes = require('./notifications.routes');
 const statsRoutes = require('./stats.routes');
 const companiesRoutes = require('./companies.routes');
@@ -29,89 +35,126 @@ const customFieldsRoutes = require('./customFields.routes');
 const calendarRoutes = require('./calendar.routes');
 const multiChannelRoutes = require('./multichannel.routes');
 const humanAgentsRoutes = require('./humanAgents.routes');
+const whatsappRoutes = require('./whatsapp.routes');
+const twilioRoutes = require('./twilio.routes');
+const sipRoutes = require('./sip.routes');
 
-// Mount routes
+const oauthRoutes = require('./oauth.routes');
+const leadSourcesRoutes = require('./leadSources.routes');
+
+const workflowRouter=require('./workflow.routes');
+
+const documentsRoutes = require('./documents.routes');
+const schedulerRoutes = require('./scheduler.routes');
+const productsRoutes = require('./products.routes');
+const quotesRoutes = require('./quotes.routes');
+const emailRoutes = require('./email.routes');
+
+const routingRoutes = require('./routing.routes');
+const tasksRoutes = require('./tasks.routes');
+
+const callSummariesRoutes = require('./callSummaries.routes');
+const searchRoutes = require('./search.routes');
+
+const dripCampaignsRoutes = require('./dripCampaigns.routes');
+
+const invoicePaymentRoutes = require('./invoicePayment.routes');
+
+// const smsRoutes = require('./sms.routes');
+
+// const usageTrackingRoutes = require('./usageTracking.routes');
+
+
+
+// MOUNT ROUTES
+
+// PUBLIC ROUTES 
+router.use('/auth', authRoutes);
+router.use('/health', healthRoutes);
+router.use('/webhook', webhooksRoutes);
+router.use('/payment-callback', invoicePaymentRoutes);
+
+// APPLY JWT AUTHENTICATION TO ALL ROUTES BELOW
+router.use(authenticateToken);
+router.use(apiRateLimiter);
+
+// Core CRM
 router.use('/leads', leadsRoutes);
 router.use('/conversations', conversationsRoutes);
 router.use('/messages', messagesRoutes);
-router.use('/faqs', faqsRoutes);
+
+// Customer Management
 router.use('/bookings', bookingsRoutes);
 router.use('/invoices', invoicesRoutes);
 router.use('/payment', paymentsRoutes);
 router.use('/subscriptions', subscriptionsRoutes);
-router.use('/reports', reportsRoutes);
-router.use('/webhook', webhooksRoutes);
+router.use('/invoice-payment', invoicePaymentRoutes);
+
+// Communication
 router.use('/calls', callsRoutes);
 router.use('/recordings', recordingsRoutes);
-router.use('/ws', wsRoutes);
-router.use('/health', healthRoutes);
-router.use('/notifications', notificationsRoutes);
-router.use('/stats', statsRoutes);
-router.use('/companies', companiesRoutes);
-router.use('/agents', agentsRoutes);
-router.use('/analytics', analyticsRoutes);
-router.use('/system', systemRoutes);
-router.use('/dashboard', dashboardRoutes);
-router.use('/takeover', takeoverRoutes);
+router.use('/whatsapp', whatsappRoutes);
+router.use('/twilio', twilioRoutes);
+router.use('/sip', sipRoutes);
+router.use('/call-summaries', callSummariesRoutes);
+
+// AI and Automation
+router.use('/faqs', faqsRoutes);
+router.use('/workflow',workflowRouter);
+router.use('/routing', routingRoutes);
 router.use('/campaigns', campaignsRoutes);
-router.use('/custom-fields', customFieldsRoutes);
-router.use('/calendar', calendarRoutes);
+router.use('/drip-campaigns', dripCampaignsRoutes);
 
-router.use('/whatsapp', require('./whatsapp.routes'));
-
-
-// Legacy endpoints for backward compatibility
-router.use('/search/leads', leadsRoutes);
-router.post('/payment-callback', require('../controllers/payments.controller').handlePaymentCallback);
-
-// Agent-specific legacy routes
-router.post('/agent-configs', require('../controllers/agents.controller').createOrUpdateAgentConfig);
-router.get('/agent-configs/:company_id', require('../controllers/agents.controller').getAgentConfigsByCompany);
-router.post('/schedule-call', require('../controllers/agents.controller').scheduleCall);
-router.get('/scheduled-calls/pending', require('../controllers/agents.controller').getPendingScheduledCalls);
-router.patch('/scheduled-calls/:id', require('../controllers/agents.controller').updateScheduledCall);
-router.post('/call-logs', require('../controllers/agents.controller').createCallLog);
-router.patch('/call-logs/:call_sid', require('../controllers/agents.controller').updateCallLog);
-router.get('/call-logs/lead/:lead_id', require('../controllers/agents.controller').getCallLogsByLead);
-router.get('/call-logs/sid/:call_sid', require('../controllers/agents.controller').getCallLogByCallSid);
-router.get('/call-logs/:call_sid', require('../controllers/agents.controller').getCallLogByCallSid);
-router.get('/call-logs', require('../controllers/agents.controller').getAllCallLogs);
-router.get('/active-calls', require('../controllers/agents.controller').getActiveCalls);
-router.get('/metrics/dashboard', require('../controllers/agents.controller').getMetricsDashboard);
-
-// Analytics legacy routes
-router.get('/hot-leads', require('../controllers/analytics.controller').getHotLeads);
-router.get('/failed-calls', require('../controllers/analytics.controller').getFailedCalls);
-
-// Takeover legacy routes
-router.get('/human-agents', require('../controllers/takeover.controller').getAllHumanAgents);
-router.patch('/human-agents/:id/status', require('../controllers/takeover.controller').updateAgentStatus);
-
-// Custom fields legacy routes  
-router.get('/extraction-templates', require('../controllers/customFields.controller').getExtractionTemplates);
-router.post('/companies/:company_id/apply-template', require('../controllers/customFields.controller').applyTemplate);
-router.get('/custom-fields/:company_id', require('../controllers/customFields.controller').getCustomFieldDefinitions);
-router.post('/custom-fields', require('../controllers/customFields.controller').createOrUpdateFieldDefinition);
-router.post('/leads/:lead_id/custom-data', require('../controllers/customFields.controller').saveLeadCustomData);
-router.get('/leads/:lead_id/custom-data', require('../controllers/customFields.controller').getLeadCustomData);
-router.get('/leads/search-by-custom-field', require('../controllers/customFields.controller').searchByCustomField);
-
-// Website lead capture
-router.post('/leads/website', require('../controllers/leads.controller').websiteLeadCapture);
-
-// Conversation AI fallback
-router.post('/conversations/ai-fallback', require('../controllers/analytics.controller').aiFollback);
-router.get('/conversations/rate-check/:phone', require('../controllers/analytics.controller').rateCheck);
-
-// System status
-router.get('/system/status', require('../controllers/analytics.controller').systemStatus);
-
-// Company calling hours
-router.get('/companies/:company_id/calling-hours', require('../controllers/companies.controller').getCallingHours);
-router.patch('/companies/:company_id/calling-hours', require('../controllers/companies.controller').updateCallingHours);
-
-router.use('/multichannel', multiChannelRoutes);
+// Agents and Teams
+router.use('/agents', agentsRoutes);
 router.use('/humanagent',humanAgentsRoutes);
+router.use('/takeover', takeoverRoutes);
+
+// Analytics and Reporting
+router.use('/stats', statsRoutes);
+router.use('/analytics', analyticsRoutes);
+router.use('/reports', reportsRoutes);
+router.use('/dashboard', dashboardRoutes);
+
+// Company and System
+router.use('/companies', companiesRoutes);
+router.use('/system', systemRoutes);
+router.use('/notifications', notificationsRoutes);
+
+// Integrations
+router.use('/oauth', oauthRoutes);
+router.use('/lead-sources', leadSourcesRoutes);
+router.use('/calendar', calendarRoutes);
+router.use('/multichannel', multiChannelRoutes);
+router.use('/email', emailRoutes);
+
+// Configuration
+router.use('/custom-fields', customFieldsRoutes);
+
+// Documents and Tasks
+router.use('/documents', documentsRoutes);
+router.use('/tasks', tasksRoutes);
+
+// Products and Quotes
+router.use('/products', productsRoutes);
+router.use('/quotes', quotesRoutes);
+
+// Scheduler
+router.use('/scheduler', schedulerRoutes);
+
+// Websockers
+router.use('/ws', wsRoutes);
+
+// Search
+router.use('/search/leads', leadsRoutes);
+router.use('/search', searchRoutes);
+
+router.use('/oauthRoutes', oauthRoutes)
+
+
+// router.use('/api/sms', smsRoutes);
+
+// app.use('/api/usage', usageTrackingRoutes);
 
 
 module.exports = router;

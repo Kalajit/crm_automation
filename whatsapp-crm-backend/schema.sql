@@ -11,8 +11,60 @@ CREATE TABLE companies (
   id SERIAL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   phone_number VARCHAR(20) UNIQUE NOT NULL,
+  industry VARCHAR(100),
+  company_size VARCHAR(50) CHECK (company_size IN ('small', 'medium', 'large', 'enterprise')),
+  website VARCHAR(255),
+  address TEXT,
+  city VARCHAR(100),
+  state VARCHAR(100),
+  country VARCHAR(100) DEFAULT 'India',
+  postal_code VARCHAR(100),
+  status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'inactive')),
+  subscription_plan VARCHAR(50) DEFAULT 'free',
+  subscription_expires_at TIMESTAMP,
+  settings JSONB DEFAULT '{}',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+-- ============================================
+-- NEW USERS TABLE FOR AUTHENTICATION
+-- ============================================
+DROP TABLE IF EXISTS users CASCADE;
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  first_name VARCHAR(100) NOT NULL,
+  last_name VARCHAR(100) NOT NULL,
+  phone VARCHAR(20),
+  role VARCHAR(50) DEFAULT 'user' CHECK (role IN ('admin', 'manager', 'agent', 'user', 'service')),
+  status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
+  email_verified BOOLEAN DEFAULT FALSE,
+  email_verification_token VARCHAR(255),
+  email_verification_expires TIMESTAMP,
+  password_reset_token VARCHAR(255),
+  password_reset_expires TIMESTAMP,
+  last_login_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- COMMENT ON TABLE users IS 'Stores user accounts for authentication';
+-- COMMENT ON COLUMN users.role IS 'admin: full access, manager: team management, agent: limited access, user: basic access, service: API access';
+
+DROP TABLE IF EXISTS refresh_token CASCADE;
+CREATE TABLE refresh_token(
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+-- COMMENT ON TABLE refresh_tokens IS 'Stores JWT refresh tokens for token renewal';
+
+
 
 -- 2. LEADS TABLE (WITH CUSTOM FIELDS AND COMPANY SUPPORT)
 DROP TABLE IF EXISTS leads CASCADE;
@@ -1412,6 +1464,414 @@ CREATE TABLE agent_breaks (
 );
 
 
+-- Document Management
+DROP TABLE IF EXISTS document_folders CASCADE;
+CREATE TABLE document_folders (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  folder_name VARCHAR(255) NOT NULL,
+  parent_folder_id INTEGER REFERENCES document_folders(id) ON DELETE CASCADE,
+  description TEXT,
+  created_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_folder_name CHECK (LENGTH(TRIM(folder_name)) > 0)
+);
+
+-- Main documents table
+DROP TABLE IF EXISTS documents CASCADE;
+CREATE TABLE documents (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE CASCADE,
+  folder_id INTEGER REFERENCES document_folders(id) ON DELETE SET NULL,
+  document_type VARCHAR(100) DEFAULT 'other',
+  document_name VARCHAR(500) NOT NULL,
+  description TEXT,
+  filename VARCHAR(255) NOT NULL,
+  file_size BIGINT NOT NULL,
+  mime_type VARCHAR(100) NOT NULL,
+  storage_url TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  tags TEXT[] DEFAULT ARRAY[]::TEXT[],
+  version INTEGER DEFAULT 1 CHECK (version > 0),
+  uploaded_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  is_deleted BOOLEAN DEFAULT FALSE,
+  deleted_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  deleted_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_document_name CHECK (LENGTH(TRIM(document_name)) > 0),
+  CONSTRAINT check_filename CHECK (LENGTH(TRIM(filename)) > 0),
+  CONSTRAINT check_file_size CHECK (file_size > 0),
+  CONSTRAINT check_storage_url CHECK (LENGTH(TRIM(storage_url)) > 0)
+);
+
+-- Document versions (for version control)
+DROP TABLE IF EXISTS document_versions CASCADE;
+CREATE TABLE document_versions (
+  id SERIAL PRIMARY KEY,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version > 0),
+  filename VARCHAR(255) NOT NULL,
+  file_size BIGINT NOT NULL CHECK (file_size > 0),
+  storage_url TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  created_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  UNIQUE(document_id, version)
+);
+
+-- Document sharing permissions
+DROP TABLE IF EXISTS document_shares CASCADE;
+CREATE TABLE document_shares (
+  id SERIAL PRIMARY KEY,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  shared_with_agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  shared_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  permissions VARCHAR(20) DEFAULT 'view' CHECK (permissions IN ('view', 'edit', 'download', 'full')),
+  shared_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  UNIQUE(document_id, shared_with_agent_id)
+);
+
+-- Document access logs
+DROP TABLE IF EXISTS document_access_logs CASCADE;
+CREATE TABLE document_access_logs (
+  id SERIAL PRIMARY KEY,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  accessed_by INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE SET NULL,
+  access_type VARCHAR(20) NOT NULL CHECK (access_type IN ('view', 'download', 'edit', 'delete', 'share')),
+  ip_address INET,
+  accessed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- Meeting Scheduler (Calendly-like)
+DROP TABLE IF EXISTS scheduling_links CASCADE;
+CREATE TABLE scheduling_links (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  agent_id INTEGER NOT NULL REFERENCES human_agents(id) ON DELETE CASCADE,
+  link_name VARCHAR(255) NOT NULL,
+  link_slug VARCHAR(255) UNIQUE NOT NULL,
+  meeting_duration INTEGER DEFAULT 30 CHECK (meeting_duration > 0),
+  meeting_type VARCHAR(100),
+  description TEXT,
+  location_type VARCHAR(50) DEFAULT 'virtual' CHECK (location_type IN ('virtual', 'phone', 'in_person')),
+  location_details TEXT,
+  availability_rules JSONB NOT NULL DEFAULT '{}'::jsonb,
+  buffer_time_before INTEGER DEFAULT 0 CHECK (buffer_time_before >= 0),
+  buffer_time_after INTEGER DEFAULT 15 CHECK (buffer_time_after >= 0),
+  max_bookings_per_day INTEGER CHECK (max_bookings_per_day IS NULL OR max_bookings_per_day > 0),
+  advance_notice_hours INTEGER DEFAULT 24 CHECK (advance_notice_hours >= 0),
+  max_days_advance INTEGER DEFAULT 60 CHECK (max_days_advance > 0),
+  custom_questions JSONB DEFAULT '[]'::jsonb,
+  confirmation_message TEXT,
+  reminder_settings JSONB DEFAULT '{
+    "email_reminder": true,
+    "sms_reminder": false,
+    "reminder_before_hours": 24
+  }'::jsonb,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_link_name CHECK (LENGTH(TRIM(link_name)) > 0),
+  CONSTRAINT check_link_slug CHECK (link_slug ~ '^[a-z0-9-]+$')
+);
+
+-- Scheduled meetings (actual bookings)
+DROP TABLE IF EXISTS scheduled_meetings CASCADE;
+CREATE TABLE scheduled_meetings (
+  id SERIAL PRIMARY KEY,
+  scheduling_link_id INTEGER NOT NULL REFERENCES scheduling_links(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  lead_name VARCHAR(255) NOT NULL,
+  lead_email VARCHAR(255) NOT NULL,
+  lead_phone VARCHAR(20),
+  scheduled_time TIMESTAMP WITH TIME ZONE NOT NULL,
+  duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
+  timezone VARCHAR(50) DEFAULT 'Asia/Kolkata' NOT NULL,
+  location_type VARCHAR(50),
+  location_details TEXT,
+  custom_answers JSONB DEFAULT '{}'::jsonb,
+  notes TEXT,
+  status VARCHAR(50) DEFAULT 'confirmed' CHECK (status IN ('confirmed', 'cancelled', 'completed', 'no_show', 'rescheduled')),
+  confirmation_code VARCHAR(50) UNIQUE NOT NULL,
+  calendar_event_id VARCHAR(255),
+  meeting_link VARCHAR(500),
+  cancellation_reason TEXT,
+  cancelled_at TIMESTAMP WITH TIME ZONE,
+  viewed_at TIMESTAMP WITH TIME ZONE,
+  sent_at TIMESTAMP WITH TIME ZONE,
+  accepted_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_lead_name CHECK (LENGTH(TRIM(lead_name)) > 0),
+  CONSTRAINT check_lead_email CHECK (lead_email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+  CONSTRAINT check_scheduled_time CHECK (scheduled_time > CURRENT_TIMESTAMP - INTERVAL '1 year')
+);
+
+-- Product/Service Catalog
+DROP TABLE IF EXISTS products CASCADE;
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  name VARCHAR(500) NOT NULL,
+  description TEXT,
+  category VARCHAR(100),
+  base_price NUMERIC(12, 2) NOT NULL CHECK (base_price >= 0),
+  currency VARCHAR(10) DEFAULT 'INR' NOT NULL,
+  sku VARCHAR(100),
+  track_inventory BOOLEAN DEFAULT FALSE,
+  stock_quantity INTEGER DEFAULT 0 CHECK (stock_quantity >= 0),
+  low_stock_threshold INTEGER DEFAULT 10 CHECK (low_stock_threshold >= 0),
+  is_active BOOLEAN DEFAULT TRUE,
+  tax_rate NUMERIC(5, 2) DEFAULT 0 CHECK (tax_rate >= 0 AND tax_rate <= 100),
+  images JSONB DEFAULT '[]'::jsonb,
+  custom_fields JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_product_name CHECK (LENGTH(TRIM(name)) > 0),
+  CONSTRAINT unique_company_sku UNIQUE(company_id, sku)
+);
+
+
+-- Product variants
+DROP TABLE IF EXISTS product_variants CASCADE;
+CREATE TABLE product_variants (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  variant_name VARCHAR(255) NOT NULL,
+  sku VARCHAR(100),
+  price_adjustment NUMERIC(12, 2) DEFAULT 0,
+  stock_quantity INTEGER DEFAULT 0 CHECK (stock_quantity >= 0),
+  is_active BOOLEAN DEFAULT TRUE,
+  custom_attributes JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_variant_name CHECK (LENGTH(TRIM(variant_name)) > 0),
+  CONSTRAINT unique_variant_sku UNIQUE(sku)
+);
+
+-- Price lists (for different customer segments)
+CREATE TABLE price_lists (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
+  description TEXT,
+  is_default BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_price_list_name CHECK (LENGTH(TRIM(name)) > 0),
+  CONSTRAINT unique_company_price_list UNIQUE(company_id, name)
+);
+
+
+-- Price list items (custom pricing per product)
+DROP TABLE IF EXISTS price_list_items CASCADE;
+CREATE TABLE price_list_items (
+  id SERIAL PRIMARY KEY,
+  price_list_id INTEGER NOT NULL REFERENCES price_lists(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  custom_price NUMERIC(12, 2) NOT NULL CHECK (custom_price >= 0),
+  discount_percent NUMERIC(5, 2) DEFAULT 0 CHECK (discount_percent >= 0 AND discount_percent <= 100),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT unique_price_list_product UNIQUE(price_list_id, product_id)
+);
+
+-- Quote/Proposal Generator
+DROP TABLE IF EXISTS quotes CASCADE;
+CREATE TABLE quotes (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  quote_number VARCHAR(100) UNIQUE NOT NULL,
+  title VARCHAR(500),
+  description TEXT,
+  valid_until DATE NOT NULL,
+  discount_type VARCHAR(20) DEFAULT 'percentage' CHECK (discount_type IN ('percentage', 'fixed')),
+  discount_value NUMERIC(12, 2) DEFAULT 0 CHECK (discount_value >= 0),
+  tax_rate NUMERIC(5, 2) DEFAULT 0 CHECK (tax_rate >= 0 AND tax_rate <= 100),
+  notes TEXT,
+  terms TEXT,
+  subtotal NUMERIC(12, 2) DEFAULT 0 CHECK (subtotal >= 0),
+  discount_amount NUMERIC(12, 2) DEFAULT 0 CHECK (discount_amount >= 0),
+  tax_amount NUMERIC(12, 2) DEFAULT 0 CHECK (tax_amount >= 0),
+  total NUMERIC(12, 2) DEFAULT 0 CHECK (total >= 0),
+  status VARCHAR(50) DEFAULT 'draft' CHECK (status IN ('draft', 'sent', 'viewed', 'accepted', 'rejected', 'expired')),
+  sent_at TIMESTAMP WITH TIME ZONE,
+  viewed_at TIMESTAMP WITH TIME ZONE,
+  accepted_at TIMESTAMP WITH TIME ZONE,
+  rejected_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_quote_number CHECK (LENGTH(TRIM(quote_number)) > 0),
+  CONSTRAINT check_valid_until CHECK (valid_until >= CURRENT_DATE)
+);
+
+-- Quote line items
+DROP TABLE IF EXISTS quote_items CASCADE;
+CREATE TABLE quote_items (
+  id SERIAL PRIMARY KEY,
+  quote_id INTEGER NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+  variant_id INTEGER REFERENCES product_variants(id) ON DELETE SET NULL,
+  product_name VARCHAR(500) NOT NULL,
+  description TEXT,
+  quantity NUMERIC(10, 2) NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(12, 2) NOT NULL CHECK (unit_price >= 0),
+  line_total NUMERIC(12, 2) NOT NULL CHECK (line_total >= 0),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+  
+  CONSTRAINT check_product_name_item CHECK (LENGTH(TRIM(product_name)) > 0)
+);
+
+-- Quote templates (for quick quote creation)
+CREATE TABLE IF NOT EXISTS quote_templates (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  template_name VARCHAR(255) NOT NULL,
+  template_type VARCHAR(50), -- 'standard', 'premium', 'enterprise'
+  description TEXT,
+  default_items JSONB DEFAULT '[]'::jsonb,
+  default_terms TEXT,
+  default_payment_terms VARCHAR(100),
+  is_active BOOLEAN DEFAULT TRUE,
+  created_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- Meeting reminders
+DROP TABLE IF EXISTS meeting_reminders CASCADE;
+CREATE TABLE meeting_reminders (
+  id SERIAL PRIMARY KEY,
+  meeting_id INTEGER NOT NULL REFERENCES scheduled_meetings(id) ON DELETE CASCADE,
+  reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('email', 'sms', 'whatsapp', 'push')),
+  minutes_before INTEGER NOT NULL CHECK (minutes_before > 0),
+  scheduled_for TIMESTAMP WITH TIME ZONE NOT NULL,
+  sent_at TIMESTAMP WITH TIME ZONE,
+  status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+  error_message TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Inventory logs (for tracking stock changes)
+DROP TABLE IF EXISTS inventory_logs CASCADE;
+CREATE TABLE inventory_logs (
+  id SERIAL PRIMARY KEY,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  variant_id INTEGER REFERENCES product_variants(id) ON DELETE CASCADE,
+  quantity_change INTEGER NOT NULL,
+  operation VARCHAR(20) NOT NULL CHECK (operation IN ('add', 'subtract', 'set', 'adjustment')),
+  reason TEXT,
+  performed_by INTEGER REFERENCES human_agents(id) ON DELETE SET NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ============================================
+-- SMS TABLES
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS sms_configs (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  provider VARCHAR(50) NOT NULL DEFAULT 'twilio',
+  account_sid VARCHAR(255) NOT NULL,
+  auth_token TEXT NOT NULL,
+  phone_number VARCHAR(20) NOT NULL,
+  is_active BOOLEAN DEFAULT true,
+  daily_limit INTEGER DEFAULT 1000,
+  messages_sent_today INTEGER DEFAULT 0,
+  last_reset_at DATE DEFAULT CURRENT_DATE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, phone_number)
+);
+
+CREATE TABLE IF NOT EXISTS sms_messages (
+  id SERIAL PRIMARY KEY,
+  sms_config_id INTEGER NOT NULL REFERENCES sms_configs(id) ON DELETE CASCADE,
+  lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+  direction VARCHAR(10) NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+  from_number VARCHAR(20) NOT NULL,
+  to_number VARCHAR(20) NOT NULL,
+  message_body TEXT NOT NULL,
+  message_sid VARCHAR(255) UNIQUE,
+  status VARCHAR(20) DEFAULT 'sent',
+  error_code VARCHAR(10),
+  error_message TEXT,
+  segments INTEGER DEFAULT 1,
+  cost DECIMAL(10,4),
+  sent_at TIMESTAMP,
+  delivered_at TIMESTAMP,
+  failed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sms_templates (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  template_name VARCHAR(255) NOT NULL,
+  template_type VARCHAR(50) NOT NULL,
+  message_body TEXT NOT NULL,
+  variables TEXT[],
+  character_count INTEGER,
+  estimated_segments INTEGER,
+  is_active BOOLEAN DEFAULT true,
+  usage_count INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sms_campaigns (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  campaign_name VARCHAR(255) NOT NULL,
+  template_id INTEGER REFERENCES sms_templates(id),
+  target_audience JSONB DEFAULT '{}',
+  scheduled_for TIMESTAMP,
+  status VARCHAR(20) DEFAULT 'draft',
+  total_recipients INTEGER DEFAULT 0,
+  sent_count INTEGER DEFAULT 0,
+  delivered_count INTEGER DEFAULT 0,
+  failed_count INTEGER DEFAULT 0,
+  total_cost DECIMAL(10,2) DEFAULT 0,
+  created_by INTEGER REFERENCES human_agents(id),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sms_campaign_recipients (
+  id SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES sms_campaigns(id) ON DELETE CASCADE,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  phone_number VARCHAR(20) NOT NULL,
+  personalized_message TEXT,
+  status VARCHAR(20) DEFAULT 'pending',
+  message_sid VARCHAR(255),
+  sent_at TIMESTAMP,
+  delivered_at TIMESTAMP,
+  failed_at TIMESTAMP,
+  error_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(campaign_id, lead_id)
+);
+
 -- ============================================
 -- INDEXES FOR PERFORMANCE
 -- ============================================
@@ -1550,6 +2010,11 @@ CREATE INDEX idx_drip_executions_subscriber ON drip_step_executions(subscriber_i
 CREATE INDEX idx_drip_executions_scheduled ON drip_step_executions(scheduled_for) WHERE status = 'pending';
 CREATE INDEX idx_unsubscribes_lead ON unsubscribes(lead_id, unsubscribe_type);
 CREATE INDEX idx_campaign_performance_campaign ON campaign_performance(campaign_id, date);
+CREATE INDEX IF NOT EXISTS idx_drip_subscribers_campaign_lead ON drip_campaign_subscribers(campaign_id, lead_id);
+CREATE INDEX IF NOT EXISTS idx_drip_subscribers_status ON drip_campaign_subscribers(status) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_drip_campaigns_company_id ON drip_campaigns(company_id);
+CREATE INDEX IF NOT EXISTS idx_drip_campaigns_active ON drip_campaigns(is_active) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_drip_executions_subscriber ON drip_campaign_executions(subscriber_id);
 
 CREATE INDEX idx_scheduled_reports_company ON scheduled_reports(company_id, is_active);
 CREATE INDEX idx_scheduled_reports_next_delivery ON scheduled_reports(next_delivery) WHERE is_active = TRUE;
@@ -1623,11 +2088,189 @@ CREATE INDEX idx_time_off_requests_agent ON time_off_requests(agent_id, status);
 CREATE INDEX idx_agent_breaks_agent ON agent_breaks(agent_id, started_at DESC);
 
 
+-- CREATE INDEX idx_documents_company ON documents(company_id) WHERE is_deleted = FALSE;
+-- CREATE INDEX idx_documents_lead ON documents(lead_id) WHERE is_deleted = FALSE;
+-- CREATE INDEX idx_documents_folder ON documents(folder_id);
+-- CREATE INDEX idx_documents_tags ON documents USING GIN(tags);
+-- CREATE INDEX idx_documents_type ON documents(document_type) WHERE is_deleted = FALSE;
+-- CREATE INDEX idx_documents_deleted ON documents(is_deleted, deleted_at);
+
+
+CREATE INDEX idx_scheduling_links_slug ON scheduling_links(link_slug) WHERE is_active = TRUE;
+CREATE INDEX idx_scheduling_links_company ON scheduling_links(company_id, is_active);
+CREATE INDEX idx_scheduling_links_agent ON scheduling_links(agent_id, is_active);
+CREATE INDEX idx_scheduled_meetings_link ON scheduled_meetings(scheduling_link_id, status);
+CREATE INDEX idx_scheduled_meetings_lead ON scheduled_meetings(lead_id);
+CREATE INDEX idx_scheduled_meetings_time ON scheduled_meetings(status, scheduled_time);
+CREATE INDEX idx_scheduled_meetings_status ON scheduled_meetings(status, scheduled_time);
+CREATE INDEX idx_scheduled_meetings_confirmation ON scheduled_meetings(confirmation_code);
+
+CREATE INDEX idx_meeting_reminders_meeting ON meeting_reminders(meeting_id);
+CREATE INDEX idx_meeting_reminders_status ON meeting_reminders(status, sent_at);
+
+CREATE INDEX idx_products_company ON products(company_id, is_active);
+CREATE INDEX idx_products_category ON products(category) WHERE is_active = TRUE;
+CREATE INDEX idx_products_code ON products(product_code);
+CREATE INDEX idx_product_variants_product ON product_variants(product_id, is_active);
+CREATE INDEX idx_product_variants_sku ON product_variants(sku);
+CREATE INDEX idx_products_sku ON products(sku);
+CREATE INDEX idx_products_active ON products(is_active);
+CREATE INDEX idx_products_stock ON products(stock_quantity) WHERE track_inventory = TRUE;
+
+CREATE INDEX idx_products_fts ON products USING GIN (
+  to_tsvector('english', 
+    name || ' ' || 
+    COALESCE(description, '') || ' ' || 
+    COALESCE(sku, '')
+  )
+) WHERE is_active = TRUE;
+
+-- Full-text search for products
+CREATE INDEX idx_products_fts ON products USING GIN (
+  to_tsvector('english', product_name || ' ' || COALESCE(description, '') || ' ' || COALESCE(product_code, ''))
+);
+
+CREATE INDEX idx_quotes_company ON quotes(company_id, status);
+CREATE INDEX idx_quotes_lead ON quotes(lead_id);
+CREATE INDEX idx_quotes_number ON quotes(quote_number);
+CREATE INDEX idx_quotes_status ON quotes(status);
+CREATE INDEX idx_quotes_valid ON quotes(valid_until) WHERE status IN ('sent', 'viewed');
+CREATE INDEX idx_quote_items_quote ON quote_items(quote_id);
+CREATE INDEX idx_quote_items_product ON quote_items(product_id);
+
+CREATE INDEX idx_folders_company ON document_folders(company_id);
+CREATE INDEX idx_folders_parent ON document_folders(parent_folder_id);
+
+CREATE INDEX idx_documents_company ON documents(company_id) WHERE is_deleted = FALSE;
+CREATE INDEX idx_documents_lead ON documents(lead_id) WHERE is_deleted = FALSE;
+CREATE INDEX idx_documents_folder ON documents(folder_id);
+CREATE INDEX idx_documents_tags ON documents USING GIN(tags);
+CREATE INDEX idx_documents_type ON documents(document_type) WHERE is_deleted = FALSE;
+CREATE INDEX idx_documents_deleted ON documents(is_deleted, deleted_at);
+
+CREATE INDEX idx_documents_fts ON documents USING GIN (
+  to_tsvector('english', 
+    document_name || ' ' || 
+    COALESCE(description, '') || ' ' || 
+    COALESCE(array_to_string(tags, ' '), '')
+  )
+) WHERE is_deleted = FALSE;
+
+-- Full-text search for documents
+CREATE INDEX idx_documents_fts ON documents USING GIN (to_tsvector('english', document_name || ' ' || COALESCE(description, '')));
+
+-- Full-text search for products
+CREATE INDEX idx_products_fts ON products USING GIN (to_tsvector('english', product_name || ' ' || COALESCE(description, '') || ' ' || COALESCE(product_code, '')));
+
+CREATE INDEX idx_document_shares_document ON document_shares(document_id);
+CREATE INDEX idx_document_shares_agent ON document_shares(shared_with_agent_id);
+
+CREATE INDEX idx_document_access_logs_document ON document_access_logs(document_id, accessed_at DESC);
+CREATE INDEX idx_document_access_logs_agent ON document_access_logs(accessed_by, accessed_at DESC);
+
+CREATE INDEX idx_price_lists_company ON price_lists(company_id);
+CREATE UNIQUE INDEX idx_price_lists_default ON price_lists(company_id) WHERE is_default = TRUE;
+
+CREATE INDEX idx_price_list_items_list ON price_list_items(price_list_id);
+CREATE INDEX idx_price_list_items_product ON price_list_items(product_id);
+
+CREATE INDEX idx_inventory_logs_product ON inventory_logs(product_id, created_at DESC);
+CREATE INDEX idx_inventory_logs_created ON inventory_logs(created_at DESC);
+
+CREATE INDEX idx_quote_templates_company ON quote_templates(company_id, is_active);
+
+CREATE INDEX idx_document_versions_document ON document_versions(document_id, version DESC);
+
+CREATE INDEX idx_document_shares_document ON document_shares(document_id);
+CREATE INDEX idx_document_shares_agent ON document_shares(shared_with_agent_id);
+
+CREATE INDEX idx_meeting_reminders_meeting ON meeting_reminders(meeting_id, status);
+CREATE INDEX idx_meeting_reminders_scheduled ON meeting_reminders(scheduled_for, status) WHERE status = 'pending';
+
+-- Email indexes
+CREATE INDEX IF NOT EXISTS idx_email_messages_lead_id ON email_messages(lead_id);
+CREATE INDEX IF NOT EXISTS idx_email_messages_received_at ON email_messages(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_email_scan_logs_config_id ON email_scan_logs(email_config_id);
+
+-- SMS indexes
+CREATE INDEX IF NOT EXISTS idx_sms_messages_lead_id ON sms_messages(lead_id);
+CREATE INDEX IF NOT EXISTS idx_sms_messages_created_at ON sms_messages(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sms_campaign_recipients_status ON sms_campaign_recipients(status) WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_sms_configs_company_id ON sms_configs(company_id);
+CREATE INDEX IF NOT EXISTS idx_sms_configs_active ON sms_configs(is_active) WHERE is_active = TRUE;
+CREATE INDEX IF NOT EXISTS idx_sms_messages_direction ON sms_messages(direction);
+CREATE INDEX IF NOT EXISTS idx_sms_campaigns_status ON sms_campaigns(status);
+
+CREATE INDEX IF NOT EXISTS idx_leads_phone_number ON leads(phone_number);
+CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
+CREATE INDEX IF NOT EXISTS idx_leads_company_id ON leads(company_id);
+CREATE INDEX IF NOT EXISTS idx_leads_lead_status ON leads(lead_status);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_company ON users(company_id);
+CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX idx_users_status ON users(status);
+
+CREATE INDEX idx_refresh_tokens_user ON refresh_tokens(user_id);
+CREATE INDEX idx_refresh_tokens_token ON refresh_tokens(token);
+CREATE INDEX idx_refresh_tokens_expires ON refresh_tokens(expires_at);
 
 
 -- ============================================
 -- TRIGGERS FOR AUTOMATIC TIMESTAMPS
 -- ============================================
+
+-- ============================================
+-- MISSING: FUNCTIONS FOR AUTOMATION
+-- ============================================
+
+-- Function to reset daily SMS limits
+CREATE OR REPLACE FUNCTION reset_daily_sms_limits()
+RETURNS void AS $$
+BEGIN
+  UPDATE sms_configs
+  SET 
+    messages_sent_today = 0,
+    last_reset_at = CURRENT_DATE
+  WHERE last_reset_at < CURRENT_DATE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to update campaign analytics
+CREATE OR REPLACE FUNCTION update_drip_campaign_analytics()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    INSERT INTO drip_campaign_analytics (
+      campaign_id, date,
+      enrolled_count, active_count, completed_count, unsubscribed_count
+    )
+    SELECT 
+      campaign_id,
+      CURRENT_DATE,
+      COUNT(*) FILTER (WHERE enrolled_at::date = CURRENT_DATE),
+      COUNT(*) FILTER (WHERE status = 'active'),
+      COUNT(*) FILTER (WHERE status = 'completed'),
+      COUNT(*) FILTER (WHERE status = 'unsubscribed')
+    FROM drip_campaign_subscribers
+    WHERE campaign_id = NEW.campaign_id
+    GROUP BY campaign_id
+    ON CONFLICT (campaign_id, date) DO UPDATE
+    SET
+      enrolled_count = EXCLUDED.enrolled_count,
+      active_count = EXCLUDED.active_count,
+      completed_count = EXCLUDED.completed_count,
+      unsubscribed_count = EXCLUDED.unsubscribed_count;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_campaign_analytics_trigger
+AFTER INSERT OR UPDATE ON drip_campaign_subscribers
+FOR EACH ROW
+EXECUTE FUNCTION update_drip_campaign_analytics();
 
 -- Create update timestamp function
 CREATE OR REPLACE FUNCTION update_timestamp()
@@ -1635,6 +2278,26 @@ RETURNS TRIGGER AS $$
 BEGIN
   NEW.updated_at = CURRENT_TIMESTAMP;
   RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================
+-- AUTO-UPDATE TIMESTAMPS TRIGGER
+-- ============================================
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE OR REPLACE FUNCTION cleanup_expired_tokens()
+RETURNS void AS $$
+BEGIN
+    DELETE FROM refresh_tokens WHERE expires_at < CURRENT_TIMESTAMP;
+    DELETE FROM users WHERE email_verification_expires < CURRENT_TIMESTAMP AND email_verified = FALSE;
+    DELETE FROM users WHERE password_reset_expires < CURRENT_TIMESTAMP AND password_reset_token IS NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1755,6 +2418,67 @@ CREATE TRIGGER update_social_accounts_timestamp BEFORE UPDATE ON social_media_ac
 
 DROP TRIGGER IF EXISTS update_agent_shifts_timestamp ON agent_shifts;
 CREATE TRIGGER update_agent_shifts_timestamp BEFORE UPDATE ON agent_shifts FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_document_folders_timestamp ON document_folders;
+CREATE TRIGGER update_document_folders_timestamp BEFORE UPDATE ON document_folders FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_documents_timestamp ON documents;
+CREATE TRIGGER update_documents_timestamp BEFORE UPDATE ON documents FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_scheduling_links_timestamp ON scheduling_links;
+CREATE TRIGGER update_scheduling_links_timestamp BEFORE UPDATE ON scheduling_links FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_scheduled_meetings_timestamp ON scheduled_meetings;
+CREATE TRIGGER update_scheduled_meetings_timestamp BEFORE UPDATE ON scheduled_meetings FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_products_timestamp ON products;
+CREATE TRIGGER update_products_timestamp BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_quotes_timestamp ON quotes;
+CREATE TRIGGER update_quotes_timestamp BEFORE UPDATE ON quotes FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_product_variants_timestamp ON product_variants;
+CREATE TRIGGER update_product_variants_timestamp BEFORE UPDATE ON product_variants FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_price_lists_timestamp ON price_lists;
+CREATE TRIGGER update_price_lists_timestamp BEFORE UPDATE ON price_lists FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_price_list_items_timestamp ON price_list_items;
+CREATE TRIGGER update_price_list_items_timestamp BEFORE UPDATE ON price_list_items FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+DROP TRIGGER IF EXISTS update_quote_templates_timestamp ON quote_templates;
+CREATE TRIGGER update_quote_templates_timestamp BEFORE UPDATE ON quote_templates FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_document_folders_updated BEFORE UPDATE ON document_foldersFOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_documents_updated BEFORE UPDATE ON documents FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_scheduling_links_updated BEFORE UPDATE ON scheduling_links
+  FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_scheduled_meetings_updated BEFORE UPDATE ON scheduled_meetings FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_products_updated BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_product_variants_updated BEFORE UPDATE ON product_variants FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_price_lists_updated BEFORE UPDATE ON price_lists FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_price_list_items_updated BEFORE UPDATE ON price_list_items FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TRIGGER trg_quotes_updated BEFORE UPDATE ON quotes FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- Create trigger for campaign analytics
+DROP TRIGGER IF EXISTS update_campaign_analytics_trigger ON drip_campaign_subscribers;
+CREATE TRIGGER update_campaign_analytics_trigger AFTER INSERT OR UPDATE ON drip_campaign_subscribers FOR EACH ROW EXECUTE FUNCTION update_drip_campaign_analytics();
+
+-- Apply trigger to companies table
+DROP TRIGGER IF EXISTS update_companies_updated_at ON companies;
+CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Apply trigger to users table
+DROP TRIGGER IF EXISTS update_users_updated_at ON users;
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 
 -- ============================================
@@ -2482,6 +3206,64 @@ INSERT INTO routing_rules (company_id, rule_name, rule_type, conditions, action,
 (1, 'After Hours Auto-Tag', 'time_based', '{"hours": {"start": 18, "end": 9}}', 'tag_lead', 60)
 ON CONFLICT DO NOTHING;
 
+
+INSERT INTO products (company_id, product_name, description, category, product_type, unit_price, currency, tax_rate, inventory_tracked)
+VALUES 
+  (1, 'Chess Coaching - Basic', '4 sessions per month, 1 hour each', 'Coaching', 'subscription', 2000.00, 'INR', 18.00, false),
+  (1, 'Chess Coaching - Premium', '8 sessions per month, 1 hour each', 'Coaching', 'subscription', 3500.00, 'INR', 18.00, false),
+  (1, 'One-time Consultation', 'Single 1-hour session', 'Consultation', 'service', 500.00, 'INR', 18.00, false),
+  (1, 'Chess Set - Standard', 'Wooden chess board with pieces', 'Equipment', 'product', 2000.00, 'INR', 18.00, true)
+ON CONFLICT (product_code) DO NOTHING;
+
+
+-- Sample scheduling link (only if company_id=1 and agent_id=1 exist)
+INSERT INTO scheduling_links (
+  company_id, agent_id, link_name, link_slug, meeting_duration, 
+  meeting_type, description, location_type, availability_rules, is_active
+)
+VALUES (
+  1, 1,
+  '30-Minute Consultation',
+  '30min-consultation',
+  30,
+  'consultation',
+  'Book a 30-minute consultation to discuss your chess coaching needs',
+  'virtual',
+  '{
+    "monday": {"available": true, "start_time": "09:00", "end_time": "17:00"},
+    "tuesday": {"available": true, "start_time": "09:00", "end_time": "17:00"},
+    "wednesday": {"available": true, "start_time": "09:00", "end_time": "17:00"},
+    "thursday": {"available": true, "start_time": "09:00", "end_time": "17:00"},
+    "friday": {"available": true, "start_time": "09:00", "end_time": "17:00"}
+  }'::jsonb,
+  true
+)
+ON CONFLICT (link_slug) DO NOTHING;
+
+
+-- Sample price list
+INSERT INTO price_lists (company_id, price_list_name, is_default)
+VALUES (1, 'Default Price List', true)
+ON CONFLICT (company_id, price_list_name) DO NOTHING;
+
+
+-- Sample company
+INSERT INTO companies (company_name, primary_contact_name, primary_contact_email, primary_contact_phone)
+VALUES ('Sample Corp', 'John Doe', 'john@sample.com', '+919876543210')
+ON CONFLICT DO NOTHING;
+
+-- Sample SMS template
+INSERT INTO sms_templates (company_id, template_name, template_type, message_body, character_count, estimated_segments)
+SELECT id, 'Welcome Message', 'welcome', 'Hi {{name}}! Welcome to our service. We''re excited to have you!', 68, 1
+FROM companies WHERE company_name = 'Sample Corp'
+ON CONFLICT DO NOTHING;
+
+-- Sample drip campaign
+INSERT INTO drip_campaigns (company_id, campaign_name, trigger_type, is_active)
+SELECT id, 'Welcome Series', 'new_lead', FALSE
+FROM companies WHERE company_name = 'Sample Corp'
+ON CONFLICT DO NOTHING;
+
 -- ============================================
 -- UTILITY VIEWS
 -- ============================================
@@ -2724,6 +3506,26 @@ BEGIN
     (p_start_date IS NULL OR i.created_at >= p_start_date)
     AND (p_end_date IS NULL OR i.created_at <= p_end_date)
     AND (p_company_id IS NULL OR l.company_id = p_company_id);
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+-- Function to archive old messages
+CREATE OR REPLACE FUNCTION archive_old_messages()
+RETURNS void AS $$
+BEGIN
+  -- Archive SMS messages older than 90 days
+  DELETE FROM sms_messages
+  WHERE created_at < NOW() - INTERVAL '90 days';
+  
+  -- Archive email scan logs older than 90 days
+  DELETE FROM email_scan_logs
+  WHERE created_at < NOW() - INTERVAL '90 days';
+  
+  -- Archive drip executions older than 180 days
+  DELETE FROM drip_campaign_executions
+  WHERE created_at < NOW() - INTERVAL '180 days';
 END;
 $$ LANGUAGE plpgsql;
 

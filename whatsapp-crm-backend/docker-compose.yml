@@ -2,210 +2,6 @@ version: '3.8'
 
 services:
 
-
-  # # ========================================
-  # # IndicTrans2 - FREE AI4Bharat Translation (Best for Indian Languages)
-  # # ========================================
-  # indictrans:
-  #   image: python:3.10-slim
-  #   container_name: whatsapp-crm-translate
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5000:5000"
-  #   environment:
-  #     PYTHONUNBUFFERED: "1"
-  #   # volumes:
-  #   #   - indictrans_models:/root/.cache
-  #   working_dir: /app
-  #   command: >
-  #     bash -c "
-  #     apt-get update && 
-  #     apt-get install -y git curl build-essential &&
-  #     pip install --no-cache-dir fastapi uvicorn[standard] torch sentencepiece sacremoses indic-nlp-library &&
-  #     pip install --no-cache-dir IndicTransToolkit &&
-  #     cat > /app/call_chess_coach.py << 'EOFPYTHON'
-  #     from fastapi import FastAPI, HTTPException
-  #     from pydantic import BaseModel
-  #     import uvicorn
-  #     import logging
-  #     from typing import Optional
-      
-  #     logging.basicConfig(level=logging.INFO)
-  #     logger = logging.getLogger(__name__)
-      
-  #     app = FastAPI(title='IndicTrans2 Translation API')
-      
-  #     translator = None
-      
-  #     LANGUAGE_MAP = {
-  #         'en': 'eng_Latn',
-  #         'hi': 'hin_Deva',
-  #         'kn': 'kan_Knda',
-  #         'ml': 'mal_Mlym',
-  #         'ta': 'tam_Taml',
-  #         'te': 'tel_Telu'
-  #     }
-      
-  #     REVERSE_MAP = {v: k for k, v in LANGUAGE_MAP.items()}
-      
-  #     class TranslateRequest(BaseModel):
-  #         q: str
-  #         source: str
-  #         target: str
-  #         format: str = 'text'
-      
-  #     class TranslateResponse(BaseModel):
-  #         translatedText: str
-      
-  #     def initialize_translator():
-  #         global translator
-  #         try:
-  #             logger.info('Initializing IndicTrans2 model...')
-  #             from IndicTransToolkit import IndicProcessor
-  #             translator = IndicProcessor(inference='cpu')
-  #             logger.info('IndicTrans2 initialized successfully')
-  #             return True
-  #         except Exception as e:
-  #             logger.error(f'Failed to initialize IndicTrans2: {e}')
-  #             return False
-      
-  #     @app.on_event('startup')
-  #     async def startup_event():
-  #         initialize_translator()
-      
-  #     @app.get('/health')
-  #     async def health_check():
-  #         return {
-  #             'status': 'healthy' if translator else 'degraded',
-  #             'model': 'IndicTrans2',
-  #             'supported_languages': list(LANGUAGE_MAP.keys())
-  #         }
-      
-  #     @app.get('/languages')
-  #     async def get_languages():
-  #         return [
-  #             {'code': code, 'name': code.upper()} 
-  #             for code in LANGUAGE_MAP.keys()
-  #         ]
-      
-  #     @app.post('/translate')
-  #     async def translate(request: TranslateRequest) -> TranslateResponse:
-  #         try:
-  #             if not request.q or not request.q.strip():
-  #                 raise HTTPException(status_code=400, detail='Empty text')
-              
-  #             if request.source not in LANGUAGE_MAP:
-  #                 raise HTTPException(status_code=400, detail=f'Unsupported source language: {request.source}')
-              
-  #             if request.target not in LANGUAGE_MAP:
-  #                 raise HTTPException(status_code=400, detail=f'Unsupported target language: {request.target}')
-              
-  #             if request.source == request.target:
-  #                 return TranslateResponse(translatedText=request.q)
-              
-  #             if not translator:
-  #                 logger.warning('Translator not initialized, returning original text')
-  #                 return TranslateResponse(translatedText=request.q)
-              
-  #             src_lang = LANGUAGE_MAP[request.source]
-  #             tgt_lang = LANGUAGE_MAP[request.target]
-              
-  #             logger.info(f'Translating: {request.source} → {request.target}')
-              
-  #             translations = translator.translate_paragraph(
-  #                 input_sentences=[request.q],
-  #                 src_lang=src_lang,
-  #                 tgt_lang=tgt_lang
-  #             )
-              
-  #             translated_text = translations[0] if translations else request.q
-              
-  #             logger.info(f'Translation complete')
-              
-  #             return TranslateResponse(translatedText=translated_text)
-              
-  #         except HTTPException:
-  #             raise
-  #         except Exception as e:
-  #             logger.error(f'Translation error: {e}')
-  #             return TranslateResponse(translatedText=request.q)
-      
-  #     @app.get('/')
-  #     async def root():
-  #         return {
-  #             'service': 'IndicTrans2 Translation API',
-  #             'version': '1.0.0',
-  #             'model': 'AI4Bharat IndicTrans2',
-  #             'supported_languages': list(LANGUAGE_MAP.keys()),
-  #             'endpoints': {
-  #                 'translate': 'POST /translate',
-  #                 'languages': 'GET /languages',
-  #                 'health': 'GET /health'
-  #             }
-  #         }
-      
-  #     if __name__ == \"__main__\":
-  #         uvicorn.run(app, host='0.0.0.0', port=5000, log_level='info')
-  #     EOFPYTHON
-  #     python /app/call_chess_coach.py
-  #     "
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 300s  # 5 minutes for model download
-  #   networks:
-  #     - whatsapp-crm-network
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 6G
-  #         cpus: '4'
-  #       reservations:
-  #         memory: 3G
-  #         cpus: '2'
-
-
-
-
-  # # ========================================
-  # # IndicTrans2 – separate file, no heredoc
-  # # ========================================
-  # indictrans:
-  #   build:
-  #     context: ../../call automation      # <-- folder that contains translate_api.py
-  #     dockerfile: Dockerfile-translate
-  #   container_name: whatsapp-crm-translate
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5000:5000"
-  #   environment:
-  #     PYTHONUNBUFFERED: "1"
-  #     PORT: "5000"
-  #     HF_TOKEN: ${HF_TOKEN:-}  # Add your HuggingFace token here
-  #     HF_HOME: /app/models/.cache
-  #   volumes:
-  #     - indictrans_models:/app/models  # Persist the downloaded models
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 120s
-  #   deploy:
-  #     resources:
-  #       limits:
-  #         memory: 2G  
-  #         cpus: '2'
-  #       reservations:
-  #         memory: 1G  
-  #         cpus: '1'
-  #   networks:
-  #     - whatsapp-crm-network
-
-
-
   # PostgreSQL Database
   postgres:
     image: postgres:15-alpine
@@ -228,6 +24,24 @@ services:
       - whatsapp-crm-network
     restart: unless-stopped
 
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: whatsapp-crm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - whatsapp-crm-network
+    restart: unless-stopped
+
+
   # Node.js Backend
   backend:
     build: 
@@ -239,8 +53,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # indictrans:
-      #   condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       DB_USER: ajsal
@@ -251,8 +65,8 @@ services:
       PORT: 3000
       API_KEY: ${API_KEY:-your_secret_api_key_change_this}
       GROQ_API_KEY: ${GROQ_API_KEY:-your_groq_api_key}
-      # INDICTRANS_URL: http://indictrans:5000
       DEEPL_API_KEY: ${DEEPL_API_KEY:-}
+      REDIS_URL: redis://redis:6379
     ports:
       - "3000:3000"
     env_file:
@@ -313,8 +127,8 @@ services:
 volumes:
   postgres_data:
     driver: local
-  # indictrans_models:
-  #   driver: local
+  redis_data:
+    driver: local
 
 networks:
   whatsapp-crm-network:

@@ -39,4 +39,12 @@ router.post('/compare', analyticsController.comparePeriods);
 router.post('/export/csv', analyticsController.exportCSV);
 router.post('/export/excel', analyticsController.exportExcel);
 
+
+// route for Part 8
+router.post('/event', analyticsController.trackEvent);
+
+// Complete lead analytics
+router.get('/leads-complete/:company_id', analyticsController.getCompleteLeadAnalytics);
+
+
 module.exports = router;

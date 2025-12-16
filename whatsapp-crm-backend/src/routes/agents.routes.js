@@ -34,4 +34,8 @@ router.get('/active-calls', agentsController.getActiveCalls);
 // Metrics
 router.get('/metrics/dashboard', agentsController.getMetricsDashboard);
 
+
+// New route for Part 8
+router.get('/:id/stats', agentsController.getAgentStats);
+
 module.exports = router;

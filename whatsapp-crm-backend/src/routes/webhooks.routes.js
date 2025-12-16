@@ -11,4 +11,13 @@ router.post('/call-completed', webhooksController.handleCallCompleted);
 // Call failed webhook
 router.post('/call-failed', webhooksController.handleCallFailed);
 
+// New route for Part 8
+router.post('/lead-capture', webhooksController.handleLeadCapture);
+
+// NEW: Unified webhook for all platforms
+router.post('/lead-capture/:token', webhooksController.handleUnifiedLeadCapture);
+
+// NEW: Meta-specific webhook
+router.post('/meta-leads/:token', webhooksController.handleMetaLeadsWebhook);
+
 module.exports = router;

@@ -2,6 +2,7 @@ const pool = require('../config/database');
 const { sendSuccess, handleError } = require('../utils/response');
 const { logRequest } = require('../utils/logger');
 const AnalyticsService = require('../services/analytics/analytics.service');
+const logger = require('../utils/logger');
 
 /**
  * Track analytics events
@@ -533,7 +534,152 @@ exports.exportExcel = async (req, res) => {
 
 
 
+exports.trackEvent = async (req, res) => {
+  const { event_name, lead_id, company_id, event_properties } = req.body;
+  if (!event_name) {
+    return res.status(400).json({ success: false, error: 'event_name is required' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO analytics_events (event_name, lead_id, company_id, event_properties, created_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+      [
+        event_name,
+        lead_id || null,   
+        company_id || null,
+        event_properties ? JSON.stringify(event_properties).slice(0, 4000) : null
+      ]
+    );
+    logRequest('POST', '/api/analytics/event', 201);
+    res.status(201).json({ success: true });
+  } catch (e) {
+    logRequest('POST', '/api/analytics/event', 500);
+    handleError(res, e);
+  }
+};
 
+
+
+// Complete Lead Analytics Dashboard
+exports.getCompleteLeadAnalytics = async (req, res) => {
+  try {
+    const { company_id } = req.params;
+    const { start_date, end_date } = req.query;
+    
+    let dateFilter = '';
+    const params = [company_id];
+    
+    if (start_date && end_date) {
+      dateFilter = ' AND l.created_at BETWEEN $2 AND $3';
+      params.push(start_date, end_date);
+    }
+    
+    // Overall statistics
+    const overallStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'new') as new_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'qualified') as qualified_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as won_leads,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_lost') as lost_leads,
+        AVG(interest_level) as avg_interest,
+        AVG((metadata->'lead_score'->>'score')::int) FILTER (WHERE metadata->'lead_score' IS NOT NULL) as avg_score
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+    `, params);
+    
+    // Source breakdown
+    const sourceStats = await pool.query(`
+      SELECT 
+        lead_source,
+        COUNT(*) as count,
+        COUNT(*) FILTER (WHERE lead_status = 'closed_won') as conversions,
+        AVG((metadata->'lead_score'->>'score')::int) FILTER (WHERE metadata->'lead_score' IS NOT NULL) as avg_score
+      FROM leads
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY lead_source
+      ORDER BY count DESC
+    `, params);
+    
+    // Language distribution
+    const languageStats = await pool.query(`
+      SELECT 
+        preferred_language,
+        COUNT(*) as count
+      FROM leads 
+      WHERE company_id = $1 ${dateFilter}
+      GROUP BY preferred_language
+    `, params);
+    
+    // Score distribution
+    const scoreStats = await pool.query(`
+      SELECT 
+        metadata->'lead_score'->>'grade' as grade,
+        COUNT(*) as count
+      FROM leads 
+      WHERE company_id = $1 
+      AND metadata->'lead_score' IS NOT NULL
+      ${dateFilter}
+      GROUP BY metadata->'lead_score'->>'grade'
+      ORDER BY 
+        CASE metadata->'lead_score'->>'grade'
+          WHEN 'A' THEN 1
+          WHEN 'B' THEN 2
+          WHEN 'C' THEN 3
+          WHEN 'D' THEN 4
+          WHEN 'F' THEN 5
+        END
+    `, params);
+    
+    // Engagement metrics
+    const engagementStats = await pool.query(`
+      SELECT 
+        AVG(call_count) as avg_calls_per_lead,
+        AVG(message_count) as avg_messages_per_lead,
+        AVG(booking_count) as avg_bookings_per_lead
+      FROM (
+        SELECT 
+          leads.id,
+          COUNT(DISTINCT cl.id) as call_count,
+          COUNT(DISTINCT wm.id) as message_count,
+          COUNT(DISTINCT b.id) as booking_count
+        FROM leads
+        LEFT JOIN call_logs cl ON leads.id = cl.lead_id
+        LEFT JOIN whatsapp_messages wm ON leads.id = wm.lead_id
+        LEFT JOIN bookings b ON leads.id = b.lead_id
+        WHERE leads.company_id = $1 ${dateFilter}
+        GROUP BY leads.id
+      ) sub
+    `, params);
+    
+    // Task completion stats
+    const taskStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_tasks,
+        COUNT(*) FILTER (WHERE status = 'completed') as completed_tasks,
+        COUNT(*) FILTER (WHERE status = 'pending' AND due_date < NOW()) as overdue_tasks,
+        AVG(
+          EXTRACT(EPOCH FROM (completed_at - created_at)) / 3600
+        ) FILTER (WHERE status = 'completed') as avg_completion_hours
+      FROM tasks
+      WHERE company_id = $1 ${dateFilter}
+    `, params);
+    
+    logger.info('GET', `/api/analytics/leads-complete/${company_id}`, 200);
+    return successResponse(res, {
+      overall: overallStats.rows[0],
+      by_source: sourceStats.rows,
+      by_language: languageStats.rows,
+      by_score: scoreStats.rows,
+      engagement: engagementStats.rows[0],
+      tasks: taskStats.rows[0]
+    }, 'Complete analytics retrieved successfully');
+    
+  } catch (error) {
+    logger.error('Complete analytics error:', error);
+    return errorResponse(res, error.message, 500);
+  }
+};
 
 
 

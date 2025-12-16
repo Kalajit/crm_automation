@@ -1,6 +1,7 @@
 require('dotenv').config();
 const app = require('./app');
 const { initializeWebSocket } = require('./websocket/callUpdates');
+const { initializeInvoiceJobs } = require('./jobs/invoiceAutomation.job');
 const http = require('http');
 
 const PORT = process.env.PORT || 3000;
@@ -10,6 +11,9 @@ const server = http.createServer(app);
 
 // Initialize WebSocket
 initializeWebSocket(server);
+
+// Initialize Invoice Automation Jobs
+initializeInvoiceJobs();
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {

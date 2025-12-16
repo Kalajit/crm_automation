@@ -107,3 +107,26 @@ exports.markNotificationSent = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+
+
+
+
+exports.getPendingNotifications = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT n.*, l.phone_number AS lead_phone
+      FROM notifications n
+      JOIN leads l ON n.lead_id = l.id
+      WHERE n.status = 'pending' 
+        AND n.scheduled_time <= NOW()
+      ORDER BY n.scheduled_time ASC
+      LIMIT 50
+    `);
+    logRequest('GET', '/api/notifications/pending', 200);
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (e) {
+    logRequest('GET', '/api/notifications/pending', 500);
+    handleError(res, e);
+  }
+};

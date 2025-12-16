@@ -64,3 +64,24 @@ exports.liveUpdate = async (req, res) => {
     handleError(res, error);
   }
 };
+
+
+
+
+exports.getPendingScheduledCalls = async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT sc.*, l.phone_number, l.name, l.company_id
+      FROM scheduled_calls sc
+      JOIN leads l ON sc.lead_id = l.id
+      WHERE sc.status = 'pending' 
+        AND sc.scheduled_time <= NOW()
+      ORDER BY sc.scheduled_time ASC
+    `);
+    logRequest('GET', '/api/scheduled-calls/pending', 200);
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (e) {
+    logRequest('GET', '/api/scheduled-calls/pending', 500);
+    handleError(res, e);
+  }
+};

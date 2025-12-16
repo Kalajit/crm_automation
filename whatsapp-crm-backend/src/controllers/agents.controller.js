@@ -602,4 +602,46 @@ exports.getMetricsDashboard = async (req, res) => {
   }
 };
 
+
+
+
+exports.getAgentStats = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const callStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_calls,
+        COUNT(*) FILTER (WHERE call_status = 'completed') as completed_calls,
+        AVG(call_duration) as avg_duration
+      FROM call_logs
+      WHERE company_id = (SELECT company_id FROM agent_instances WHERE id = $1)
+      AND created_at >= NOW() - INTERVAL '30 days'
+    `, [id]);
+    
+    const messageStats = await pool.query(`
+      SELECT COUNT(*) as total_messages
+      FROM whatsapp_messages
+      WHERE lead_id IN (
+        SELECT id FROM leads 
+        WHERE company_id = (SELECT company_id FROM agent_instances WHERE id = $1)
+      )
+      AND timestamp >= NOW() - INTERVAL '30 days'
+    `, [id]);
+    
+    logRequest('GET', `/api/agent-instances/${id}/stats`, 200);
+    res.json({ 
+      success: true, 
+      data: {
+        ...callStats.rows[0],
+        ...messageStats.rows[0]
+      }
+    });
+    
+  } catch (error) {
+    logRequest('GET', `/api/agent-instances/${req.params.id}/stats`, 500);
+    handleError(res, error);
+  }
+};
+
 module.exports = exports;

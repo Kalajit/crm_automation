@@ -85,3 +85,32 @@ exports.getConversationByPhone = async (req, res) => {
     handleError(res, error);
   }
 };
+
+
+
+exports.getConversationMessages = async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { limit } = req.query;
+    
+    const query = `
+      SELECT 
+        wm.*,
+        l.name as lead_name
+      FROM whatsapp_messages wm
+      LEFT JOIN leads l ON wm.lead_id = l.id
+      WHERE wm.phone_number = $1
+      ORDER BY wm.timestamp DESC
+      LIMIT $2
+    `;
+    
+    const result = await pool.query(query, [phone, parseInt(limit) || 100]);
+    
+    logRequest('GET', `/api/conversations/${phone}/messages`, 200);
+    res.json({ success: true, data: result.rows });
+    
+  } catch (error) {
+    logRequest('GET', `/api/conversations/${req.params.phone}/messages`, 500);
+    handleError(res, error);
+  }
+};

@@ -6,8 +6,13 @@ const session = require('express-session');
 const routes = require('./routes');
 const { errorHandler } = require('./middleware/error.middleware');
 const { rateLimiter } = require('./middleware/rateLimit.middleware');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
+
+// Import schedulers
+const { initializeSchedulers } = require('./jobs');
 
 // ============================================
 // MIDDLEWARE
@@ -23,6 +28,7 @@ app.use(cors({
 }));
 
 // Body parsing
+app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('combined'));
@@ -40,6 +46,13 @@ app.use(session({
     maxAge: 3600000 // 1 hour
   }
 }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use('/api/', limiter);
 
 // ============================================
 // ROUTES

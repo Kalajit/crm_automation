@@ -39,4 +39,22 @@ router.post('/', leadsController.createOrUpdateLead);
 // Update lead by ID
 router.patch('/:lead_id', leadsController.updateLeadById);
 
+// New routes for Part 8
+router.get('/:lead_id/custom-fields', leadsController.getLeadCustomFields);
+router.patch('/:lead_id/status', leadsController.updateLeadStatus);
+router.get('/export/csv', leadsController.exportLeadsToCSV);
+router.get('/phone/:phone', leadsController.getLeadByPhone);
+router.patch('/phone/:phone', leadsController.updateLeadByPhone);
+
+// router.get('/:id', leadsController.get_LeadBy_Id);
+router.put('/:id', leadsController.updateLead);
+router.delete('/:id', leadsController.deleteLead);
+router.get('/:lead_id/custom-fields', leadsController.getLeadCustomFields);
+router.patch('/:lead_id/status', leadsController.updateLeadStatus);
+
+// Lead scoring routes
+router.post('/:lead_id/calculate-score', leadsController.calculateLeadScore);
+router.post('/batch-calculate-scores', leadsController.batchCalculateScores);
+router.get('/top-scored', leadsController.getTopScoredLeads);
+
 module.exports = router;
