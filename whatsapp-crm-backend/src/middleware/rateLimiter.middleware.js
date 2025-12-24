@@ -1,12 +1,12 @@
 const rateLimit = require('express-rate-limit');
 // const RedisStore = require('rate-limit-redis');
 const { RedisStore } = require('rate-limit-redis');
-const redis = require('redis');
+// const redis = require('redis');
 const { errorResponse } = require('../utils/response');
 const {logger} = require('../utils/logger');
 
-// Create Redis client (optional - falls back to memory if Redis not available)
-let redisClient = null;
+// Import the ioredis client from your existing config
+const redisClient = require('../config/redis');
 
 try {
   if (process.env.REDIS_URL) {
@@ -69,7 +69,7 @@ const rateLimiter = (maxRequests = 100, windowSeconds = 60, options = {}) => {
     },
     skip: (req) => {
       // Skip rate limiting for specific IPs (e.g., internal services)
-      const whitelistedIPs = (process.env.RATE_LIMIT_WHITELIST || '').split(',');
+      const whitelistedIPs = (process.env.RATE_LIMIT_WHITELIST || '').split(',').filter(Boolean);
       return whitelistedIPs.includes(req.ip);
     },
     keyGenerator: (req) => {
@@ -80,14 +80,20 @@ const rateLimiter = (maxRequests = 100, windowSeconds = 60, options = {}) => {
   };
 
   // Use Redis store if available, otherwise use memory store
-  if (redisClient && redisClient.isOpen) {
-    config.store = new RedisStore({
-      client: redisClient,
-      prefix: 'rl:',
-      sendCommand: (...args) => redisClient.sendCommand(args)
-    });
-  } else {
-    logger.info('Using memory store for rate limiting');
+  try {
+    if (redisClient && redisClient.status === 'ready') {
+      config.store = new RedisStore({
+        client: redisClient,
+        prefix: 'rl:',
+        // ioredis uses sendCommand directly
+        sendCommand: (...args) => redisClient.call(...args)
+      });
+      logger.info('Using Redis store for rate limiting');
+    } else {
+      logger.info('Using memory store for rate limiting (Redis not ready)');
+    }
+  } catch (error) {
+    logger.warn('Failed to initialize Redis store, using memory store:', error.message);
   }
 
   return rateLimit(config);

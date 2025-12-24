@@ -11,4 +11,7 @@ router.get('/leads', statsController.getLeadMetrics);
 // Message metrics
 router.get('/messages', statsController.getMessageMetrics);
 
+router.get('/metrics/dashboard', statsController.getMetricsDashboard);
+router.get('/active-calls', statsController.getActiveCalls);
+
 module.exports = router;

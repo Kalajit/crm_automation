@@ -1,6 +1,6 @@
 const pool = require('../config/database');
 const { successResponse, errorResponse } = require('../utils/response');
-const logger = require('../utils/logger');
+const {logger} = require('../utils/logger');
 const callSummaryService = require('../services/callSummary/callSummary.service');
 
 // Send call summary to customer

@@ -39,4 +39,11 @@ router.get('/meetings/:confirmation_code', SchedulerController.getMeetingDetails
 router.put('/meetings/:confirmation_code/cancel', SchedulerController.cancelMeeting);
 router.put('/meetings/:confirmation_code/reschedule', SchedulerController.rescheduleMeeting);
 
+
+// Schedule call management
+router.post('/schedule-call', SchedulerController.scheduleCall);
+router.get('/scheduled-calls/pending', SchedulerController.getPendingScheduledCalls);
+router.patch('/scheduled-calls/:id', SchedulerController.updateScheduledCall);
+
+
 module.exports = router;

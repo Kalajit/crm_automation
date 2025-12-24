@@ -2,7 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
-const logger = require('../utils/logger');
+const {logger} = require('../utils/logger');
 
 // JWT secret from environment
 const JWT_SECRET = process.env.JWT_SECRET_KEY || 'your-secret-key-change-in-production';
@@ -52,6 +52,7 @@ exports.register = async (req, res) => {
       email,
       password,
       phone,
+      phone_number,
       first_name,
       last_name,
       industry,
@@ -79,13 +80,19 @@ exports.register = async (req, res) => {
     const companyResult = await client.query(
       `INSERT INTO companies (
         name, 
+        phone_number,
         industry, 
         company_size,
         status,
         created_at
-      ) VALUES ($1, $2, $3, $4, NOW()) 
+      ) VALUES ($1, $2, $3, $4, $5, NOW()) 
       RETURNING id, name, status`,
-      [company_name, industry || 'other', company_size || 'small', 'active']
+      [
+        company_name, 
+        phone_number, 
+        industry || 'other', 
+        company_size || 'small', 
+        'active']
     );
 
     const company = companyResult.rows[0];
@@ -137,7 +144,7 @@ exports.register = async (req, res) => {
 
     // Store refresh token in database
     await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, expires_at)
+      `INSERT INTO refresh_token (user_id, token, expires_at)
        VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
       [user.id, refreshToken]
     );
@@ -240,7 +247,7 @@ exports.login = async (req, res) => {
 
     // Store refresh token
     await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, expires_at)
+      `INSERT INTO refresh_token (user_id, token, expires_at)
        VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
       [user.id, refreshToken]
     );
@@ -304,7 +311,7 @@ exports.refreshToken = async (req, res) => {
     // Check if refresh token exists and is valid
     const tokenResult = await pool.query(
       `SELECT user_id, expires_at 
-       FROM refresh_tokens 
+       FROM refresh_token 
        WHERE token = $1 AND user_id = $2 AND expires_at > NOW()`,
       [refreshToken, decoded.user_id]
     );
@@ -336,9 +343,9 @@ exports.refreshToken = async (req, res) => {
     const { accessToken, refreshToken: newRefreshToken } = generateTokens(user);
 
     // Delete old refresh token and insert new one
-    await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [refreshToken]);
+    await pool.query('DELETE FROM refresh_token WHERE token = $1', [refreshToken]);
     await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token, expires_at)
+      `INSERT INTO refresh_token (user_id, token, expires_at)
        VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
       [user.id, newRefreshToken]
     );
@@ -372,12 +379,12 @@ exports.logout = async (req, res) => {
     // Delete specific refresh token or all tokens for user
     if (refreshToken) {
       await pool.query(
-        'DELETE FROM refresh_tokens WHERE token = $1 AND user_id = $2',
+        'DELETE FROM refresh_token WHERE token = $1 AND user_id = $2',
         [refreshToken, userId]
       );
     } else {
       // Delete all refresh tokens for user (logout from all devices)
-      await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
+      await pool.query('DELETE FROM refresh_token WHERE user_id = $1', [userId]);
     }
 
     logger.info(`User logged out: ${userId}`);
@@ -482,7 +489,7 @@ exports.changePassword = async (req, res) => {
     );
 
     // Invalidate all refresh tokens (force re-login on all devices)
-    await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
+    await pool.query('DELETE FROM refresh_token WHERE user_id = $1', [userId]);
 
     logger.info(`Password changed for user: ${userId}`);
 
@@ -600,7 +607,7 @@ exports.resetPassword = async (req, res) => {
     );
 
     // Invalidate all refresh tokens
-    await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [user.id]);
+    await pool.query('DELETE FROM refresh_token WHERE user_id = $1', [user.id]);
 
     logger.info(`Password reset successful for: ${user.email}`);
 

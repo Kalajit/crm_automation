@@ -398,7 +398,8 @@
 
 
 const pool = require('../config/database');
-const logger = require('../utils/logger');
+const {logger} = require('../utils/logger');
+const { successResponse, errorResponse } = require('../utils/response');
 const schedulerServiceModule = require('../services/scheduler/meetingScheduler.service');
 
 // Handle both export patterns
@@ -579,6 +580,111 @@ class SchedulerController {
       res.status(500).json({ error: error.message });
     }
   }
+
+  // Schedule a call
+  async scheduleCall(req, res) {
+    try {
+      const { company_id, lead_id, call_type, scheduled_time } = req.body;
+      
+      if (!company_id || !lead_id || !call_type || !scheduled_time) {
+        return errorResponse(res, 'company_id, lead_id, call_type, and scheduled_time are required', 400);
+      }
+
+      // Validate that the lead exists
+      const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1', [lead_id]);
+      if (leadCheck.rows.length === 0) {
+        return errorResponse(res, `Lead with id ${lead_id} does not exist`, 404);
+      }
+      
+      // Validate that the company exists
+      const companyCheck = await pool.query('SELECT id FROM companies WHERE id = $1', [company_id]);
+      if (companyCheck.rows.length === 0) {
+        return errorResponse(res, `Company with id ${company_id} does not exist`, 404);
+      }
+      
+      const query = `
+        INSERT INTO scheduled_calls (company_id, lead_id, call_type, scheduled_time)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *;
+      `;
+      const result = await pool.query(query, [company_id, lead_id, call_type, scheduled_time]);
+      
+      return successResponse(res, result.rows[0], 'Call scheduled successfully', 201);
+    } catch (error) {
+      logger.error('Schedule call error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  // Get pending scheduled calls
+  async getPendingScheduledCalls(req, res) {
+    try {
+      const query = `
+        SELECT sc.*, l.phone_number, l.name, ac.prompt_key, ac.initial_message, ac.voice
+        FROM scheduled_calls sc
+        JOIN leads l ON sc.lead_id = l.id
+        JOIN agent_configs ac ON sc.company_id = ac.company_id
+        WHERE sc.status = 'pending' AND sc.scheduled_time <= NOW()
+        ORDER BY sc.scheduled_time ASC;
+      `;
+      const result = await pool.query(query);
+      
+      return successResponse(res, result.rows, 'Pending scheduled calls retrieved successfully');
+    } catch (error) {
+      logger.error('Get pending scheduled calls error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  // Update scheduled call
+  async updateScheduledCall(req, res) {
+    try {
+      const { id } = req.params;
+      const { status, call_sid } = req.body;  
+      
+      let query;
+      let params;
+      
+      if (status === 'called' && call_sid) {
+        query = `
+          UPDATE scheduled_calls
+          SET status = $1, call_sid = $2, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $3
+          RETURNING *;
+        `;
+        params = [status, call_sid, id];
+      } else if (status === 'failed') {
+        query = `
+          UPDATE scheduled_calls
+          SET status = $1, retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2
+          RETURNING *;
+        `;
+        params = [status, id];
+      } else {
+        query = `
+          UPDATE scheduled_calls
+          SET status = $1, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2
+          RETURNING *;
+        `;
+        params = [status, id];
+      }
+      
+      const result = await pool.query(query, params);
+      
+      if (result.rows.length === 0) {
+        return errorResponse(res, 'Scheduled call not found', 404);
+      }
+      
+      return successResponse(res, result.rows[0], 'Scheduled call updated successfully');
+    } catch (error) {
+      logger.error('Update scheduled call error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+
 }
 
 module.exports = new SchedulerController();

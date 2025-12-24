@@ -1,5 +1,5 @@
 const pool = require('../../config/database');
-const logger = require('../../utils/logger');
+const {logger} = require('../../utils/logger');
 
 // Get usage column mapping
 function getUsageColumn(eventType) {

@@ -221,9 +221,9 @@
 
 // src/controllers/usageTracking.controller.js
 const pool = require('../config/database');
-const usageTrackingService = require('../services/usageTracking/usageTracking.service');
+const usageTrackingService = require('../services/usage/usageTracking.service');
 const { successResponse, errorResponse } = require('../utils/response');
-const logger = require('../utils/logger');
+const {logger} = require('../utils/logger');
 
 // ============================================
 // ADMIN AUTHENTICATION CHECK

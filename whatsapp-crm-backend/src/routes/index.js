@@ -60,9 +60,9 @@ const dripCampaignsRoutes = require('./dripCampaigns.routes');
 
 const invoicePaymentRoutes = require('./invoicePayment.routes');
 
-// const smsRoutes = require('./sms.routes');
+const smsRoutes = require('./sms.routes');
 
-// const usageTrackingRoutes = require('./usageTracking.routes');
+const usageTrackingRoutes = require('./usageTracking.routes');
 
 
 
@@ -152,9 +152,9 @@ router.use('/search', searchRoutes);
 router.use('/oauthRoutes', oauthRoutes)
 
 
-// router.use('/api/sms', smsRoutes);
+router.use('/api/sms', smsRoutes);
 
-// app.use('/api/usage', usageTrackingRoutes);
+router.use('/api/usage', usageTrackingRoutes);
 
 
 module.exports = router;
